@@ -1,0 +1,1 @@
+Why chose lambda architecture over the other
