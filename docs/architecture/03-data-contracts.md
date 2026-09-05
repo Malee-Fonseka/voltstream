@@ -1,1 +1,0 @@
-details about data contracts
