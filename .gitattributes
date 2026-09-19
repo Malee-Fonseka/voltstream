@@ -1,0 +1,59 @@
+# Line-ending policy — decision T009.
+#
+# This repository is developed on Windows and ships shell scripts, SQL, YAML and Python
+# into Linux containers. A CRLF line ending in a `.sh` file makes it fail inside a
+# container with a cryptic `bad interpreter: /bin/bash^M` error. These attributes
+# override any developer's core.autocrlf setting (Git for Windows defaults it to true at
+# the system level) so every clone gets the same bytes.
+
+# Default: every file git detects as text is stored and checked out with LF.
+*               text=auto eol=lf
+
+# Explicit LF for everything that runs or is parsed inside a container.
+*.sh            text eol=lf
+*.py            text eol=lf
+*.sql           text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.toml          text eol=lf
+*.json          text eol=lf
+*.csv           text eol=lf
+*.md            text eol=lf
+*.txt           text eol=lf
+*.html          text eol=lf
+*.js            text eol=lf
+*.css           text eol=lf
+*.svg           text eol=lf
+*.drawio        text eol=lf
+*.env           text eol=lf
+*.env.example   text eol=lf
+*.cfg           text eol=lf
+*.ini           text eol=lf
+Makefile        text eol=lf
+Dockerfile      text eol=lf
+*.Dockerfile    text eol=lf
+.gitignore      text eol=lf
+.gitattributes  text eol=lf
+.python-version text eol=lf
+LICENSE         text eol=lf
+
+# Windows-native scripts keep CRLF.
+*.ps1           text eol=crlf
+*.bat           text eol=crlf
+*.cmd           text eol=crlf
+
+# Binaries: never normalise, never diff as text.
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.ico           binary
+*.pdf           binary
+*.parquet       binary
+*.snappy        binary
+*.woff          binary
+*.woff2         binary
+*.ttf           binary
+*.zip           binary
+*.gz            binary
+*.jar           binary

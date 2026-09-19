@@ -80,6 +80,12 @@ export_rate` while Appendix A's `base.yaml` carries `blocks`, `fixed_charge_by_t
   code change, which destroys the backfill demo (§5.6). **Do not choose this.**
 **Done when:** D2 filled; the exact final CSV column list is written down and is what `T031`
 will implement.
+**Outcome (2026-09-19):** Decided as **Option 3**, not the Option 1 lean above — see D2 in
+`05-open-decisions.md` for the reasoning (lineage hole; §2.3 calls rates data; stale-tariff
+divergence needs rates to move). Final contract is ten columns:
+`household_id, effective_date, billing_tier, subsidy_flag, subsidy_pct, fixed_charge,
+block_1_rate, block_2_rate, block_3_rate, export_rate`. Config keeps only block boundaries plus
+`generator_defaults` that only the dropper may read.
 
 ### T004 — D3: Watermark units (BLOCKING, subtle)
 **Files:** `docs/architecture/05-open-decisions.md`
@@ -102,6 +108,13 @@ the injected lateness spread, not against network jitter. Decide:
 - Alternative: express it in real seconds and convert inside `simclock.py`.
 **Done when:** D3 filled with the chosen unit, the chosen value, the chosen injection spread,
 and one sentence on why some events are *expected* to be dropped.
+**Outcome (2026-09-19):** Simulated units, as recommended — but **not** the suggested numbers.
+A sizing model (see D3) showed W = 5 / spread 1–20 drops only 2.9 % of late events, because
+one trigger interval is 48 sim min and the watermark advances once per trigger. Pinned:
+`watermark_sim_minutes: 30`; out-of-order U[1, 30] sim min (always absorbed); dropouts become
+**store-and-forward** (30 real s buffer, flushed on reconnect) at `0.002` per meter-tick, of
+which ~57 % is dropped by the speed layer → expected kWh gap ≈ 1.7 %. Output mode `update`.
+Batch gets a 90 real-s late-data grace after the tariff file lands.
 
 ### T005 — D4: Who computes the provisional bill
 **Files:** `docs/architecture/05-open-decisions.md`
@@ -118,6 +131,13 @@ argument is hollow under viva questioning. Decide:
 - Alternative: speed layer only, with the API's use of `core/` confined to `/reports`.
 **Done when:** D4 filled. If the recommended option is chosen, note that the merge endpoint
 returns the recomputed value and logs a warning when it differs from the stored one.
+**Outcome (2026-09-19):** Decided as **Option 2, refined** — not the Option 1 lean above.
+The API is `SELECT`-only (as §6.1/§8.3 already say); the speed layer persists the **full**
+provisional breakdown via `spark_expr.py` (free — it computes it for batch anyway); and the
+pure module's production caller is **`reconciliation.py`**, which uses it to compute the
+counterfactual `bill(speed_kwh, today's tariff)` and split each divergence into a
+`tariff_effect` and a `data_effect`. That gives the consistency test a production consequence.
+See D4 for why recomputing in the API would *add* a drift surface rather than remove one.
 
 ### T006 — D5: Subsidy and final-bill arithmetic
 **Files:** `docs/architecture/05-open-decisions.md`
@@ -142,6 +162,14 @@ consumption — so it is a per-household constant and does not break continuity 
 Keep it that way.
 **Done when:** D5 filled with the formula above (or the agreed variant) and an explicit
 yes/no on the negative-bill question.
+**Outcome (2026-09-19):** Formula as above with `tariff.subsidy_pct` (D2). Pinned in D5:
+**`Decimal` everywhere** (Python `Decimal`, Spark `DecimalType`, kWh `(12,4)`, money `(12,2)`)
+— decided by batch **determinism** (float sums are order-dependent; Spark's sum order is not)
+as much as by the half-cent case; **half-up rounding per line item**, totals are exact sums of
+rounded parts; subsidy on the energy charge only; **negative bills allowed**, never clamped
+(carry-forward is cross-day state and would break lineage); `pct_divergence` base is gross
+charges, not `final_bill`. New file `core/money.py` holds the precision constants. Three
+verified worked examples in D5 become the first T172/T173 fixtures.
 
 ### T007 — D6: How Airflow submits Spark jobs, and what the sensor is
 **Files:** `docs/architecture/05-open-decisions.md`
@@ -159,6 +187,16 @@ filesystem — `FileSensor` will never see it. Use `S3KeySensor` from the Amazon
 an `aws_conn_id` pointing at the MinIO endpoint, or a `PythonSensor` wrapping boto3.
 **Done when:** D6 filled with both the submission mechanism and the sensor type, and
 `00-master-design.md` §8.3 corrected so it no longer says `FileSensor`.
+**Outcome (2026-09-19):** `DockerOperator` **through `tecnativa/docker-socket-proxy`** (not
+the raw socket — avoids Docker Desktop permission failures); `S3KeySensor` via an
+`AIRFLOW_CONN_…` env var. A third sub-decision surfaced: Airflow's clock is real, the
+pipeline's days are simulated, so `{{ ds }}` can never be a sim date and §5.6's
+`airflow dags backfill` cannot address one. Resolved by **Design B**: a `tariff_watcher` DAG
+(new file) triggers one `daily_billing` run per new tariff file with `sim_date` parsed from
+the filename and `run_id = billing__<date>`; restatement is a new run `billing__<date>__r<n>`,
+preserved alongside the original. No `simclock`/`voltstream` in Airflow. **Airflow 3.x**,
+one `airflow standalone` container, LocalExecutor, separate metadata DB; tripwire to 2.11.
+Verification via `SQLCheckOperator`s. §8.3 corrected in the Master Design.
 
 ### T008 — D7: Package and repository name spelling
 **Files:** `docs/architecture/05-open-decisions.md`
@@ -168,6 +206,11 @@ one name everywhere. Decide to rename the directory and git remote to `voltstrea
 (recommended), or to accept the mismatch and note it explicitly. Either way, **the Python
 package is `voltstream`.**
 **Done when:** D7 filled; if renaming, the local directory and git remote are renamed.
+**Outcome (2026-09-19):** **Option 2** — repository and folder stay `volstream`; package,
+Compose project and every runtime name are `voltstream`. `name: voltstream` in the compose
+file is what makes this safe (Compose would otherwise derive the project name from the
+`docker/` folder). README carries a one-line note; `grep -rni volstream` over
+`src/ docker/ config/ airflow/ scripts/ tests/` must stay empty and is added to `make lint`.
 
 ### T009 — Line-ending policy
 **Files:** `.gitattributes` (new)
@@ -249,7 +292,9 @@ from a directory other than the repository root.
 **Do:** Add `[tool.ruff]` (line length 100; select `E,F,I,UP,B`), `[tool.mypy]`
 (`strict = true` for `voltstream.core.*` at minimum, `ignore_missing_imports` for pyspark),
 `[tool.pytest.ini_options]` (`testpaths`, markers `integration` and `slow`,
-`--strict-markers`), and `[tool.coverage]`.
+`--strict-markers`), and `[tool.coverage]`. Per D7, the `make lint` target (T110) also runs
+`grep -rni "volstream" src/ docker/ config/ airflow/ scripts/ tests/` and fails if it matches
+— the misspelling is permitted only in the README's note and in repository URLs.
 **Done when:** `ruff check .`, `mypy src` and `pytest --collect-only` all run without
 *configuration* errors. Findings are fine; config errors are not.
 
@@ -368,12 +413,14 @@ Spark re-imports it per executor process).
 ### T029 — `contracts/events.py`
 **Files:** `src/voltstream/contracts/events.py`
 **Do:** Pydantic v2 `MeterReading` with every field in §6.2 and correct types — `event_ts` as
-a tz-aware `datetime`, kWh as `Decimal` **or** `float` (pick one and make it consistent with
-the Postgres `NUMERIC` columns; mixing them is how rounding bugs enter).
-`model_config = ConfigDict(extra="forbid")`. Add `from_kafka_value(bytes)` and
-`to_kafka_value() -> bytes`.
-**Done when:** The §6.2 sample JSON round-trips; an unknown field raises; a missing required
-field raises.
+a tz-aware `datetime`; kWh fields as **`Decimal`** with `max_digits=12, decimal_places=4`
+(D5); `voltage` as `float` (unused by billing). Serialise `Decimal` fields to JSON as
+**numbers**, not strings, via a `field_serializer`, so the §6.2 sample stays valid and Spark's
+`from_json` parses the exact decimal text. `model_config = ConfigDict(extra="forbid")`. Add
+`from_kafka_value(bytes)` and `to_kafka_value() -> bytes`.
+**Done when:** The §6.2 sample JSON round-trips with `consumption_kwh == Decimal("0.412")`; a
+kWh value with 5 decimal places raises; an unknown field raises; a missing required field
+raises.
 
 ### T030 — Decide and document the latency timestamp
 **Files:** `src/voltstream/contracts/events.py`, `docs/architecture/05-open-decisions.md`
@@ -425,7 +472,11 @@ banner with the date.
 
 ### T035 — Postgres schema: speed-view tables
 **Files:** `docker/init/postgres/01_schema.sql`
-**Do:** `zone_metrics_rt` and `household_running_rt` exactly as §6.4.
+**Do:** `zone_metrics_rt` exactly as §6.4. `household_running_rt` as §6.4 **plus the D4
+columns** so a provisional response has the same shape as a final one:
+`self_consumed_kwh NUMERIC(12,4)`, `energy_charge`, `fixed_charge`, `subsidy_discount`,
+`export_credit` (all `NUMERIC(12,2)`), `tier_breakdown JSONB` — all `NOT NULL`.
+`estimated_bill` remains the total.
 **Done when:** `psql -f` against an empty database succeeds, and re-running it is idempotent
 (`CREATE TABLE IF NOT EXISTS`).
 
@@ -454,7 +505,10 @@ This is also the known-household set that `core/validation.py` checks
 
 ### T039 — Postgres schema: operational tables
 **Files:** `docker/init/postgres/01_schema.sql`
-**Do:** `rejected_records`, `pipeline_runs` and `reconciliation_daily` as §6.4.
+**Do:** `rejected_records` and `pipeline_runs` as §6.4. `reconciliation_daily` as §6.4 **plus
+the D4 decomposition columns** `tariff_effect NUMERIC(12,2) NOT NULL` and
+`data_effect NUMERIC(12,2) NOT NULL` (invariant: `speed_estimate − batch_final ==
+tariff_effect + data_effect`).
 **Done when:** All three created.
 
 ### T040 — Handle the `pipeline_runs` unique-index trap
@@ -491,9 +545,13 @@ to 50.
 **Do:** `kafka` (KRaft mode, single broker — no ZooKeeper), `postgres`, `minio`. Real
 **healthchecks**, not sleeps: `kafka-broker-api-versions` for Kafka, `pg_isready` for Postgres,
 the `/minio/health/live` endpoint for MinIO. Named volumes for all three. A project network.
-`name: voltstream` at the top of the file (§7.1: one name everywhere).
+`name: voltstream` at the top of the file — per D7 this is **mandatory**: Compose otherwise
+derives the project name from the folder holding the compose file (`docker/`), and the
+repository folder is `volstream`; this key is what makes every network, volume and container
+come out `voltstream-*`.
 **Done when:** `docker compose up -d kafka postgres minio` reaches `healthy` on all three,
-confirmed by `docker compose ps`.
+confirmed by `docker compose ps`; `docker compose ls` shows project `voltstream`; nothing in
+`docker network ls` / `docker volume ls` is named `docker_*` or `volstream_*`.
 
 ### T044 — Compose: named volumes for Spark checkpoints
 **Files:** `docker/docker-compose.yml`
@@ -539,9 +597,13 @@ Bake the connector JARs into the image rather than resolving them at runtime —
 every job start is slow and fails without network:
 - `spark-sql-kafka-0-10`, matching the Spark version exactly.
 - `hadoop-aws` + `aws-java-sdk-bundle` — **these must match the Hadoop version bundled with
-  your Spark build.** Do not guess. Check with
-  `sc._jvm.org.apache.hadoop.util.VersionInfo.getVersion()` and pin to what it prints. A
-  mismatch here produces `NoSuchMethodError` at runtime and is a classic multi-hour sink.
+  your Spark build.** A mismatch produces `NoSuchMethodError` at runtime and is a classic
+  multi-hour sink. **Measured in T002:** PySpark 3.5.9 bundles Hadoop **3.3.4**, Scala
+  **2.12** → `hadoop-aws:3.3.4`, `spark-sql-kafka-0-10_2.12:3.5.9`, and the
+  `aws-java-sdk-bundle` version declared in `hadoop-aws:3.3.4`'s POM (expected 1.12.262 —
+  confirm against the POM). Re-verify with
+  `sc._jvm.org.apache.hadoop.util.VersionInfo.getVersion()` inside the built image, since the
+  Docker base image may not bundle the same Hadoop as the pip wheel.
 - The PostgreSQL JDBC driver.
 **Done when:** `spark-submit --version` works inside the image, and a scratch job that reads
 Kafka, reads `s3a://`, and opens a JDBC connection starts with no `ClassNotFoundException`.
@@ -596,17 +658,22 @@ the constant is the only place those strings appear.
 reading passes every rule.
 **Done when:** Passes, with one case per reason in the vocabulary.
 
-### T055 — `core/netting.py`
-**Files:** `src/voltstream/core/netting.py`
-**Do:** Exactly §3.3c:
+### T055 — `core/money.py` and `core/netting.py`
+**Files:** `src/voltstream/core/money.py` (new, per D5), `src/voltstream/core/netting.py`
+**Do:** First `money.py`: the precision/scale constants as plain ints — `MONEY = (12, 2)`,
+`KWH = (12, 4)`, `PCT = (5, 2)` — plus `round_money(Decimal) -> Decimal` (`ROUND_HALF_UP`,
+2 dp) and `quantize_kwh(Decimal) -> Decimal` (4 dp). **No pyspark import**; `spark_expr.py`
+builds its `DecimalType`s from these same ints. Then `netting.py`, exactly §3.3c, over
+`Decimal`:
 ```
 self_consumed   = min(solar_kwh, consumption_kwh)
 billable_import = consumption_kwh - self_consumed
 export_kwh      = solar_kwh - self_consumed
 ```
 Return a frozen dataclass or `NamedTuple`, not a dict — it feeds `tariff.py` and should be
-type-checked.
-**Done when:** `mypy --strict` clean on the module.
+type-checked. No rounding in netting: ≤ 4 dp in, ≤ 4 dp out, exactly.
+**Done when:** `mypy --strict` clean on both modules; `round_money(Decimal("0.165")) ==
+Decimal("0.17")`.
 
 ### T056 — Unit tests for `core/netting.py`
 **Files:** `tests/unit/test_netting.py`
@@ -617,43 +684,59 @@ zero with solar positive (pure export). Assert both §9 Phase 2 invariants in ev
 ### T057 — `core/tariff.py`: block-tariff energy charge
 **Files:** `src/voltstream/core/tariff.py`
 **Do:** `energy_charge(billable_import_kwh, blocks) -> (total, breakdown)` implementing the
-**marginal/slab** reading fixed in `T006`: the first 60 kWh at 8.00, the next 60 at 16.50, the
-remainder at 24.50. `blocks` is passed in, never read from config inside this function. The
-breakdown is the per-block `{up_to, rate, kwh, charge}` list that becomes
-`household_bill_daily.tier_breakdown`.
-**Done when:** Hand-computed values for 0, 59.99, 60, 60.01, 120 and 200 kWh all match.
+**marginal/slab** reading fixed in `T006`: the first 60 kWh at the household's `block_1_rate`,
+the next 60 at `block_2_rate`, the remainder at `block_3_rate`. Per D2, add
+`build_blocks(boundaries, tariff_record) -> list[Block]`, which zips the config boundaries with
+the record's three rates; that is the only place the two are combined. `blocks` is passed in,
+never read from config inside `energy_charge`. The breakdown is the per-block
+`{up_to, rate, kwh, charge}` list that becomes `household_bill_daily.tier_breakdown`.
+**Done when:** Hand-computed values for 0, 59.99, 60, 60.01, 120 and 200 kWh all match at the
+default rates (8.00 / 16.50 / 24.50), **and**
+`grep -rn "generator_defaults" src/voltstream/core src/voltstream/streaming src/voltstream/batch src/voltstream/api`
+returns nothing.
 
 ### T058 — `core/tariff.py`: full bill assembly
 **Files:** `src/voltstream/core/tariff.py`
-**Do:** `compute_bill(netting_result, tariff_record, blocks) -> BillBreakdown`, applying the
-`T006` formula in order: energy charge → fixed charge → subsidy → export credit → final.
-Return every intermediate as a named field — `household_bill_daily` stores them all and the
-report needs them. Pin the rounding rule here (see `T063`) rather than letting each caller
-round differently.
-**Done when:** A worked example is written as a docstring doctest and passes.
+**Do:** `compute_bill(netting_result, tariff_record, boundaries) -> BillBreakdown`, applying
+the D5 formula in order: per-block line items (each `round_money`'d) → `energy_charge` as the
+exact sum of the rounded lines → `fixed_charge` → `subsidy_discount` on the energy charge only
+→ `export_credit` → `final_bill` as the exact sum/difference of the four rounded components,
+**never clamped**. Every intermediate is a `Decimal` field — `household_bill_daily` and
+`household_running_rt` store them all. All rounding goes through `core/money.py`.
+**Done when:** The D5 boundary-tie example (60.0100 kWh → energy `480.17`, final `720.17`)
+is the docstring doctest and passes; `final_bill == energy_charge + fixed_charge −
+subsidy_discount − export_credit` is an exact `Decimal` equality.
 
 ### T059 — Unit tests for `core/tariff.py`
 **Files:** `tests/unit/test_tariff.py`
 **Do:** Boundaries at exactly 60 and 120, from both sides — this is §4.4's worked failure
 example ("the speed layer believes the first block ends at 60 kWh and the batch layer believes
 61"), so it gets an explicit test. Plus: subsidised vs unsubsidised; each of the three
-fixed-charge tiers; zero consumption; export-only household; the negative-bill case decided in
-`T006`.
+fixed-charge tiers; zero consumption; export-only household. Then the **three D5 worked
+examples as exact-equality assertions** (boundary tie → `720.17`; typical subsidised solar →
+`454.41`; net exporter → `−150.00`), and the line-item rounding case (two half-cent lines →
+`0.34`, not `0.33`).
 **Done when:** Passes, and deliberately flipping a `>` to `>=` in the block logic makes at
-least one test fail.
+least one test fail; deliberately rounding the sum instead of the lines makes the `0.34` test
+fail.
 
 ### T060 — Property tests: tariff invariants
 **Files:** `tests/property/test_tariff_invariants.py`
-**Do:** `hypothesis` strategies over consumption / solar / tier / subsidy, asserting the four
-properties §9 Phase 2 names:
-- **Monotonicity** — more consumption never lowers the bill.
+**Do:** `hypothesis` strategies generating **`Decimal`** inputs — kWh with ≤ 4 dp, rates and
+fixed charge with ≤ 2 dp, `subsidy_pct` in `[0, 100]` (D2/D5) — asserting the four properties
+§9 Phase 2 names, plus two D5 additions:
+- **Monotonicity** — more consumption never lowers the bill; **and** more solar never raises
+  it (holds because every rate is `≥ 0` and `subsidy_pct ≤ 100`).
 - **Continuity** — no discontinuous jump at a block boundary; assert the bill is ε-continuous
-  across `up_to_kwh ± δ`.
+  across `up_to_kwh ± δ` (ε = one cent, since line items are rounded).
 - **Netting invariants** — `self_consumed + export == solar` and
-  `self_consumed + billable_import == consumption`.
+  `self_consumed + billable_import == consumption`, exactly.
 - **Non-negativity** — no computed *component* is ever negative. (`final_bill` itself may be,
-  per `T006`.)
-**Done when:** ≥ 1,000 examples pass, with `@example()` cases pinned at every block boundary.
+  per D5.)
+- **Row invariants** — `final_bill == energy + fixed − subsidy − export` exactly, and the
+  breakdown's block charges sum to `energy_charge` exactly.
+**Done when:** ≥ 1,000 examples pass, with `@example()` cases pinned at every block boundary
+and at the three D5 worked examples.
 
 ### T061 — `core/spark_expr.py`: netting as Column expressions
 **Files:** `src/voltstream/core/spark_expr.py`
@@ -666,30 +749,47 @@ per-row serialisation cost."
 **Files:** `src/voltstream/core/spark_expr.py`
 **Do:** The block tariff as nested `F.when` / `F.greatest` / `F.least` arithmetic, **generated
 programmatically from the same `blocks` structure `tariff.py` consumes**, so the two cannot
-drift structurally even before the consistency test catches them numerically. Build
-`tier_breakdown` with `F.to_json(F.struct(...))`.
-**Done when:** Still no UDFs, and `df.explain()` shows the arithmetic inlined in the physical
-plan rather than a `BatchEvalPython` node.
+drift structurally even before the consistency test catches them numerically. Per D5,
+**everything is `DecimalType`**: build the types from `core/money.py`'s ints; every literal is
+`F.lit(Decimal("...")).cast(DecimalType(...))` — a single bare float (`* 0.01`, `F.lit(60.0)`)
+silently promotes the whole expression to `DoubleType`; round each block charge with
+`F.round(c, 2)` (half-up — never `F.bround`, which is half-even) **before** summing, and cast
+each stored component to its target `DecimalType`. Build `tier_breakdown` with
+`F.to_json(F.struct(...))`.
+**Done when:** Still no UDFs; `df.explain()` shows the arithmetic inlined in the physical plan
+rather than a `BatchEvalPython` node; `grep -nE "\b[0-9]+\.[0-9]+\b"
+src/voltstream/core/spark_expr.py` finds no float literals; and the output schema for every
+kWh/money column is `DecimalType`.
 
 ### T063 — The consistency test (the centrepiece)
 **Files:** `tests/consistency/test_pure_vs_spark.py`
-**Do:** Generate ≥ 5,000 random `(consumption, solar, tier, subsidy_flag, export_rate,
-fixed_charge)` rows with a fixed seed, **including values that straddle every `up_to_kwh`
-boundary**. Run `core/tariff.py` row-wise and `core/spark_expr.py` over a DataFrame. Assert
-every output field matches at the precision of the Postgres `NUMERIC(12,2)` / `NUMERIC(12,4)`
-columns — pin the rounding rule in `core/` so both sides round identically, rather than
-papering over a real difference with a loose tolerance.
-**Done when:** Passes over ≥ 5,000 inputs, and changing one block boundary in `spark_expr.py`
-alone makes it fail. **This is the §4.4 viva answer — "we made drift a test failure" — so it
-must be demonstrably fragile in exactly that way.**
+**Do:** Generate ≥ 5,000 random rows of `Decimal` inputs — consumption, solar, and a full
+D2 `TariffRecord` (three block rates, fixed charge, `subsidy_flag`, `subsidy_pct`,
+`export_rate`) — with a fixed seed, **including values that straddle every `up_to_kwh`
+boundary and deliberate half-cent tie cases** (products ending in exactly `…5` at the third
+decimal — the case that separates float from decimal). Run `core/tariff.py` row-wise and
+`core/spark_expr.py` over a DataFrame. Assert **exact `==`** on every output component — D5's
+rounding rules make both sides deterministic, so no tolerance. Assert the Spark output
+**schema** is `DecimalType` for every kWh/money column (this catches a stray float literal
+even when the values happen to agree). Compare `tier_breakdown` **numerically per field**
+after parsing both JSON strings — Spark's `to_json` writes `480.00`, Python writes `480.0`;
+textual comparison would spuriously fail.
+**Done when:** Passes over ≥ 5,000 inputs; changing one block boundary in `spark_expr.py`
+alone makes it fail; replacing one `Decimal` literal in `spark_expr.py` with a float makes it
+fail. **This is the §4.4 viva answer — "we made drift a test failure" — so it must be
+demonstrably fragile in exactly those ways.**
 
 ### T064 — Session-scoped Spark fixture
 **Files:** `tests/conftest.py`
 **Do:** A session-scoped local `SparkSession` (`local[2]`, `spark.ui.enabled=false`, shuffle
 partitions 1) shared by the consistency and Spark tests, so the run creates one JVM rather than
-one per test. Add a comment noting that on Windows, local Spark may need
-`HADOOP_HOME`/`winutils.exe` for anything touching the local filesystem — keep these tests
-purely in-memory to sidestep it.
+one per test. **Before building the session**, set
+`os.environ.setdefault("PYSPARK_PYTHON", sys.executable)` and likewise
+`PYSPARK_DRIVER_PYTHON` — T002 found that on Windows, an unset `PYSPARK_PYTHON` makes Spark
+launch workers via the Microsoft Store `python` alias stub, and every task fails with
+`Python worker failed to connect back`. Harmless on Linux. Add a comment noting that local
+Spark may need `HADOOP_HOME`/`winutils.exe` for anything touching the local filesystem — keep
+these tests purely in-memory to sidestep it.
 **Done when:** A full `pytest` run creates exactly one `SparkSession` and finishes in a
 tolerable time (target < ~2 min).
 
@@ -739,11 +839,18 @@ that demonstrated firing is what the ten observability marks turn on.
 **Files:** `src/voltstream/simulators/faults.py`
 **Do:** Implement each fault §9 Phase 1 requires — commit them one at a time if you prefer
 smaller diffs: duplicates (same `event_id` re-sent), out-of-order (`event_ts` shifted backwards
-by the spread fixed in `T004`), nulls in required fields, negative kWh, unknown `household_id`,
-and timed meter dropouts (`dropout_probability` / `dropout_duration_seconds`). §9: "Fault
+by U[1, 30] sim min per D3), nulls in required fields, negative kWh, unknown `household_id`,
+and meter dropouts. Per D3, a dropout is a **per-meter state machine**: on trigger
+(`dropout_probability_per_meter_tick`), the meter buffers its readings for
+`dropout_duration_real_seconds`; on expiry it flushes the whole buffer in one tick with the
+**original** `event_ts` values (store-and-forward). `dropout_backfill: false` discards the
+buffer instead — keep the switch for contrasting the two behaviours in the demo. §9: "Fault
 injection is not optional… it earns marks in three rubric rows at once."
-**Done when:** Each fault type maps to exactly one `T053` rejection reason, verified by a test
-that injects each fault and runs validation over the result.
+**Done when:** Each *rejectable* fault type maps to exactly one `T053` rejection reason,
+verified by a test that injects each fault and runs validation over the result. Out-of-order
+and backfilled readings are **valid** records (they are late, not wrong) and must pass
+validation — assert that too. A backfill after a 30 real-s dropout emits exactly 15 readings
+whose `event_ts` are unchanged.
 
 ### T071 — Unit tests for `faults.py`
 **Files:** `tests/unit/test_faults.py` (new)
@@ -770,12 +877,19 @@ and rejection rate side by side — that pairing is what makes the observability
 
 ### T074 — `simulators/reference_dropper.py`
 **Files:** `src/voltstream/simulators/reference_dropper.py`
-**Do:** Wake once per simulated day at simulated midnight; generate `tariff_<date>.csv` and
-`weather_<date>.csv` with the `T003` columns for all 50 households and 5 zones; write to
+**Do:** Wake once per simulated day at simulated midnight; generate `tariff_<date>.csv` (the ten
+D2 columns, sourcing `billing_tier`/`subsidy_flag` from the `households` dimension and money
+from `config.tariff.generator_defaults` — this is the **only** module allowed to read those
+defaults) and `weather_<date>.csv`, for all 50 households and 5 zones; write to
 `s3a://voltstream-landing/tariff/` and `/weather/`; sleep. **Write to a temporary key and copy
-to the final key**, so the Airflow sensor can never observe a partial file.
+to the final key**, so the Airflow sensor can never observe a partial file. Apply a
+**deterministic, documented day-over-day change** to at least one monetary column (e.g.
+`block_2_rate` steps by a fixed amount on alternate simulated days), so the speed layer's
+stale-tariff divergence (§3.1) is non-zero and attributable in `T140`. State the rule in the
+module docstring.
 **Done when:** After one simulated day, both files exist in MinIO and parse cleanly with
-`TariffRecord` / `WeatherForecast`.
+`TariffRecord` / `WeatherForecast`; after two, the two tariff files differ in the documented
+column and nothing else.
 
 ### T075 — Seed a day-zero tariff
 **Files:** `src/voltstream/simulators/reference_dropper.py` or `docker/init/minio/`
@@ -808,11 +922,13 @@ path. One builder used by all four Spark entrypoints.
 ### T078 — `streaming/sources.py`: Kafka read and deserialise
 **Files:** `src/voltstream/streaming/sources.py`
 **Do:** `read_meter_stream(spark)` returning a DataFrame with the §6.2 schema **declared
-explicitly** — never `inferSchema` on a stream — plus the Kafka metadata columns `key`,
-`timestamp`, `partition`, `offset`, and headers. Set `includeHeaders=true`: it is **off by
-default**, and `T030`'s latency measurement and `trace_id` propagation both depend on it.
-**Done when:** `printSchema()` shows every contract field with the right type plus the metadata
-columns, and `trace_id` is extractable from headers.
+explicitly** — never `inferSchema` on a stream — with kWh fields as `DecimalType(12,4)` per
+D5 (`voltage` stays `DoubleType`), plus the Kafka metadata columns `key`, `timestamp`,
+`partition`, `offset`, and headers. Set `includeHeaders=true`: it is **off by default**, and
+`T030`'s latency measurement and `trace_id` propagation both depend on it.
+**Done when:** `printSchema()` shows every contract field with the right type
+(`decimal(12,4)` for kWh) plus the metadata columns, and `trace_id` is extractable from
+headers.
 
 ### T079 — `streaming/sources.py`: validation split
 **Files:** `src/voltstream/streaming/sources.py`
@@ -904,12 +1020,16 @@ same `trace_id`.
 
 ### T088 — `streaming/speed_layer.py`: windowed zone aggregation
 **Files:** `src/voltstream/streaming/speed_layer.py`
-**Do:** Read the stream; split valid/invalid; `withWatermark("event_ts", <T004 value>)`;
-`window(event_ts, "15 minutes")` — **simulated** minutes, and say so in a comment right there;
-`groupBy(window, grid_zone)`; aggregate total consumption, total solar, renewable ratio, and
-active meter count.
-**Done when:** A console sink shows one row per `(zone, window)` with plausible values, and
-windows advance at the simulated rate.
+**Do:** Read the stream; split valid/invalid; `withWatermark("event_ts", "30 minutes")` built
+from `watermark_sim_minutes` — **simulated** minutes, and say so in a comment right there;
+`window(event_ts, "15 minutes")` likewise; `groupBy(window, grid_zone)`; aggregate total
+consumption, total solar, renewable ratio, and active meter count. **`outputMode("update")`**
+— per D3, each micro-batch upserts the windows it touched, so a window is visible ~10–12 real s
+after its first event and is revised as absorbed late data arrives; the watermark governs only
+when it becomes immutable (~16 real s after it ends), not when it is first seen.
+**Done when:** A console sink shows one row per `(zone, window)` with plausible values, windows
+advance at the simulated rate, and a window's totals visibly *increase* across two consecutive
+micro-batches while it is still open.
 
 ### T089 — Speed layer: zone sink
 **Files:** `src/voltstream/streaming/speed_layer.py`
@@ -920,22 +1040,27 @@ that change every ~10 s.
 
 ### T090 — Speed layer: per-household running total
 **Files:** `src/voltstream/streaming/speed_layer.py`
-**Do:** A second aggregation grouped by `(household_id, sim_date)`, accumulating consumption,
-solar and the netting outputs via `core/spark_expr.py`. **Note this is a stateful aggregate
-spanning a whole simulated day**, so its state retention must be sized for that — a watermark
-tuned for the 15-minute zone window will evict it long before the day closes. Use a separate
-watermark, or a separate stream.
+**Do:** A second aggregation grouped by `(household_id, window(event_ts, "1 day"))`,
+accumulating consumption, solar and the netting outputs via `core/spark_expr.py`. Per D3,
+group by a **1-day event-time window**, not by a derived `sim_date` column: the window key is
+what lets the same 30-sim-min watermark evict the day's state ~16 real s after simulated
+midnight. A derived date column would never be evicted. Derive `sim_date` from `window.start`
+for the sink.
 **Done when:** `household_running_rt` totals rise monotonically through the simulated day and
-reset at simulated midnight.
+reset at simulated midnight; the streaming query's state-store metrics show the previous day's
+keys evicted shortly after midnight.
 
 ### T091 — Speed layer: provisional bill against yesterday's tariff
 **Files:** `src/voltstream/streaming/speed_layer.py`
 **Do:** Broadcast-join yesterday's tariff (from `voltstream-archive`, or the landing file for
-`sim_date − 1`); compute `estimated_bill` with `core/spark_expr.py`; set `tariff_source_date`
-to that file's date — **deliberately stale, deliberately labelled** (§3.1). Reload the broadcast
-when the simulated day rolls over.
-**Done when:** `tariff_source_date == sim_date − 1` and `estimated_bill` is non-null for all 50
-households.
+`sim_date − 1`); compute **every** bill component with `core/spark_expr.py` — the same call the
+batch job makes — and persist all of them per D4 (`self_consumed_kwh`, `energy_charge`,
+`fixed_charge`, `subsidy_discount`, `export_credit`, `tier_breakdown`, `estimated_bill`); set
+`tariff_source_date` to that file's date — **deliberately stale, deliberately labelled** (§3.1).
+Reload the broadcast when the simulated day rolls over.
+**Done when:** `tariff_source_date == sim_date − 1`, every D4 column is non-null for all 50
+households, and `estimated_bill == energy_charge + fixed_charge − subsidy_discount −
+export_credit` row by row.
 
 ### T092 — Speed layer: metrics
 **Files:** `src/voltstream/streaming/speed_layer.py`
@@ -956,13 +1081,15 @@ the three numbers are consistent.
 
 ### T094 — Verify the watermark actually drops stragglers
 **Files:** `tests/integration/test_watermark_behaviour.py` (new)
-**Do:** The `T004` decision only pays off if it is observable. With out-of-order injection on,
-assert the speed layer's daily total for a household is **strictly less than** the raw Parquet
-total for the same household and day. That gap is the speed-vs-batch delta the whole Lambda
-demonstration depends on (§3.2). If the gap is zero, the watermark is too generous and there is
-nothing to demo; if it is enormous, it is too tight and the speed view is useless.
-**Done when:** The test asserts a non-zero gap inside a configured sane band, and the observed
-percentage is recorded for the report.
+**Do:** The `T004` decision only pays off if it is observable. Two assertions, per D3:
+1. With the default fault config, the speed layer's daily kWh total across all households is
+   below the raw Parquet total by **0.25 % – 5 %** (modelled expectation ≈ 1.7 %). That gap is
+   the speed-vs-batch delta the whole Lambda demonstration depends on (§3.2).
+2. With `dropout_probability_per_meter_tick: 0` (network reordering still on), the gap is
+   **exactly zero**. This proves the watermark absorbs all reordering ≤ 30 sim min, and is what
+   makes T140's attribution — "the kWh gap is dropped backfill, nothing else" — honest.
+**Done when:** Both assertions pass, and the observed percentage from (1) is recorded for the
+report.
 
 ### T095 — Compose: `speed-layer`
 **Files:** `docker/docker-compose.yml`
@@ -1052,10 +1179,16 @@ generated when absent, echoed in a response header, and bound to the `T025` log 
 
 ### T106 — `api/models.py`: response schemas
 **Files:** `src/voltstream/api/models.py`
-**Do:** Pydantic response models for every endpoint. The bill response **must** carry
-`source: Literal["batch","speed"]` and `provisional: bool` — that labelling is the §3.2 merge
-contract and the thing the demo screenshots.
-**Done when:** The OpenAPI schema shows the enumerated `source` values.
+**Do:** Pydantic response models for every endpoint. Per D4, **one** `BillResponse` model
+serves both branches of the merge: `household_id`, `sim_date`, `source:
+Literal["batch","speed"]`, `provisional: bool`, `tariff_date` (speed → `tariff_source_date`,
+batch → `tariff_effective_date`), the five kWh figures, the four charge components,
+`tier_breakdown`, `total` (speed → `estimated_bill`, batch → `final_bill`), and batch-only
+optionals `readings_count`, `duplicates_removed`, `pipeline_run_id`, `computed_at` (null when
+provisional). The `source`/`provisional` labelling is the §3.2 merge contract and the thing
+the demo screenshots.
+**Done when:** The OpenAPI schema shows the enumerated `source` values, and a provisional and
+a final response for the same household differ only in values, never in keys.
 
 ### T107 — `api/routers/zones.py`
 **Files:** `src/voltstream/api/routers/zones.py`
@@ -1073,7 +1206,9 @@ contract and the thing the demo screenshots.
 **Files:** `README.md`
 **Do:** Fill the empty file with the §7/§8/§9-derived structure: what this is, an architecture
 diagram placeholder, prerequisites, quickstart (`make demo`), a service/port table, and a
-"where to look" map from rubric criterion to file.
+"where to look" map from rubric criterion to file. Per D7, one line near the top: *"The
+repository is `volstream`; the Python package, Compose project and all runtime names are
+`voltstream`."* Clone instructions use the real slug.
 **Done when:** Someone who has never seen the repository can start it from the README alone.
 
 ### T110 — Makefile
@@ -1111,7 +1246,9 @@ partition.
 
 ### T113 — `batch/daily_billing.py`: reference joins
 **Files:** `src/voltstream/batch/daily_billing.py`
-**Do:** Read the tariff CSV for the run date from `voltstream-landing`; validate against
+**Do:** Read the tariff CSV for the run date from `voltstream-landing` with an **explicit
+schema** — `DecimalType(12,2)` for money and rates, `DecimalType(5,2)` for `subsidy_pct`,
+never `inferSchema`, which yields `DoubleType` and silently defeats D5; validate against
 `TariffRecord`; join on `household_id` with the **effective-dated** rule — §10.2 is explicit
 that this is a simple effective-dated join, not full SCD Type 2, so pick the latest row with
 `effective_date <= sim_date` and say so. Join weather on `grid_zone`. **Fail the job loudly if
@@ -1159,43 +1296,84 @@ small static DataFrames. No Kafka, no MinIO.
 
 ### T119 — `airflow.Dockerfile`
 **Files:** `docker/images/airflow.Dockerfile`
-**Do:** Official Airflow image plus **only** orchestration dependencies (the Docker or Amazon
-provider, per `T007`). **No PySpark, no FastAPI** — §5.6: "Airflow's notoriously constrained
-dependency set never has to coexist with PySpark and FastAPI in one image."
-**Done when:** `docker run --rm <img> python -c "import pyspark"` fails, and the image is
-materially smaller than the Spark image.
+**Do:** `apache/airflow:<3.x latest stable>-python3.11` plus **only** the three providers D6
+names — `apache-airflow-providers-docker`, `-amazon`, `-postgres` — installed with that
+version's constraints file. **No PySpark, no FastAPI, no `voltstream`** — §5.6: "Airflow's
+notoriously constrained dependency set never has to coexist with PySpark and FastAPI in one
+image." The DAGs read their three tunables from `config/base.yaml` mounted `:ro` with
+`yaml.safe_load`. D6 tripwire: if Airflow 3 + `DockerOperator` + proxy is not green within one
+working session, switch the base image to 2.11 — nothing in the DAGs is version-specific.
+**Done when:** `docker run --rm <img> python -c "import pyspark"` **and** `… "import
+voltstream"` both fail; `python -c "import airflow.providers.docker, airflow.providers.amazon,
+airflow.providers.postgres"` succeeds; the image is materially smaller than the Spark image.
 
-### T120 — Compose: Airflow
-**Files:** `docker/docker-compose.yml`
-**Do:** Scheduler + webserver + its metadata database — a **separate** database from the
-application one; sharing them makes the lineage story incoherent and risks the DAG's own
-bookkeeping contending with billing writes. Set `AIRFLOW_UID`; mount the DAGs directory; mount
-the Docker socket if `T007` chose `DockerOperator`.
-**Done when:** The Airflow UI loads and the scheduler heartbeat is current.
+### T120 — Compose: Airflow and the socket proxy
+**Files:** `docker/docker-compose.yml`, `docker/init/postgres/00_airflow_db.sql` (new)
+**Do:** Per D6, two tier-4 services. (1) `docker-socket-proxy` (`tecnativa/docker-socket-proxy`)
+with `/var/run/docker.sock` mounted **into the proxy only**, `CONTAINERS=1 POST=1 IMAGES=1
+NETWORKS=1`, everything else off. (2) `airflow` as **one** container running `airflow
+standalone` with `AIRFLOW__CORE__EXECUTOR=LocalExecutor`,
+`AIRFLOW__DATABASE__SQL_ALCHEMY_CONN` → a **separate** `airflow` database on the existing
+Postgres instance (created by `00_airflow_db.sql` in `docker-entrypoint-initdb.d`, which runs
+on first init only — never the application database), `AIRFLOW_CONN_MINIO_S3` and
+`AIRFLOW_CONN_VOLTSTREAM_PG` as env vars (no UI clicking), `AIRFLOW_UID`, `dags/` mounted,
+`config/base.yaml` mounted `:ro`. The Docker socket is **not** mounted into Airflow.
+**Done when:** The Airflow UI loads and the scheduler heartbeat is current; a scratch DAG with
+a `DockerOperator(image="alpine", command="echo ok", docker_url="tcp://docker-socket-proxy:2375",
+mount_tmp_dir=False, network_mode=<compose network>)` succeeds; `\l` in Postgres shows
+`airflow` and the app database as separate databases.
 
-### T121 — `daily_billing_dag.py`: the sensor
-**Files:** `airflow/dags/daily_billing_dag.py`
-**Do:** The tariff-arrival sensor chosen in `T007` — `S3KeySensor` against MinIO, **not**
-`FileSensor`, which cannot see an object-store key. Poke mode, 30 s interval, timeout aligned
-with `alerts.batch_sla_minutes`.
-**Done when:** The sensor stays running until `reference_dropper` writes the file, then succeeds
-within one poke interval.
+### T121 — `tariff_watcher_dag.py` and the head of `daily_billing_dag.py`
+**Files:** `airflow/dags/tariff_watcher_dag.py` (new, per D6), `airflow/dags/daily_billing_dag.py`
+**Do:** Per D6 Design B. **Watcher:** schedule every real minute, `catchup=False`,
+`max_active_runs=1`; one `@task` lists `voltstream-landing/tariff/` via the S3 hook, parses
+`tariff_(\d{4}-\d{2}-\d{2})\.csv`, and feeds
+`TriggerDagRunOperator.partial(trigger_dag_id="daily_billing", skip_when_already_exists=True)
+.expand_kwargs([...])` with `trigger_run_id=f"billing__{d}"` and `conf={"sim_date": d}`.
+Idempotent by construction. **Billing DAG head:** `schedule=None`,
+`params={"sim_date": Param(type="string", format="date")}`, `max_active_runs=1`,
+`catchup=False`. First task: `S3KeySensor` on `tariff_{{ params.sim_date }}.csv` against MinIO
+(`aws_conn_id` from the env-var connection) — **not** `FileSensor`, which cannot see an
+object-store key — `check_fn` size > 0, poke mode, 15 s, `timeout = alerts.batch_sla_minutes
+× 60`. Second task: `@task wait_late_data_grace` reads the object's `LastModified` and sleeps
+until `LastModified + batch.late_data_grace_real_seconds` (90). Per D3: a meter dropout that
+straddles simulated midnight flushes D−1 readings up to 30 real s after midnight, and the
+archiver commits them up to a trigger later; without the wait, the rescan can start before
+D−1's partition is complete — and the batch layer's entire justification is completeness. For a
+restatement of an old file the wait is a no-op.
+**Done when:** Within a minute of `reference_dropper` writing `tariff_D.csv`, a run
+`billing__D` exists; re-running the watcher creates no duplicate; the sensor succeeds within
+one poke; the grace task's log shows the computed wake time and the billing job starts ≥ 90
+real s after the file's `LastModified`.
 
 ### T122 — `daily_billing_dag.py`: submit and verify
 **Files:** `airflow/dags/daily_billing_dag.py`
-**Do:** Task 1 submits `daily_billing.py` via the `T007` mechanism. Task 2 verifies the result
-in SQL: 50 rows present, no nulls, `final_bill` within sane bounds. Retries with exponential
-backoff and an SLA per §5.6. **Zero business logic in the DAG** (§5.6: "they submit Spark jobs
-and verify results").
-**Done when:** No tariff or netting arithmetic appears anywhere under `airflow/dags/`.
+**Do:** Per D6: `run_daily_billing` is a `DockerOperator` on `voltstream-spark:local` with
+`docker_url="tcp://docker-socket-proxy:2375"`, `mount_tmp_dir=False`, `network_mode=<compose
+network>`, `force_pull=False`, `auto_remove="force"`, credentials in `private_environment`,
+`AIRFLOW_CTX_DAG_RUN_ID` passed through for lineage (`pipeline_runs.orchestrator_run_id`),
+and the full command `spark-submit … daily_billing.py --sim-date {{ params.sim_date }}`.
+Then `verify_bills`: an `SQLValueCheckOperator` (50 rows) and an `SQLCheckOperator` (no nulls,
+`final_bill` within sane bounds) on the `VOLTSTREAM_PG` connection. `retries=2` with
+exponential backoff on compute tasks — T115's transaction makes a retry safe. **No task
+`sla=`** (removed in Airflow 3; `BatchSLAMiss` in T147 is the SLA). **Zero business logic in
+the DAG** (§5.6: "they submit Spark jobs and verify results").
+**Done when:** No tariff or netting arithmetic appears anywhere under `airflow/dags/`; the
+task log shows the Spark job's structured JSON log lines streamed from the child container.
 
-### T123 — `daily_billing_dag.py`: make backfill work
+### T123 — `daily_billing_dag.py`: make restatement work
 **Files:** `airflow/dags/daily_billing_dag.py`
-**Do:** Parameterise on the logical date and make the DAG genuinely idempotent, so
-`airflow dags backfill` works. §5.6: "That command *is* the Lambda restatement mechanism." It is
-the single highest-value demo in the project — it must actually work, not merely be configured.
-**Done when:** `airflow dags backfill --start-date X --end-date Y daily_billing` reruns a
-completed day, producing updated rows and a `superseded` run row.
+**Do:** Per D6, restatement is **a new run of the same DAG for the same `sim_date`** with
+`run_id = billing__<date>__r<n>` — not `airflow dags backfill`, whose data intervals are real
+time and cannot address a simulated day. Make the DAG genuinely idempotent under that: every
+task keyed on `params.sim_date`, nothing keyed on the logical date, and T040's supersede logic
+exercised. §5.6's *mechanism* — re-execute deterministic code over immutable inputs for a
+past day — is exactly this; only the CLI verb changes. It is the single highest-value demo in
+the project — it must actually work, not merely be configured.
+**Done when:** `airflow dags trigger daily_billing --conf '{"sim_date":"D"}' --run-id
+billing__D__r2` on an already-finalised day D produces updated `household_bill_daily` rows, a
+`superseded` + `success` pair in `pipeline_runs` (with two distinct `orchestrator_run_id`s),
+and both runs remain visible in the UI.
 
 ### T124 — `batch/daily_zone_rollup.py`
 **Files:** `src/voltstream/batch/daily_zone_rollup.py`, `airflow/dags/daily_billing_dag.py`
@@ -1225,10 +1403,11 @@ a `success` row in `pipeline_runs`, and an archived tariff parquet.
 finalised row in `household_bill_daily` → return it with `source="batch", provisional=false`;
 otherwise the speed estimate with `source="speed", provisional=true`. §3.2 calls it nine lines of
 logic — keep it nine lines, and comment it as the physical embodiment of
-`query = merge(batch_view, realtime_view)`. Per `T005`, recompute the provisional figure from the
-stored kWh via `core/tariff.py`.
+`query = merge(batch_view, realtime_view)`. Per D4, it does **no arithmetic**: pick a row, map
+it to `BillResponse`. The API is `SELECT`-only.
 **Done when:** The same household and date returns `speed` before the DAG runs and `batch` after,
-with no restart in between.
+with no restart in between; and `grep -rn "core.tariff\|core.netting" src/voltstream/api/`
+returns nothing.
 
 ### T128 — Merge-function tests
 **Files:** `tests/integration/test_merge_function.py` (new)
@@ -1240,10 +1419,12 @@ row → does **not** flip to batch. A `superseded` + `success` pair → does fli
 ### T129 — Bill-delta endpoint
 **Files:** `src/voltstream/api/routers/households.py`
 **Do:** `GET /api/v1/households/{id}/bill/delta?date=…` returning speed estimate, batch final,
-and absolute and percentage divergence side by side. §3.2: a screenshot of the same household
-before and after finalisation "proves comprehension of Lambda more convincingly than several
-pages of prose" — so make that screenshot a single request.
-**Done when:** One request returns both figures and the delta.
+absolute and percentage divergence, and — once the day is reconciled — the D4 decomposition
+`tariff_effect` and `data_effect` from `reconciliation_daily`. §3.2: a screenshot of the same
+household before and after finalisation "proves comprehension of Lambda more convincingly than
+several pages of prose" — so make that screenshot a single request, and let it say *why* the
+figures differ.
+**Done when:** One request returns both figures, the delta, and the two effects summing to it.
 
 ### T130 — `api/routers/reports.py`
 **Files:** `src/voltstream/api/routers/reports.py`
@@ -1299,12 +1480,18 @@ daily report file is generated.
 
 ### T137 — `batch/reconciliation.py`
 **Files:** `src/voltstream/batch/reconciliation.py`
-**Do:** After each billing run, compare `household_running_rt.estimated_bill` against
-`household_bill_daily.final_bill` per household, writing `reconciliation_daily` with absolute and
-percentage divergence.
-**Done when:** 50 rows per simulated day with non-trivial divergence. If divergence is exactly
-zero everywhere, either the watermark is dropping nothing (see `T094`) or the stale-tariff logic in
-`T091` is not actually stale — both are bugs, not successes.
+**Do:** After each billing run, compare `household_running_rt.estimated_bill` (`S`) against
+`household_bill_daily.final_bill` (`B`) per household. Per D4 this is **plain Python, no
+`SparkSession`** — 50 rows — and it is the pure module's production caller: read today's
+tariff CSV from the landing bucket via `objectstore.py`, compute the counterfactual
+`C = compute_bill(netting(speed_kwh), today's tariff)` with `core/tariff.py`, and write
+`reconciliation_daily` with `abs_divergence`, `pct_divergence`, `tariff_effect = S − C` and
+`data_effect = C − B`. Runs on the **app** image.
+**Done when:** 50 rows per simulated day with non-trivial divergence, and
+`tariff_effect + data_effect == speed_estimate − batch_final` on every row. If divergence is
+exactly zero everywhere, either the watermark is dropping nothing (see `T094`) or the
+stale-tariff logic in `T091` is not actually stale — both are bugs, not successes. If
+`data_effect` is zero but `tariff_effect` is not, D3's dropouts are off.
 
 ### T138 — Reconciliation metric
 **Files:** `src/voltstream/batch/reconciliation.py`
@@ -1319,16 +1506,23 @@ lines of code, and the thing an examiner will remember."
 
 ### T140 — Attribute the divergence in writing
 **Files:** `docs/architecture/01-lambda-vs-kappa.md` (or `05-open-decisions.md` until it exists)
-**Do:** Record the two causes of divergence and their measured relative contribution: (a) events
-dropped past the speed layer's watermark, (b) yesterday's tariff versus today's. Being able to
-*attribute* the delta — not merely display it — is the difference between showing a number and
-understanding the architecture, and it is a very likely viva question.
-**Done when:** The measured split is written down, with numbers from a real run.
+**Do:** Record the two causes of divergence and their measured relative contribution — per D4
+these are now read straight from `reconciliation_daily`, not estimated: (a) `data_effect` —
+backfill dropped past the speed layer's watermark (D3), (b) `tariff_effect` — yesterday's
+tariff versus today's (D2). Check the mean `data_effect` in kWh terms against D3's modelled
+~1.7 % gap. Being able to *attribute* the delta — not merely display it — is the difference
+between showing a number and understanding the architecture, and it is a very likely viva
+question.
+**Done when:** The measured split is written down, with numbers from a real run, and the
+`data_effect` share is inside T094's band.
 
 ### T141 — Reconciliation tests
 **Files:** `tests/unit/test_reconciliation.py` (new)
-**Do:** The divergence arithmetic, including division-by-zero when `final_bill` is 0, and the
-negative-bill case from `T006`.
+**Do:** The divergence arithmetic per D4/D5: `pct_divergence = 100 × abs_divergence /
+(batch.energy_charge + batch.fixed_charge)`, and `0` when that base is `0` — the base is
+**gross charges, not `final_bill`**, because a net exporter's `final_bill` can be negative or
+near zero. Cases: base `= 0`; negative `final_bill`; the identity
+`tariff_effect + data_effect == speed_estimate − batch_final` on every row; all `Decimal`.
 **Done when:** Test passes.
 
 ---
@@ -1471,12 +1665,18 @@ more; confirm `LambdaDivergenceHigh` fires after the next batch run.
 
 ### T162 — `scripts/backfill.sh` — the restatement demo
 **Files:** `scripts/backfill.sh`
-**Do:** §5.6's thirty-second demo, scripted: corrupt a tariff file → run the DAG → print the wrong
-bills → restore the file → `airflow dags backfill` → print the corrected bills → print the diff.
-Confirms `T040`'s superseded-run handling under real conditions. §5.6: "That single demo defends
-the entire architecture chapter."
+**Do:** §5.6's thirty-second demo, scripted: corrupt a monetary column in the day's tariff CSV
+(D2: e.g. `block_2_rate` `16.50 → 61.50`) → trigger a restatement run → print the wrong bills
+→ restore the file → trigger another → print the corrected bills → print the diff. Per D6 the
+restatement command is `docker compose exec airflow airflow dags trigger daily_billing --conf
+'{"sim_date":"<date>"}' --run-id billing__<date>__r<n>`, with `<n>` computed from the existing
+runs; the script polls the run to completion. Confirms `T040`'s superseded-run handling under
+real conditions and leaves **both** runs visible in the Airflow UI — the audit trail shows the
+wrong bill, the corrected bill, and which run produced each. §5.6: "That single demo defends
+the entire architecture chapter." Keep the `make backfill d=<date>` name.
 **Done when:** Running it end to end produces a visible before/after bill table with no manual
-intervention.
+intervention, and `pipeline_runs` shows `superseded → superseded → success` for the day with
+three distinct `orchestrator_run_id`s.
 
 ### T163 — `scripts/demo.sh`
 **Files:** `scripts/demo.sh`
@@ -1551,9 +1751,13 @@ and that observed fault rates match configuration.
 **Files:** `tests/integration/test_batch_end_to_end.py`
 **Do:** Write a known synthetic day to Parquet and a known tariff CSV; run `daily_billing.py`;
 assert the exact expected bills — **hand-computed**, not regenerated from the code under test. A
-test that computes its own expectation from the implementation asserts nothing.
-**Done when:** Passes, and changing a block rate in config changes the expected value — proving the
-test checks arithmetic rather than plumbing.
+test that computes its own expectation from the implementation asserts nothing. The first three
+households are the D5 worked examples (`720.17`, `454.41`, `−150.00`). Then, per D5, **run the
+job a second time on the same fixtures and assert every `household_bill_daily` row is identical**
+(excluding `pipeline_run_id` and `computed_at`) — this is §5.4's "byte-identical output" claim
+as a test, and it is what `DecimalType` buys over float64.
+**Done when:** Passes, and changing a block rate in the fixture CSV changes the expected value —
+proving the test checks arithmetic rather than plumbing.
 
 ### T173 — Test fixtures
 **Files:** `tests/fixtures/`
