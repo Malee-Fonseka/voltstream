@@ -1,0 +1,210 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+# ---------------------------------------------------------------------------
+# Project metadata — decision T015. Tool configuration (ruff, mypy, pytest,
+# coverage) is added in T016.
+# ---------------------------------------------------------------------------
+[project]
+name = "voltstream"
+description = "Smart-grid energy monitoring and billing platform on a Lambda architecture (EC8203 mini project)."
+readme = "README.md"
+# D1: PySpark 3.5.x is tested against Python 3.8-3.11. Do not widen the upper bound.
+requires-python = ">=3.11,<3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Maleesha Fonseka" },
+]
+keywords = ["lambda-architecture", "kafka", "spark", "airflow", "smart-grid", "billing"]
+classifiers = [
+  "Private :: Do Not Upload",
+  "Programming Language :: Python :: 3.11",
+  "License :: OSI Approved :: MIT License",
+  "Topic :: Scientific/Engineering",
+]
+dynamic = ["version"]
+
+# Base dependencies: everything every service imports (config, contracts, metrics).
+# Deliberately small — each Docker image adds exactly one or two extras below.
+dependencies = [
+  "pydantic>=2.7,<3",
+  "pydantic-settings>=2.3,<3",
+  "pyyaml>=6,<7",
+  "prometheus-client>=0.20,<1",
+]
+
+# §7.3: optional dependency groups so the API image never ships a Spark
+# distribution and the Airflow image never sees any of these at all.
+[project.optional-dependencies]
+# Spark image (speed layer, raw archiver, batch jobs). psycopg is here because the
+# Spark driver performs the Postgres upsert inside foreachBatch (D4, T086).
+spark = [
+  "pyspark==3.5.*",
+  "psycopg[binary]>=3.1,<4",
+]
+# App image, API half: FastAPI + Postgres + object-store health check (§10.1).
+api = [
+  "fastapi>=0.110,<1",
+  "uvicorn[standard]>=0.29,<1",
+  "psycopg[binary]>=3.1,<4",
+  "prometheus-fastapi-instrumentator>=7,<8",
+  "boto3>=1.34,<2",
+]
+# App image, simulator half: Kafka producer, load/solar curves, MinIO writes.
+sim = [
+  "confluent-kafka>=2.3,<3",
+  "numpy>=1.26,<3",
+  "boto3>=1.34,<2",
+]
+# Local development and CI. CI installs ".[dev,api,sim,spark]" (T169).
+dev = [
+  "pytest>=8,<9",
+  "pytest-cov>=5,<7",
+  "hypothesis>=6.100,<7",
+  "ruff>=0.5,<1",
+  "mypy>=1.10,<2",
+  "pre-commit>=3.7,<5",
+  "httpx>=0.27,<1",
+  "types-PyYAML>=6",
+]
+
+# Console entry points — one per ENTRYPOINT module in §7.2. Each module must
+# expose a zero-argument `main()` (the API exposes `run()`). Spark jobs are also
+# launched via spark-submit by the DAG (D6); these scripts are for local runs.
+[project.scripts]
+voltstream-producer     = "voltstream.simulators.meter_producer:main"
+voltstream-dropper      = "voltstream.simulators.reference_dropper:main"
+voltstream-speed-layer  = "voltstream.streaming.speed_layer:main"
+voltstream-archiver     = "voltstream.streaming.raw_archiver:main"
+voltstream-billing      = "voltstream.batch.daily_billing:main"
+voltstream-zone-rollup  = "voltstream.batch.daily_zone_rollup:main"
+voltstream-reconcile    = "voltstream.batch.reconciliation:main"
+voltstream-api          = "voltstream.api.main:run"
+
+# ---------------------------------------------------------------------------
+# Build configuration
+# ---------------------------------------------------------------------------
+[tool.hatch.version]
+path = "src/voltstream/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/voltstream"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "src/voltstream",
+  "config",
+  "LICENSE",
+  "README.md",
+  "pyproject.toml",
+]
+
+# ---------------------------------------------------------------------------
+# Tooling — decision T016. `make lint` (T110) runs ruff + mypy and, per D7,
+# `grep -rni volstream src/ docker/ config/ airflow/ scripts/ tests/`.
+# ---------------------------------------------------------------------------
+
+# --- ruff: lint + format -----------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+extend-exclude = ["docs", "dashboard", "config", "docker"]
+
+[tool.ruff.lint]
+# E/W pycodestyle, F pyflakes, I isort, UP pyupgrade, B bugbear.
+select = ["E", "W", "F", "I", "UP", "B"]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+# Re-exports from package __init__ files are intentional.
+"__init__.py" = ["F401"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["voltstream"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+# --- mypy --------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+files = ["src/voltstream"]
+plugins = ["pydantic.mypy"]
+# Baseline for the whole package.
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_unreachable = true
+no_implicit_optional = true
+check_untyped_defs = true
+disallow_incomplete_defs = true
+show_error_codes = true
+pretty = true
+
+# core/ is the shared transformation module (§4.4). It is held to strict typing:
+# these are the flags `--strict` enables, spelled out because `strict` itself
+# is global-only and cannot be set per module.
+[[tool.mypy.overrides]]
+module = ["voltstream.core.*"]
+disallow_untyped_defs = true
+disallow_untyped_calls = true
+disallow_any_generics = true
+disallow_subclassing_any = true
+disallow_untyped_decorators = true
+warn_return_any = true
+no_implicit_reexport = true
+strict_equality = true
+extra_checks = true
+
+# Third-party libraries without (complete) type information.
+[[tool.mypy.overrides]]
+module = [
+  "pyspark.*",
+  "py4j.*",
+  "confluent_kafka.*",
+  "prometheus_fastapi_instrumentator.*",
+  "boto3.*",
+  "botocore.*",
+  "hypothesis.*",
+]
+ignore_missing_imports = true
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+# --- pytest ------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+# --strict-markers: unregistered @pytest.mark.* is an error.
+# --strict-config:  any unknown key in this section is an error.
+addopts = "-ra --strict-markers --strict-config"
+xfail_strict = true
+markers = [
+  "integration: needs the Docker Compose stack (Kafka, Postgres, MinIO); excluded from `make test`, run by `make test-all`",
+  "slow: takes more than a few seconds, e.g. starts a local SparkSession",
+]
+
+# --- coverage ----------------------------------------------------------------
+# The CI gate (T170) is `--cov=voltstream.core --cov-fail-under=<N>`: core/ is
+# where the correctness marks live; gating the whole package rewards testing glue.
+[tool.coverage.run]
+source = ["voltstream"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+precision = 1
+exclude_lines = [
+  "pragma: no cover",
+  "if TYPE_CHECKING:",
+  "if __name__ == .__main__.:",
+  "raise NotImplementedError",
+  "^\\s*\\.\\.\\.\\s*$",
+]

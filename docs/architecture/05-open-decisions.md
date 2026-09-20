@@ -1,7 +1,7 @@
 # voltstream — Decision Log
 
 Architecture Decision Records for the questions the
-[Master Design](../Master_Design.md) leaves ambiguous or self-contradictory.
+[Master Design](00-master-design.md) leaves ambiguous or self-contradictory.
 Each is load-bearing for code written later. Nothing in `src/` that depends on a
 decision below may be written until that decision's **Decision** section is filled.
 

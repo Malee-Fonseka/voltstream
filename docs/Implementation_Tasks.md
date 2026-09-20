@@ -1,7 +1,9 @@
 # voltstream — Implementation Task List
 
-**Companion to [`Master_Design.md`](Master_Design.md).** That document says *what* and
-*why*. This one says *in what order*, in units small enough to review one at a time.
+**Companion to [`00-master-design.md`](architecture/00-master-design.md).** That document
+says *what* and *why*. This one says *in what order*, in units small enough to review one at
+a time. Decisions that the design left open are recorded in
+[`05-open-decisions.md`](architecture/05-open-decisions.md).
 
 ---
 
@@ -14,7 +16,8 @@
   check; if you cannot demonstrate it, the task is not done.
 - **Gates** (`G1`–`G5`) are hard stops carried over from Master Design §9. Do not proceed
   past a gate with it red.
-- `§x.y` references point into `Master_Design.md`.
+- `§x.y` references point into `architecture/00-master-design.md`; `Dn` references point
+  into `architecture/05-open-decisions.md`.
 
 ### Conventions
 
@@ -31,7 +34,8 @@
   (only the four Dockerfiles / compose file contain a single comment line).
 - Layout is flat `src/…`, **not** the `src/voltstream/…` package layout §7.2 requires.
 - Several stub filenames are misspelled relative to §7.2 (see `T012`).
-- `docs/` contains only `Master_Design.md`.
+- `docs/` contains only `Master_Design.md` (moved to `architecture/00-master-design.md` in
+  T014).
 - `config/`, `dashboard/`, `.github/`, `docs/architecture/`, `tests/property/`,
   `tests/consistency/`, `tests/integration/`, `tests/fixtures/` do not exist.
 - `.venv` is **Python 3.13** — see `T002`. This is a blocking compatibility risk.
@@ -576,9 +580,14 @@ does not duplicate seed rows.
 
 ### T047 — Bootstrap: `minio-init`
 **Files:** `docker/init/minio/create_buckets.sh`, `docker/docker-compose.yml`
-**Do:** Create the four buckets from §6.3: `voltstream-raw`, `voltstream-landing`,
-`voltstream-archive`, `voltstream-checkpoints`. Idempotent (`mc mb --ignore-existing`).
-**Done when:** `mc ls local/` lists all four; re-running exits 0.
+**Do:** Create the buckets from §6.3 — `voltstream-raw`, `voltstream-landing`,
+`voltstream-archive` — names taken from the `MINIO_BUCKET_*` variables in `.env` (T018).
+Idempotent (`mc mb --ignore-existing`). **Decide the fourth:** §6.3 lists
+`voltstream-checkpoints` for Spark checkpoints, but §8.5 and T044 put checkpoints on named
+Docker volumes (and §5.4's own object-store commit caveat argues against checkpointing to
+S3A). Recommended: drop the bucket and remove `MINIO_BUCKET_CHECKPOINTS` from
+`.env.example`; add §6.3 to T182's reconciliation list either way.
+**Done when:** `mc ls local/` lists every bucket named in `.env`; re-running exits 0.
 
 ### T048 — `app.Dockerfile`
 **Files:** `docker/images/app.Dockerfile`
@@ -1093,7 +1102,7 @@ report.
 
 ### T095 — Compose: `speed-layer`
 **Files:** `docker/docker-compose.yml`
-**Do:** Tier-3 Spark service with its own checkpoint volume, its own metrics port, and — 
+**Do:** Tier-3 Spark service with its own checkpoint volume, its own metrics port, and —
 critically — **its own consumer group**, distinct from the archiver's. §5.2: independent
 consumer groups are "what makes the two-branch Lambda shape possible from a single source."
 **Done when:** `kafka-consumer-groups --describe` shows **two** groups on `meter.readings`, both

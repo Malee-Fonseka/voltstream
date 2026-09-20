@@ -1,0 +1,75 @@
+# pre-commit hooks — decision T017.
+#
+# Install once per clone:   pre-commit install
+# Run on everything:        pre-commit run --all-files
+# Update pinned versions:   pre-commit autoupdate
+#
+# Every hook here runs in an environment pre-commit builds itself, so results do
+# not depend on which `python` the committing process happens to find on PATH
+# (a real hazard on Windows, where it can be the Microsoft Store stub). The one
+# consequence: the mypy hook does not see the project's third-party packages,
+# so it runs with --ignore-missing-imports. CI's `mypy src` in the full
+# environment (T169) is the authoritative type check; this hook is the fast one.
+
+default_language_version:
+  python: python3.11
+
+default_stages: [pre-commit]
+
+repos:
+  # --- generic hygiene --------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        # Complements .gitattributes (T009): LF everywhere except Windows scripts.
+        args: [--fix=lf]
+        exclude: '\.(ps1|bat|cmd)$'
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: check-added-large-files
+        # Screenshots and Grafana exports are committed evidence; raw data is not.
+        args: [--maxkb=2048]
+      - id: check-executables-have-shebangs
+      - id: detect-private-key
+
+  # --- ruff: lint (with autofix) and format; config lives in pyproject.toml -----
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.8
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  # --- mypy: whole package each run (incremental cache keeps it fast) -----------
+  # Keep this rev on the same major as `mypy` in pyproject's [dev] extra; bump
+  # both together, or the hook and CI will disagree.
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.20.2
+    hooks:
+      - id: mypy
+        pass_filenames: false
+        args: [src/voltstream, --ignore-missing-imports]
+        # The pydantic mypy plugin (pyproject [tool.mypy].plugins) must be
+        # importable inside the hook's own environment.
+        additional_dependencies:
+          - "pydantic>=2.7,<3"
+          - "pydantic-settings>=2.3,<3"
+          - "types-PyYAML>=6"
+
+  # --- project rules ------------------------------------------------------------
+  - repo: local
+    hooks:
+      # D7: the repository slug is `volstream`; the code is `voltstream`. The
+      # misspelling may appear only in the README's note and in repository URLs.
+      - id: no-volstream-misspelling
+        name: D7 — no 'volstream' inside source, config, docker, airflow, scripts, tests
+        language: pygrep
+        entry: '(?i)volstream'
+        files: ^(src|docker|config|airflow|scripts|tests)/
