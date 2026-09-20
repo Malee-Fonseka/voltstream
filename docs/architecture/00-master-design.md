@@ -1237,17 +1237,30 @@ upstream.
   windowing.
 
 **T+5:00 onward — Airflow.**
-The DAG runs a `FileSensor` in poke mode, checking every 30 seconds for the tariff
-file. On arrival:
+A small `tariff_watcher` DAG lists the MinIO landing bucket every real minute. When it
+sees `tariff_2026-08-10.csv` it triggers one run of `daily_billing` with
+`sim_date=2026-08-10` (parsed from the filename) and `run_id=billing__2026-08-10`;
+re-offering the same date later is skipped, so the trigger is idempotent. The
+`daily_billing` run then:
 
-1. **Submit the Spark billing job.** Reads the *entire* `sim_date=2026-08-10/`
-   Parquet partition; deduplicates on `(meter_id, event_ts)`; joins the tariff and
-   weather dimensions; applies netting and block-tariff logic from `core/`; writes
-   `household_bill_daily`.
-2. **Run `reconciliation.py`.** Compares each household's speed estimate against the
-   batch final; writes `reconciliation_daily`; emits the divergence as a Prometheus
-   gauge.
-3. **Mark the day finalised** by inserting a `success` row into `pipeline_runs`.
+0. **Waits on an `S3KeySensor`** for the tariff object (the file is in object storage,
+   so a local `FileSensor` cannot see it), then **waits a 90-second late-data grace**
+   after the object's `LastModified`, so store-and-forward backfills for the closed day
+   have landed in the Parquet partition before it is rescanned (decision D3).
+1. **Submit the Spark billing job** as a sibling container via `DockerOperator`. Reads
+   the *entire* `sim_date=2026-08-10/` Parquet partition; deduplicates on
+   `(meter_id, event_ts)`; joins the tariff and weather dimensions; applies netting and
+   block-tariff logic from `core/`; writes `household_bill_daily`; and **marks the day
+   finalised** by inserting a `success` row into `pipeline_runs` in the same
+   transaction.
+2. **Verifies the result in SQL** (50 rows, no nulls), runs the zone roll-up, and fails
+   the run if `sum(zone totals) ≠ sum(household totals)`.
+3. **Run `reconciliation.py`.** Compares each household's speed estimate against the
+   batch final; writes `reconciliation_daily`, splitting the divergence into a tariff
+   effect and a data effect; emits the divergence as a Prometheus gauge.
+
+Airflow itself contains no billing logic and no PySpark — it launches containers and
+checks tables (decision D6).
 
 **T+5:30 (approx.) — the merge function flips.**
 `GET /api/v1/households/HH-0042/bill?date=2026-08-10` now finds a finalised row and
