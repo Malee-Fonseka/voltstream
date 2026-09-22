@@ -1,0 +1,188 @@
+# voltstream — base application configuration (decision T019).
+#
+# Every tunable the Python code reads lives here — no magic numbers in source. Loaded by
+# `voltstream.config` (T021) with this precedence: base.yaml -> config/<VOLTSTREAM_ENV>.yaml
+# (deep-merge) -> environment variables VOLTSTREAM__SECTION__KEY -> .env. An unknown key
+# anywhere in the chain is a load-time error, not a silently ignored one.
+#
+# Every value below is commented with its unit and whether it governs SIMULATED time
+# (scaled by `simulation.time_scale`) or REAL wall-clock time. This distinction is load-
+# bearing — see D3 in docs/architecture/05-open-decisions.md for why conflating the two
+# breaks the watermark.
+#
+# This file holds non-secret, deployment-independent defaults only. Connection secrets
+# (Postgres password, MinIO/S3 credentials) live in .env (T018) and are read directly from
+# the process environment by voltstream.config — they are never duplicated here.
+
+# ==============================================================================
+# simulation — the simulated clock (§3.4) and the population it drives
+# ==============================================================================
+simulation:
+  # How many simulated seconds pass per real second. 288 -> 1 simulated day == 5 real
+  # minutes == 300 real seconds (86400 / 288). SIMULATED-time scale factor.
+  time_scale: 288
+  # How often (REAL seconds) meter_producer.py emits one reading per household.
+  emit_interval_seconds: 2
+  # Number of simulated households (HH-0001..HH-00NN). Must match the seeded row count
+  # in docker/init/postgres/03_seed_households.sql (T042).
+  households: 50
+  # Grid zones meter readings and tariff/weather rows are partitioned by.
+  zones: ["ZONE-A", "ZONE-B", "ZONE-C", "ZONE-D", "ZONE-E"]
+  # The REAL wall-clock instant that simulated time is anchored to (RFC 3339, UTC).
+  # sim_now() = epoch_real + (real_now() - process_start_real) * time_scale, so every
+  # process in a run must agree on this value for windows/dates to line up. Override per
+  # run with VOLTSTREAM__SIMULATION__EPOCH_REAL (see .env.example) for a reproducible demo
+  # start; this default is only used when that override is unset.
+  epoch_real: "2026-01-01T00:00:00Z"
+
+# ==============================================================================
+# faults — deliberate fault injection rates (simulators/faults.py, T069-T070)
+# ==============================================================================
+# D3: lateness has two distinct, deliberately separated mechanisms — network reordering
+# (always absorbed by the watermark) and comms-outage store-and-forward (mostly dropped).
+# Every rate here is a per-reading (or per-meter-tick) PROBABILITY, unitless, and safe to
+# set to 0 for a clean run (faults.py's contract: all rates 0 => output == input exactly).
+faults:
+  # Probability a reading is re-sent with the same event_id (tests dedup in core/keys.py).
+  duplicate_rate: 0.02
+  # Probability a reading's event_ts is shifted backwards — SIMULATED lateness, spread
+  # below. Always <= watermark_sim_minutes, so these are always absorbed, never dropped.
+  out_of_order_rate: 0.03
+  # Uniform range, in SIMULATED minutes, for the out-of-order shift above. Upper bound is
+  # deliberately equal to speed_layer.watermark_sim_minutes (D3).
+  out_of_order_lateness_sim_minutes: [1, 30]
+  # Probability a required field is nulled out (rejected by core/validation.py).
+  null_field_rate: 0.01
+  # Probability consumption_kwh or solar_generation_kwh is forced negative (rejected).
+  negative_value_rate: 0.005
+  # Probability a reading is stamped with a household_id outside the known set (rejected).
+  unknown_household_rate: 0.005
+  # Probability, PER METER PER TICK, that the meter goes silent and starts buffering
+  # (D3's comms-outage regime; distinct from out_of_order_rate above).
+  dropout_probability_per_meter_tick: 0.002
+  # How long (REAL seconds) a dropped-out meter buffers before flushing everything it
+  # buffered in one tick, event_ts values unchanged (store-and-forward). 30 real s ==
+  # 144 SIMULATED minutes == 15 buffered readings at emit_interval_seconds: 2.
+  dropout_duration_real_seconds: 30
+  # true = flush the buffer on reconnect (store-and-forward, D3's modelled ~1.7% kWh gap).
+  # false = discard the buffer instead (data genuinely lost) - kept as a switch so the demo
+  # can contrast the two behaviours.
+  dropout_backfill: true
+
+# ==============================================================================
+# kafka — topic layout (§5.2). Connection address is deployment-specific -> .env only.
+# ==============================================================================
+kafka:
+  topic: "meter.readings"
+  dlq_topic: "meter.readings.dlq"
+  partitions: 3
+  # REAL milliseconds. 7 days - long enough that the speed layer can be replayed from
+  # Kafka alone for recent history; the durable system of record is still voltstream-raw.
+  retention_ms: 604800000
+
+# ==============================================================================
+# speed_layer — Structured Streaming job (streaming/speed_layer.py)
+# ==============================================================================
+# D3: at this project's time scale the trigger interval, not the watermark, dominates
+# what gets dropped. Values pinned by the sizing model in 05-open-decisions.md.
+speed_layer:
+  # Tumbling window width, SIMULATED minutes, on event_ts.
+  window_sim_minutes: 15
+  # Watermark on event_ts, SIMULATED minutes. = 6.25 real s at time_scale 288; sized to be
+  # >= the out-of-order spread above, so network reordering is always absorbed.
+  watermark_sim_minutes: 30
+  # Structured Streaming micro-batch trigger interval, REAL seconds. = 48 SIMULATED
+  # minutes - this, not the watermark, is the dominant term in what gets dropped (D3).
+  trigger_interval_real_seconds: 10
+  # foreachBatch upsert mode. In "update" mode the watermark governs only when a window
+  # becomes immutable, not first visibility - see D3 consequence for the latency reasoning.
+  output_mode: "update"
+
+# ==============================================================================
+# batch — daily billing job (batch/daily_billing.py, orchestrated by Airflow)
+# ==============================================================================
+batch:
+  # REAL seconds to wait, after the tariff-file sensor succeeds, before the batch job
+  # reads the raw partition - gives straddling-midnight dropout backfills (D3) time to
+  # land. Comfortably inside the "batch < 10 real min after day close" NFR (§2.5).
+  late_data_grace_real_seconds: 90
+
+# ==============================================================================
+# tariff — D2: STRUCTURE only. Every number that enters bill arithmetic comes from the
+# day's tariff file per household (contracts/reference.py); nothing here is money except
+# the clearly-labelled generator_defaults block, which only reference_dropper.py may read.
+# ==============================================================================
+tariff:
+  # Block-tariff boundaries, cumulative kWh. Fixed for the life of the deployment - these
+  # are the only tariff values `core/` and `core/spark_expr.py` are allowed to read from
+  # config; every rate is a per-household, per-day value from the tariff CSV instead.
+  blocks:
+    - { name: "block_1", up_to_kwh: 60 }
+    - { name: "block_2", up_to_kwh: 120 }
+    - { name: "block_3", up_to_kwh: null }   # null = unbounded top block
+  # GENERATOR DEFAULTS - read ONLY by simulators/reference_dropper.py to write the daily
+  # tariff_YYYY-MM-DD.csv file. core/, streaming/, batch/ and api/ MUST NOT read these
+  # (enforced by `grep -rn generator_defaults src/voltstream/core src/voltstream/streaming
+  # src/voltstream/batch src/voltstream/api` returning nothing - T057's Done-when).
+  generator_defaults:
+    block_rates: { block_1: 8.00, block_2: 16.50, block_3: 24.50 }
+    fixed_charge_by_tier: { TIER_1: 120.00, TIER_2: 240.00, TIER_3: 480.00 }
+    subsidy_pct: 25.0
+    export_rate: 18.00
+
+# ==============================================================================
+# alerts — thresholds evaluated by Prometheus/Alertmanager rules (config/prometheus,
+# config/alertmanager) and surfaced through api/routers/alerts.py
+# ==============================================================================
+alerts:
+  # REAL minutes since a zone's last reading before MeterDataStale fires.
+  stale_data_minutes: 2
+  # Renewable ratio (0-1) below which LowRenewableContribution fires. Crossed both ways
+  # daily per profiles.py's solar curve (T068).
+  low_renewable_threshold: 0.15
+  # Fraction (0-1) of rejected records above which RejectRateHigh fires.
+  reject_rate_threshold: 0.05
+  # REAL minutes after simulated day-close before BatchSlaMissed fires.
+  batch_sla_minutes: 10
+  # Percent divergence (see core/money.py pct_divergence base, D5) above which
+  # LambdaDivergenceHigh fires. Sized so D3's modelled ~1.7% steady-state gap sits under it.
+  lambda_divergence_threshold_pct: 5.0
+
+# ==============================================================================
+# postgres — application database, non-secret connection defaults (§5.5). Overridden by
+# POSTGRES_HOST/POSTGRES_PORT/POSTGRES_DB in Docker; POSTGRES_PASSWORD is read from the
+# environment only and never appears here.
+# ==============================================================================
+postgres:
+  host: "localhost"
+  port: 5432
+  db: "voltstream"
+  user: "voltstream"
+
+# ==============================================================================
+# minio — object storage bucket names (§6.3). Endpoint and credentials are deployment
+# secrets -> .env only (MINIO_ENDPOINT, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY).
+# ==============================================================================
+minio:
+  bucket_raw: "voltstream-raw"           # master dataset: meter readings, Parquet
+  bucket_landing: "voltstream-landing"   # daily tariff/weather drops, as received
+  bucket_archive: "voltstream-archive"   # processed reference files, immutable
+  # No bucket_checkpoints here: per T044, Spark checkpoints live on named Docker volumes,
+  # not S3A (§8.5's own object-store commit caveat argues against it).
+
+# ==============================================================================
+# api — FastAPI bind address inside its container/process (§5.8)
+# ==============================================================================
+api:
+  host: "0.0.0.0"
+  port: 8000
+
+# ==============================================================================
+# observability — non-HTTP metrics endpoints (§10.1). The API exposes /metrics itself via
+# prometheus-fastapi-instrumentator; this port is for processes with no HTTP server of
+# their own (meter_producer.py, reference_dropper.py, Spark driver processes).
+# ==============================================================================
+observability:
+  metrics_port: 8001
+  # Default root log level for logging_setup.py; overridden by VOLTSTREAM_LOG_LEVEL (.env).
+  log_level: "INFO"

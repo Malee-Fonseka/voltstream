@@ -1,0 +1,18 @@
+# voltstream — laptop overrides (decision T020).
+#
+# Loaded when VOLTSTREAM_ENV=local (.env.example default is `docker`, which has no
+# overlay file and inherits base.yaml unchanged). Deep-merged over config/base.yaml: keys
+# below replace the base value, everything else is inherited as-is. Kept short on purpose
+# - this is for a fast local test run, not a second copy of base.yaml.
+
+simulation:
+  # Fewer households -> faster simulator startup and smaller local Postgres/Parquet output
+  # for a quick `pytest` / `make demo` cycle. Must still be <= the 50 seeded households.
+  households: 10
+  # Emit twice as often (REAL seconds) so a short local run still produces enough windows
+  # to see the speed layer's aggregation actually happen.
+  emit_interval_seconds: 1
+
+observability:
+  # Chattier logging for local debugging; INFO in base.yaml/Docker.
+  log_level: "DEBUG"
