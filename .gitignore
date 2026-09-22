@@ -89,3 +89,5 @@ docs/report/*.synctex.gz
 Thumbs.db
 desktop.ini
 $RECYCLE.BIN/
+
+/graphify-out
