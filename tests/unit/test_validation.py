@@ -7,7 +7,7 @@ from decimal import Decimal
 from uuid import uuid4
 
 from voltstream.contracts.events import MeterReading
-from voltstream.core.validation import REJECTION_REASONS, validate
+from voltstream.core.validation import REJECTION_REASONS, ValidationResult, validate
 
 _KNOWN_HOUSEHOLDS = frozenset({"HH-0042"})
 _ZONES = frozenset({"ZONE-A", "ZONE-B", "ZONE-C"})
@@ -33,7 +33,7 @@ def _reading(**overrides: object) -> MeterReading:
     return MeterReading(**defaults)  # type: ignore[arg-type]
 
 
-def _validate(reading: MeterReading, **overrides: object) -> object:
+def _validate(reading: MeterReading, **overrides: object) -> ValidationResult:
     kwargs: dict[str, object] = {
         "known_household_ids": _KNOWN_HOUSEHOLDS,
         "configured_zones": _ZONES,

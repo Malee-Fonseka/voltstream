@@ -150,6 +150,58 @@ services:
     networks: [voltstream]
     entrypoint: ["/bin/sh", "/scripts/create_buckets.sh"]
 
+  # ============================================================================
+  # Tier 3 — simulators (decision T076). Both on the `app` image (§7.3: no PySpark).
+  # ============================================================================
+  meter-producer:
+    build:
+      context: ..
+      dockerfile: docker/images/app.Dockerfile
+    image: voltstream-app:${VOLTSTREAM_IMAGE_TAG:-local}
+    container_name: voltstream-meter-producer
+    restart: unless-stopped
+    command: ["voltstream-producer"]
+    environment:
+      VOLTSTREAM_ENV: docker
+      VOLTSTREAM_CONFIG_DIR: /app/config
+      VOLTSTREAM__KAFKA__BOOTSTRAP_SERVERS: kafka:9092
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-voltstream}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-voltstream-dev}
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://minio:9000
+    volumes:
+      - ../config:/app/config:ro
+    networks: [voltstream]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  reference-dropper:
+    build:
+      context: ..
+      dockerfile: docker/images/app.Dockerfile
+    image: voltstream-app:${VOLTSTREAM_IMAGE_TAG:-local}
+    container_name: voltstream-reference-dropper
+    restart: unless-stopped
+    command: ["voltstream-dropper"]
+    environment:
+      VOLTSTREAM_ENV: docker
+      VOLTSTREAM_CONFIG_DIR: /app/config
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-voltstream}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-voltstream-dev}
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://minio:9000
+    volumes:
+      - ../config:/app/config:ro
+    networks: [voltstream]
+    depends_on:
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+
 networks:
   voltstream:
     name: voltstream

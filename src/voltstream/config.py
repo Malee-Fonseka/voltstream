@@ -78,6 +78,7 @@ class FaultsConfig(_StrictModel):
 
 
 class KafkaConfig(_StrictModel):
+    bootstrap_servers: str
     topic: str
     dlq_topic: str
     partitions: int

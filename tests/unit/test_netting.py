@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from voltstream.core.netting import net
+from voltstream.core.netting import NettingResult, net
 
 
-def _assert_invariants(consumption: Decimal, solar: Decimal, result: object) -> None:
-    self_consumed, billable_import, export = result  # type: ignore[misc]
+def _assert_invariants(consumption: Decimal, solar: Decimal, result: NettingResult) -> None:
+    self_consumed, billable_import, export = result
     # §9 Phase 2 invariants, exact Decimal equality — no rounding in netting.
     assert self_consumed + export == solar
     assert self_consumed + billable_import == consumption

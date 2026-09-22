@@ -70,9 +70,12 @@ faults:
   dropout_backfill: true
 
 # ==============================================================================
-# kafka — topic layout (§5.2). Connection address is deployment-specific -> .env only.
+# kafka — topic layout and connection (§5.2). bootstrap_servers here is the no-Docker
+# default (a host publishing to localhost); Compose overrides it per service via
+# VOLTSTREAM__KAFKA__BOOTSTRAP_SERVERS=kafka:9092 (the internal network address).
 # ==============================================================================
 kafka:
+  bootstrap_servers: "localhost:29092"
   topic: "meter.readings"
   dlq_topic: "meter.readings.dlq"
   partitions: 3

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import uuid4
@@ -32,7 +33,7 @@ def _reading(**overrides: object) -> MeterReading:
 
 
 @pytest.fixture(autouse=True)
-def _clear_config_cache() -> None:
+def _clear_config_cache() -> Iterator[None]:
     get_config.cache_clear()
     yield
     get_config.cache_clear()
