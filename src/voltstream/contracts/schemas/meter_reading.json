@@ -1,0 +1,84 @@
+{
+  "additionalProperties": false,
+  "description": "One smart-meter reading, as published to Kafka (key = `household_id`).",
+  "properties": {
+    "consumption_kwh": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*(?:\\d{0,8}|(?=[\\d.]{1,13}0*$)\\d{0,8}\\.\\d{0,4}0*$)",
+          "type": "string"
+        }
+      ],
+      "title": "Consumption Kwh"
+    },
+    "event_id": {
+      "format": "uuid",
+      "title": "Event Id",
+      "type": "string"
+    },
+    "event_ts": {
+      "format": "date-time",
+      "title": "Event Ts",
+      "type": "string"
+    },
+    "grid_zone": {
+      "title": "Grid Zone",
+      "type": "string"
+    },
+    "household_id": {
+      "title": "Household Id",
+      "type": "string"
+    },
+    "meter_id": {
+      "title": "Meter Id",
+      "type": "string"
+    },
+    "producer_id": {
+      "title": "Producer Id",
+      "type": "string"
+    },
+    "schema_version": {
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "solar_generation_kwh": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*(?:\\d{0,8}|(?=[\\d.]{1,13}0*$)\\d{0,8}\\.\\d{0,4}0*$)",
+          "type": "string"
+        }
+      ],
+      "title": "Solar Generation Kwh"
+    },
+    "trace_id": {
+      "format": "uuid",
+      "title": "Trace Id",
+      "type": "string"
+    },
+    "voltage": {
+      "title": "Voltage",
+      "type": "number"
+    }
+  },
+  "required": [
+    "schema_version",
+    "event_id",
+    "trace_id",
+    "meter_id",
+    "household_id",
+    "grid_zone",
+    "event_ts",
+    "consumption_kwh",
+    "solar_generation_kwh",
+    "voltage",
+    "producer_id"
+  ],
+  "title": "MeterReading",
+  "type": "object"
+}

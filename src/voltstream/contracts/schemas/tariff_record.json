@@ -1,0 +1,121 @@
+{
+  "additionalProperties": false,
+  "description": "One row of `tariff_YYYY-MM-DD.csv` (D2's final ten-column contract).",
+  "properties": {
+    "billing_tier": {
+      "enum": [
+        "TIER_1",
+        "TIER_2",
+        "TIER_3"
+      ],
+      "title": "Billing Tier",
+      "type": "string"
+    },
+    "block_1_rate": {
+      "anyOf": [
+        {
+          "minimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*(?:\\d{0,10}|(?=[\\d.]{1,13}0*$)\\d{0,10}\\.\\d{0,2}0*$)",
+          "type": "string"
+        }
+      ],
+      "title": "Block 1 Rate"
+    },
+    "block_2_rate": {
+      "anyOf": [
+        {
+          "minimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*(?:\\d{0,10}|(?=[\\d.]{1,13}0*$)\\d{0,10}\\.\\d{0,2}0*$)",
+          "type": "string"
+        }
+      ],
+      "title": "Block 2 Rate"
+    },
+    "block_3_rate": {
+      "anyOf": [
+        {
+          "minimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*(?:\\d{0,10}|(?=[\\d.]{1,13}0*$)\\d{0,10}\\.\\d{0,2}0*$)",
+          "type": "string"
+        }
+      ],
+      "title": "Block 3 Rate"
+    },
+    "effective_date": {
+      "format": "date",
+      "title": "Effective Date",
+      "type": "string"
+    },
+    "export_rate": {
+      "anyOf": [
+        {
+          "minimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*(?:\\d{0,10}|(?=[\\d.]{1,13}0*$)\\d{0,10}\\.\\d{0,2}0*$)",
+          "type": "string"
+        }
+      ],
+      "title": "Export Rate"
+    },
+    "fixed_charge": {
+      "anyOf": [
+        {
+          "minimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*(?:\\d{0,10}|(?=[\\d.]{1,13}0*$)\\d{0,10}\\.\\d{0,2}0*$)",
+          "type": "string"
+        }
+      ],
+      "title": "Fixed Charge"
+    },
+    "household_id": {
+      "title": "Household Id",
+      "type": "string"
+    },
+    "subsidy_flag": {
+      "title": "Subsidy Flag",
+      "type": "boolean"
+    },
+    "subsidy_pct": {
+      "anyOf": [
+        {
+          "maximum": 100.0,
+          "minimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*(?:\\d{0,3}|(?=[\\d.]{1,6}0*$)\\d{0,3}\\.\\d{0,2}0*$)",
+          "type": "string"
+        }
+      ],
+      "title": "Subsidy Pct"
+    }
+  },
+  "required": [
+    "household_id",
+    "effective_date",
+    "billing_tier",
+    "subsidy_flag",
+    "subsidy_pct",
+    "fixed_charge",
+    "block_1_rate",
+    "block_2_rate",
+    "block_3_rate",
+    "export_rate"
+  ],
+  "title": "TariffRecord",
+  "type": "object"
+}

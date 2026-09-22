@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -15,7 +16,7 @@ _REPO_CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
 
 
 @pytest.fixture(autouse=True)
-def _isolated_config_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolated_config_cache(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Every test gets a clean cache and starts with no VOLTSTREAM_* env vars set.
 
     monkeypatch.delenv/setenv are auto-reverted after the test; explicitly clearing the
