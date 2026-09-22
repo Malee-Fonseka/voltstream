@@ -1,0 +1,66 @@
+{
+  "additionalProperties": false,
+  "description": "One row of `weather_YYYY-MM-DD.csv` (\u00a76.2, unchanged by D2).",
+  "properties": {
+    "cloud_cover_pct": {
+      "anyOf": [
+        {
+          "maximum": 100.0,
+          "minimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*(?:\\d{0,3}|(?=[\\d.]{1,6}0*$)\\d{0,3}\\.\\d{0,2}0*$)",
+          "type": "string"
+        }
+      ],
+      "title": "Cloud Cover Pct"
+    },
+    "forecast_date": {
+      "format": "date",
+      "title": "Forecast Date",
+      "type": "string"
+    },
+    "grid_zone": {
+      "title": "Grid Zone",
+      "type": "string"
+    },
+    "solar_irradiance_index": {
+      "anyOf": [
+        {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*(?:\\d{0,1}|(?=[\\d.]{1,5}0*$)\\d{0,1}\\.\\d{0,3}0*$)",
+          "type": "string"
+        }
+      ],
+      "title": "Solar Irradiance Index"
+    },
+    "temperature_c": {
+      "anyOf": [
+        {
+          "maximum": 60.0,
+          "minimum": -90.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*(?:\\d{0,3}|(?=[\\d.]{1,6}0*$)\\d{0,3}\\.\\d{0,2}0*$)",
+          "type": "string"
+        }
+      ],
+      "title": "Temperature C"
+    }
+  },
+  "required": [
+    "grid_zone",
+    "forecast_date",
+    "cloud_cover_pct",
+    "temperature_c",
+    "solar_irradiance_index"
+  ],
+  "title": "WeatherForecast",
+  "type": "object"
+}

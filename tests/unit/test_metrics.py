@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 
+import pytest
 from prometheus_client import generate_latest
 
 from voltstream import metrics
@@ -77,10 +78,12 @@ def test_reimporting_the_module_does_not_raise_duplicate_timeseries() -> None:
     importlib.reload(metrics)
 
 
-def test_start_metrics_server_uses_configured_port_by_default(monkeypatch) -> None:
-    calls = {}
+def test_start_metrics_server_uses_configured_port_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
 
-    def fake_start_http_server(port, registry):
+    def fake_start_http_server(port: int, registry: object) -> None:
         calls["port"] = port
         calls["registry"] = registry
 

@@ -1,1 +1,219 @@
-# production compose
+# voltstream — tiers 1 (infrastructure) and 2 (bootstrap) of the stack (§8.2, T043-T047).
+#
+# `name: voltstream` below is mandatory per D7: Compose otherwise derives the project
+# name from the folder holding this file (`docker/`), and the repository folder is
+# `volstream` (missing a "t") — this key is what makes every network, volume and
+# container come out `voltstream-*` regardless.
+#
+# Tier 1 (kafka, postgres, minio) has real healthchecks, never a `sleep` (§8.2). Tier 2
+# (the three `-init` services) apply schema/topics/buckets and exit 0; every statement
+# they run is idempotent, because they run again on every `compose up`, not only once.
+
+name: voltstream
+
+services:
+  # ============================================================================
+  # Tier 1 — infrastructure
+  # ============================================================================
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: voltstream-kafka
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:${KAFKA_HOST_PORT:-29092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:-Tsb-BTJJRQWukaYvUsVNIA}
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+    ports:
+      - "${KAFKA_HOST_PORT:-29092}:29092"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks: [voltstream]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: voltstream-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-voltstream}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-voltstream}
+      POSTGRES_DB: ${POSTGRES_DB:-voltstream}
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks: [voltstream]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-voltstream} -d ${POSTGRES_DB:-voltstream}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  minio:
+    # minio/minio on Docker Hub started refusing anonymous pulls in 2024; quay.io is the
+    # unauthenticated mirror MinIO itself documents as the replacement.
+    image: quay.io/minio/minio:latest
+    container_name: voltstream-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-voltstream}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-voltstream-dev}
+    ports:
+      - "${MINIO_HOST_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_HOST_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    networks: [voltstream]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  # ============================================================================
+  # Tier 2 — bootstrap (one-shot, idempotent, run again on every `compose up`)
+  # ============================================================================
+  postgres-init:
+    image: postgres:16-alpine
+    container_name: voltstream-postgres-init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: 5432
+      PGUSER: ${POSTGRES_USER:-voltstream}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-voltstream}
+      PGDATABASE: ${POSTGRES_DB:-voltstream}
+    volumes:
+      - ./init/postgres:/sql:ro
+    networks: [voltstream]
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        for f in /sql/*.sql; do
+          echo "applying $$f"
+          psql -v ON_ERROR_STOP=1 -f "$$f"
+        done
+
+  kafka-init:
+    image: apache/kafka:3.8.0
+    container_name: voltstream-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-meter.readings}
+      KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-meter.readings.dlq}
+      KAFKA_PARTITIONS: ${KAFKA_PARTITIONS:-3}
+      KAFKA_RETENTION_MS: ${KAFKA_RETENTION_MS:-604800000}
+    volumes:
+      - ./init/kafka:/scripts:ro
+    networks: [voltstream]
+    entrypoint: ["/bin/bash", "/scripts/create_topics.sh"]
+
+  minio-init:
+    image: quay.io/minio/mc:latest
+    container_name: voltstream-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-voltstream}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-voltstream-dev}
+      MINIO_BUCKET_RAW: ${MINIO_BUCKET_RAW:-voltstream-raw}
+      MINIO_BUCKET_LANDING: ${MINIO_BUCKET_LANDING:-voltstream-landing}
+      MINIO_BUCKET_ARCHIVE: ${MINIO_BUCKET_ARCHIVE:-voltstream-archive}
+    volumes:
+      - ./init/minio:/scripts:ro
+    networks: [voltstream]
+    entrypoint: ["/bin/sh", "/scripts/create_buckets.sh"]
+
+  # ============================================================================
+  # Tier 3 — simulators (decision T076). Both on the `app` image (§7.3: no PySpark).
+  # ============================================================================
+  meter-producer:
+    build:
+      context: ..
+      dockerfile: docker/images/app.Dockerfile
+    image: voltstream-app:${VOLTSTREAM_IMAGE_TAG:-local}
+    container_name: voltstream-meter-producer
+    restart: unless-stopped
+    command: ["voltstream-producer"]
+    environment:
+      VOLTSTREAM_ENV: docker
+      VOLTSTREAM_CONFIG_DIR: /app/config
+      VOLTSTREAM__KAFKA__BOOTSTRAP_SERVERS: kafka:9092
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-voltstream}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-voltstream-dev}
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://minio:9000
+    volumes:
+      - ../config:/app/config:ro
+    networks: [voltstream]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  reference-dropper:
+    build:
+      context: ..
+      dockerfile: docker/images/app.Dockerfile
+    image: voltstream-app:${VOLTSTREAM_IMAGE_TAG:-local}
+    container_name: voltstream-reference-dropper
+    restart: unless-stopped
+    command: ["voltstream-dropper"]
+    environment:
+      VOLTSTREAM_ENV: docker
+      VOLTSTREAM_CONFIG_DIR: /app/config
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-voltstream}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-voltstream-dev}
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://minio:9000
+    volumes:
+      - ../config:/app/config:ro
+    networks: [voltstream]
+    depends_on:
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+
+networks:
+  voltstream:
+    name: voltstream
+
+volumes:
+  # Tier 1 data — survive `make down`, destroyed only by `make clean`.
+  postgres_data:
+  kafka_data:
+  minio_data:
+  # Spark checkpoints (§8.5, T044): named volumes, never a bind mount into /tmp — a
+  # checkpoint directory must survive a container restart with stable inode identity.
+  # Declared now, before the streaming jobs exist, so nobody bind-mounts them later out
+  # of convenience.
+  speed_checkpoints:
+  archiver_checkpoints:

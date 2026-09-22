@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -13,7 +14,7 @@ _EPOCH = datetime(2026, 1, 1, tzinfo=UTC)
 
 
 @pytest.fixture(autouse=True)
-def _fixed_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
+def _fixed_epoch(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Pin epoch_real so every test reasons about the same anchor, per T024."""
     monkeypatch.setenv("VOLTSTREAM__SIMULATION__EPOCH_REAL", _EPOCH.isoformat())
     get_config.cache_clear()
