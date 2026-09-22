@@ -1,0 +1,1057 @@
+\documentclass[12pt,a4paper]{article}
+
+% ---------- Base packages (from original template) ----------
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\IfFileExists{lmodern.sty}{\usepackage{lmodern}}{}
+\usepackage{graphicx}
+\usepackage{titlesec}
+\usepackage{setspace}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+\usepackage{subcaption}
+\usepackage{float}
+\usepackage{hyperref}
+
+% ---------- Added packages ----------
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{caption}
+\usepackage{amsmath}
+
+% ---------- Formatting ----------
+\setstretch{1.15}
+\titleformat{\section}{\large\bfseries}{\thesection.}{1em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection.}{1em}{}
+\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue}
+
+\captionsetup{font=small,labelfont=bf}
+\setlist{itemsep=2pt,parsep=0pt,topsep=4pt}
+
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+
+% ---------- Code listing style ----------
+\definecolor{lstbg}{gray}{0.96}
+\lstdefinestyle{plain}{
+  backgroundcolor=\color{lstbg},
+  basicstyle=\ttfamily\scriptsize,
+  breaklines=true,
+  columns=fullflexible,
+  frame=single,
+  framesep=3pt,
+  rulecolor=\color{gray!40},
+  showstringspaces=false,
+  xleftmargin=4pt,
+  aboveskip=6pt,
+  belowskip=6pt
+}
+\lstset{style=plain}
+
+% ---------- Figure placeholder ----------
+% Replace each \figph{...}{...} with the \includegraphics line commented above it.
+\newcommand{\figph}[2]{%
+  \fbox{\begin{minipage}[c][#2][c]{0.90\textwidth}
+    \centering\small\itshape #1
+  \end{minipage}}%
+}
+
+%----------------------------------------
+\begin{document}
+
+% --------- Cover Page ---------
+\begin{titlepage}
+    \centering
+    \includegraphics[width=3cm]{Logo.jpeg}\par\vspace{1cm}
+    {\LARGE \textbf{Department of Electrical and Information Engineering}}\\[0.4cm]
+    {\Large \textbf{University of Ruhuna}}\\[1.5cm]
+    {\Large \textbf{Mini Project}}\\[0.2cm]
+    {\large \textbf{Applied Big Data Engineering}}\\[0.2cm]
+    {\large \textbf{EC8203}}\\[1.2cm]
+
+    {\Large \textbf{Voltstream}}\\[0.3cm]
+    {\large A Lambda-Architecture Data Platform for}\\[0.1cm]
+    {\large Smart Grid Monitoring and Billing}\\[4cm]
+
+    \begin{tabular}{rr}
+        \large \textbf{EG/2021/4511} & \large \textbf{Fernando S.A.U.} \\
+        \large \textbf{EG/2021/4516} & \large \textbf{Fonseka C. M.} \\
+        \large \textbf{EG/2021/4525} & \large \textbf{} \\
+    \end{tabular}\\[1cm]
+    {\large \textbf{Computer Engineering (CE)}} \\
+
+    {\large \textbf{xx/09/2026}}\\[2cm]
+
+\end{titlepage}
+
+% --------- Table of Contents ---------
+\clearpage
+\phantomsection
+\addcontentsline{toc}{section}{Contents}
+\label{contents}
+\tableofcontents
+\clearpage
+
+% --------- Sections ---------
+
+\section{Introduction and Use Case}
+
+\subsection{Scope}
+
+This report documents \textbf{voltstream}, an end-to-end data platform implementing
+Use Case 3 of the module brief: \emph{Smart Grid Energy Monitoring and Billing}. The
+system ingests continuous smart-meter telemetry and a once-daily tariff reference
+feed, and serves a real-time zone dashboard alongside a daily per-household billing
+report. It is built on a \textbf{Lambda architecture}; Section~\ref{sec:arch} sets out
+that decision and the rejected Kappa alternative.
+
+\subsection{Domain Problem}
+
+Electricity cannot be meaningfully stored at grid scale, so supply must match demand
+continuously. Distributed rooftop solar complicates this: it is generation the utility
+neither controls nor dispatches, and cloud cover crossing a zone can cut contribution
+substantially within a minute, leaving a shortfall that must be absorbed by plant
+requiring minutes to ramp. \emph{Renewable contribution by zone, right now} is
+therefore an operational signal that triggers a physical control action, and it is
+worthless if it arrives late.
+
+In parallel, a separate department bills the same households from the same readings.
+Billing is not consumption multiplied by a rate. It combines block tariffs with
+band-dependent rates, tier-dependent fixed charges, subsidy discounts, and net
+metering that credits exported solar against imported grid energy.
+
+\subsection{Interpreted Business Requirements}
+
+The two business questions posed by the brief yield two consumers whose requirements
+are in direct opposition. Table~\ref{tab:twoconsumers} is the origin of the
+architecture decision that follows.
+
+\begin{table}[H]
+\centering
+\caption{The two consumers have opposing requirements.}
+\label{tab:twoconsumers}
+\small
+\begin{tabularx}{\textwidth}{L{3.1cm} X X}
+\toprule
+\textbf{Dimension} & \textbf{Grid operations} & \textbf{Billing} \\
+\midrule
+Question & Grid load and renewable mix by zone & Household bill once daily tariff is applied \\
+Latency & Seconds & End of simulated day \\
+A 2\% error & Harmless; does not change a ramping decision & Legally actionable \\
+Yesterday's answer & Disposable & Reproducible for years \\
+Late data & May be ignored & Must be included \\
+Restatement & Never & Months later, on demand \\
+Auditability & Not required & Full lineage to source readings \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The second question's phrasing---\emph{once daily tariff data is applied}---encodes a
+dependency on data that does not exist until the day closes. No streaming technique
+removes that dependency, because it is a property of the business process rather than
+of the technology.
+
+\section{Requirements}
+
+\subsection{Functional}
+
+\begin{enumerate}[label=\textbf{F\arabic*.},leftmargin=2.2em,itemsep=1pt]
+  \item Ingest continuous smart-meter readings, and one tariff and weather reference
+        file per simulated day.
+  \item Retain every raw event immutably for unbounded reprocessing.
+  \item Compute and expose per-zone load and renewable contribution over event-time
+        windows.
+  \item Compute per-household daily bills applying solar netting, block tariffs,
+        fixed charges and subsidy discounts.
+  \item Serve a live dashboard, a consolidated daily report, and threshold-based
+        alerts including low renewable contribution.
+\end{enumerate}
+
+\subsection{Non-Functional}
+
+\begin{table}[H]
+\centering
+\caption{Non-functional requirements and their justification.}
+\label{tab:nfr}
+\small
+\begin{tabularx}{\textwidth}{L{0.9cm} L{5.4cm} X}
+\toprule
+\textbf{ID} & \textbf{Requirement} & \textbf{Rationale} \\
+\midrule
+N1 & Speed-layer latency below 60\,s & Grid ramping decision window \\
+N2 & Batch complete within 10 real minutes of day close & Demonstration tractability \\
+N3 & Zero data loss on single-component failure & Message-bus retention plus immutable master dataset \\
+N4 & Unbounded restatement horizon & Billing dispute window exceeds bus retention \\
+N5 & Reproducible from a clean clone & Explicit assessment requirement \\
+N6 & Every pipeline stage observable & Failures must be detectable and diagnosable \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Simulated Clock}
+\label{sec:simclock}
+
+Simulated time is compressed so the pipeline is demonstrable within a session:
+
+\[
+  1 \text{ simulated day} = 5 \text{ real minutes}, \qquad \mathrm{TIME\_SCALE} = 288
+\]
+
+With a 2-second emit interval, each meter produces 144 readings per simulated day.
+Across 50 households in 5 grid zones this yields approximately 7{,}200 raw events,
+480 zone-metric rows and 50 bill rows per simulated day.
+
+All timestamps and all windowing operate on \emph{simulated} time; only
+ingestion-latency metrics use wall-clock time. A single module, \texttt{simclock.py},
+performs the conversion, so no component computes simulated time independently.
+
+\section{Architecture Decision: Lambda versus Kappa}
+\label{sec:arch}
+
+\subsection{The Two Candidates}
+
+\textbf{Lambda} maintains two processing paths over one immutable input: a batch layer
+recomputing authoritative results from all history, a speed layer computing
+approximate results from recent data, and a serving layer merging them, so that
+$\mathit{query} = \mathit{merge}(\mathit{batch\_view}, \mathit{realtime\_view})$.
+
+\textbf{Kappa} maintains a single path. Everything is a stream, and correction is
+achieved by replaying the log from an earlier offset through the same code.
+
+\subsection{Decision and Evaluation}
+
+\textbf{Lambda is selected.} The decision follows from Table~\ref{tab:twoconsumers},
+evaluated against the four criteria the assessment identifies as decisive.
+
+\begin{table}[H]
+\centering
+\caption{Architecture evaluation. Replay and consistency are the decisive criteria.}
+\label{tab:archeval}
+\small
+\begin{tabularx}{\textwidth}{L{1.9cm} X L{1.9cm}}
+\toprule
+\textbf{Criterion} & \textbf{Analysis} & \textbf{Verdict} \\
+\midrule
+Latency &
+Two consumers separated by roughly two orders of magnitude: seconds for operations,
+hours for billing. A single path must be tuned for one, penalising the other. Tuning
+for exactness through long watermarks and complete-day state makes the operations view
+unusably late; tuning for latency makes billing incorrect. &
+Lambda \\
+\addlinespace
+Replay &
+Billing disputes and retroactive tariff corrections carry a restatement horizon of
+\emph{months}. Practical Kafka retention is \emph{days}. Kappa's correction
+mechanism---replay from an earlier offset---is unavailable beyond retention. Lambda's
+batch layer replays from object storage, which is unbounded. &
+Lambda \\
+\addlinespace
+Cost &
+Lambda pays for two codepaths and a nightly compute burst. Kappa pays for either
+extended retention or very large long-lived state holding per-household billing
+accumulators across the horizon. Both are affordable at our volume, but Kappa's state
+cost grows with $\mathit{households} \times \mathit{horizon}$, the worse curve. &
+Lambda, narrowly \\
+\addlinespace
+Consistency &
+Billing requires an immutable, auditable ledger independent of the message bus, with
+lineage from final amount back to source readings. Lambda's master dataset provides
+this. Kappa's ground truth is the log itself---a transport system governed by a
+retention policy, an uncomfortable foundation for a financial audit trail. &
+Lambda, decisively \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{The Rejected Alternative: Kappa}
+
+Kappa is a genuinely viable design here and is presented as such.
+
+\paragraph{How it would work.} Tariff data would be a \emph{compacted} Kafka
+topic keyed on household, retaining the latest tariff per household. A single
+Structured Streaming job would perform a stream-stream join against meter readings.
+Corrections would be made by deploying fixed code, replaying from an earlier offset
+into a new output table, and atomically switching readers to it.
+
+\paragraph{Its genuine advantages.} One codebase, eliminating any possibility of
+speed-batch divergence---Lambda's canonical weakness. Operational simplicity: one job
+to deploy and monitor rather than two plus an orchestrator. Conceptual cleanliness:
+batch is simply a bounded stream, with no second mental model to maintain.
+
+\paragraph{Grounds for rejection.}
+\begin{enumerate}[itemsep=2pt]
+  \item \textbf{Retention horizon mismatch.} Decisive. Billing restatement must remain
+        possible months later, while retention is measured in days. Kappa's correction
+        mechanism is unavailable at precisely the point billing most requires it.
+  \item \textbf{Audit independence.} Finance requires a ledger that does not depend on
+        the configuration of the message bus. A retention-policy change should not be
+        capable of destroying a billing audit trail.
+  \item \textbf{State cost and fragility.} Holding per-household tiered billing
+        accumulators as streaming state across a months-long horizon is expensive and
+        fragile compared with a bounded nightly job over a fixed partition.
+\end{enumerate}
+
+\subsection{Lambda's Cost and Our Structural Mitigation}
+\label{sec:drift}
+
+Lambda's cost is real: the same business logic exists in two codepaths and can
+silently diverge. Concretely, if the speed layer treats the first tariff block as
+ending at 60\,kWh while the batch layer treats it as ending at 61\,kWh, a household
+consuming near that boundary sees one figure during the day and a different figure on
+the final bill. The defect is invisible unless the boundary is specifically exercised.
+
+Our mitigation is structural rather than procedural:
+
+\begin{enumerate}[itemsep=3pt]
+  \item \textbf{A shared pure module.} \texttt{voltstream/core/} holds netting, tariff
+        and validation logic as pure functions with no I/O, no clock access and no
+        database calls. Both the streaming and batch jobs import it. It is a
+        \emph{peer} of the layer packages rather than nested inside either, so the
+        sharing is visible in the repository structure itself.
+  \item \textbf{A consistency test pinning the implementations together.}
+        \texttt{core/tariff.py} holds scalar functions; \texttt{core/spark\_expr.py}
+        holds the same logic as Spark \texttt{Column} expressions. This duplication is
+        necessary---the API container has no Spark runtime yet must compute
+        provisional estimates, while the Spark path must use Column expressions rather
+        than user-defined functions to preserve query optimisation and avoid per-row
+        serialisation. \texttt{tests/consistency/test\_pure\_vs\_spark.py} generates
+        several thousand random inputs, executes both, and asserts identical output.
+\end{enumerate}
+
+Divergence between the layers is therefore a test failure rather than a matter of
+developer discipline.
+
+\subsection{Contingency: What Would Reverse This Decision}
+\label{sec:contingency}
+
+The choice of Lambda is contingent on one constraint: \textbf{the master dataset must
+outlive the message bus's retention window}. Adopting Kafka tiered storage, which
+offloads old segments to object storage, or a table format such as Apache Iceberg or
+Delta Lake, which grants the log ACID semantics and unbounded queryable history,
+removes that constraint. At that point Kappa's single codebase becomes the better
+trade and migration would be justified.
+
+Stating the condition under which the decision reverses is, in our view, a stronger
+position than defending Lambda unconditionally.
+
+\section{Solution Architecture}
+\label{sec:solution}
+
+\begin{figure}[H]
+\centering
+% \includegraphics[width=\textwidth]{fig/lambda-architecture.png}
+\figph{Figure 1 --- Lambda architecture: sources, Kafka and landing zone, speed and
+batch layers, master dataset, serving store, merge API}{5.5cm}
+\caption{End-to-end architecture. The speed path (process then store) and the batch
+path (store then process) consume the same topic through independent consumer groups.}
+\label{fig:lambda}
+\end{figure}
+
+\subsection{The Three Views}
+
+\paragraph{Master dataset.} Every raw event, unmodified, written as Parquet to object
+storage and partitioned by simulated date and hour; daily reference files archived
+alongside. Nothing is updated in place. This is the ground truth from which the batch
+layer recomputes, and it is what makes replay possible after bus retention expires.
+
+\paragraph{Speed view.} Event-time tumbling windows of 15 simulated minutes per zone,
+producing total consumption, total solar generation, renewable ratio and active meter
+count. A per-household running total is also maintained, costed against
+\emph{yesterday's} tariff---deliberately stale and labelled provisional.
+
+\paragraph{Batch view.} Triggered on tariff file arrival. Reads the complete day's
+partition, deduplicates, validates, joins the effective-dated tariff and weather
+dimensions, applies netting and block-tariff logic, writes finalised rows and marks
+the day closed.
+
+\subsection{The Merge Function}
+\label{sec:merge}
+
+\begin{lstlisting}[caption={Serving-layer merge logic.},label={lst:merge}]
+GET /api/v1/households/{id}/bill?date=YYYY-MM-DD
+
+    if pipeline_runs has a successful batch run for this sim_date:
+        return household_bill_daily row, source="batch", provisional=false
+    else:
+        return household_running_rt row, source="speed", provisional=true
+\end{lstlisting}
+
+The batch view wins unconditionally because it is strictly better informed: it
+observed the late events the speed layer discarded past its watermark, applied the
+correct day's tariff rather than a stale one, and executed deterministically over a
+closed input set. There is no case in which the speed estimate is more correct. The
+response always reports which view served it, making the provisional-to-final
+transition observable from the API itself.
+
+\begin{figure}[H]
+\centering
+% \includegraphics[width=0.7\textwidth]{fig/merge-decision.png}
+\figph{Figure 2 --- Merge decision flow: finalisation check against the run ledger,
+and the two labelled return paths}{3.4cm}
+\caption{The merge function: the architecture rendered as product behaviour.}
+\label{fig:merge}
+\end{figure}
+
+\subsection{Domain Modelling Decisions}
+
+\paragraph{Event time, not processing time.} Readings carry their own
+\texttt{event\_ts} and arrive out of order due to network buffering. All windowing
+uses event time with a watermark. Windowing on arrival time would let a network delay
+silently relocate a reading into the wrong window, after which daily totals would
+cease to reconcile.
+
+\paragraph{Solar netting.} The non-trivial transformation, applied before tariff
+evaluation:
+\begin{align}
+  \mathit{self\_consumed}   &= \min(\mathit{solar},\ \mathit{consumption}) \\
+  \mathit{billable\_import} &= \mathit{consumption} - \mathit{self\_consumed} \\
+  \mathit{export}           &= \mathit{solar} - \mathit{self\_consumed}
+\end{align}
+$\mathit{billable\_import}$ is charged against the block tariff;
+$\mathit{export}$ is credited at the net-metering rate.
+
+\paragraph{Idempotency and partitioning.} Kafka provides at-least-once delivery; the
+deduplication key is $(\mathit{meter\_id}, \mathit{event\_ts})$. The Kafka
+\emph{message key} is \texttt{household\_id}, achieving two objectives at once:
+per-household ordering within a partition, required for deduplication, and
+co-partitioning with the tariff join key, making the join local rather than a shuffle.
+
+\section{Technology Stack and Justification}
+\label{sec:stack}
+
+Selections are justified against use-case constraints rather than general popularity.
+Each entry names the alternative rejected and the reason.
+
+\begin{table}[H]
+\centering
+\caption{Technology selections and the constraint each satisfies.}
+\label{tab:stack}
+\small
+\begin{tabularx}{\textwidth}{L{2.0cm} L{2.4cm} X L{2.2cm}}
+\toprule
+\textbf{Layer} & \textbf{Selected} & \textbf{Constraint satisfied} & \textbf{Rejected} \\
+\midrule
+Ingestion & Apache Kafka & A replayable log is a precondition for Lambda; independent
+multi-consumer reads enable the two-branch fan-out & RabbitMQ; direct DB writes \\
+\addlinespace
+Stream processing & Spark Structured Streaming & Unified batch and stream API enables
+the shared \texttt{core/} module, structurally mitigating divergence; native
+event-time watermarking & Storm; Flink \\
+\addlinespace
+Master dataset & Parquet on MinIO & Columnar, compressed, immutable; partition-pruned
+full-day rescans; retention decoupled from compute & HDFS; raw CSV/JSON \\
+\addlinespace
+Serving store & PostgreSQL & Relational joins, ACID for financial writes, indexed
+point lookups; post-aggregation write volume is trivial & Cassandra; MongoDB \\
+\addlinespace
+Orchestration & Apache Airflow & Sensors, retries, SLA alerts and backfill---the
+restatement mechanism itself & cron \\
+\addlinespace
+Observability & Prometheus, Grafana, Alertmanager & Pull scraping suits containers;
+alert rules are declarative and version-controlled & Bespoke log parsing \\
+\addlinespace
+Serving API & FastAPI & Async, generated OpenAPI docs, schema enforcement at the
+boundary & Flask \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Ingestion: Apache Kafka}
+
+Kafka is an append-only log rather than a queue: reading does not delete, and
+consumers track their own offsets. Three capabilities follow, all load-bearing here.
+\textbf{Replay}---a speed-layer defect is corrected by resetting the offset and
+reprocessing. \textbf{Decoupling}---the producer is indifferent to consumer
+availability, so Kafka absorbs bursts and outages. \textbf{Independent multi-consumer
+reads}---the speed layer and raw archiver read the same topic in separate consumer
+groups with separate offsets, which is what makes the two-branch Lambda shape possible
+from a single source.
+
+Three partitions are configured, bounding consumer parallelism. Default retention of
+approximately seven days is the mechanical fact underlying Section~\ref{sec:arch}.
+
+\paragraph{Rejected.} RabbitMQ removes messages on acknowledgement, eliminating both
+replay and independent multi-consumer reading. Writing directly to the database
+forfeits buffering, backpressure and replay, and couples producer availability to
+database availability.
+
+\subsection{Stream Processing: Spark Structured Streaming}
+
+Because the batch and streaming APIs are identical, the billing logic resides in one
+shared module imported by both jobs (Section~\ref{sec:drift}). Lambda's canonical
+weakness is not mitigated rhetorically---the class of defect is structurally
+eliminated. No other candidate engine offers this property.
+
+A watermark encodes the system's belief about maximum lateness. The trade-off is
+explicit: a shorter watermark gives lower latency but discards more late data; a
+longer one gives more complete results at higher latency and greater retained state.
+The speed layer chooses low latency and accepts discarding stragglers; the batch layer
+requires no watermark at all, because it rescans a closed day. That divergence is not
+an inconsistency---it is each layer tuned for its own consumer, which is the benefit
+Lambda exists to provide.
+
+\paragraph{Rejected: Storm.} Attains genuinely lower latency, in the single-digit
+millisecond range, but provides no native event-time windowing or watermarks and no
+batch API for code sharing. Our latency requirement is seconds, so Storm's sole
+advantage is irrelevant here while both its costs are real.
+
+\paragraph{Rejected: Flink.} In our assessment the superior pure streaming engine,
+with true event-at-a-time processing and a stronger state backend. It is rejected on
+grounds specific to this project rather than on technical merit: no unified batch story
+in the same idiom for code sharing, a steeper learning curve within the time budget,
+and a latency requirement Spark already satisfies comfortably.
+
+\subsection{Master Dataset: Parquet on Object Storage}
+
+\paragraph{Why a master dataset is required.} Lambda's premise is
+$\mathit{query} = f(\mathit{all\ data})$, which cannot be computed if the data was
+discarded. Concretely: a tier-boundary comparison using \texttt{>} instead of
+\texttt{>=} renders every boundary-adjacent bill incorrect, and with raw inputs
+retained the function is fixed and the range backfilled---without them, the incorrect
+answer is the only answer that exists. The same applies to late meter backfills and
+retroactive tariff adjustments. More generally, \emph{raw data is a superset of every
+aggregate that might later be required; an aggregate is a superset of nothing}. The
+defining property is immutability: re-executing yesterday's job over yesterday's
+partition produces identical output, and that determinism constitutes the audit
+guarantee.
+
+\paragraph{Why Parquet.} Columnar layout yields four benefits over row-oriented CSV or
+JSON. \emph{Column pruning}---the billing job reads four columns from a schema of
+twelve, physically reading only those bytes. \emph{Effective compression}---values
+within a column are homogeneous, so \texttt{grid\_zone} with five distinct values
+across millions of rows reduces to dictionary-encoded integers. \emph{Embedded schema
+and real types}---the footer stores types, making \texttt{event\_ts} a genuine
+timestamp rather than a re-inferred string, which is a correctness benefit rather than
+a convenience. \emph{Predicate pushdown}---per-row-group statistics allow entire
+groups to be skipped without decompression. Partitioning by simulated date and hour
+compounds this: the daily job's directory listing alone excludes every other day.
+
+\paragraph{Why MinIO rather than AWS S3.} Object storage is the correct category, its
+defining property being that storage is decoupled from compute---the processing
+cluster can be destroyed and recreated without touching the data. MinIO implements the
+S3 API, so the code uses \texttt{s3a://} paths and migration to AWS is a change of
+endpoint and credentials. MinIO is preferred because reproducibility is an assessment
+requirement: a grader runs \texttt{docker compose up} with no cloud account, no
+credentials and no network dependency during the demonstration. HDFS was rejected as
+its NameNode overhead is unjustified at this scale and it reintroduces the
+compute-storage coupling object storage removes.
+
+\subsection{Serving Store: PostgreSQL}
+
+The serving layer is optimised for the read pattern, not for ingestion. Our patterns
+are point lookups by $(\mathit{household\_id}, \mathit{sim\_date})$, aggregation over
+recent windows grouped by zone, and joins between billing and tariff rows---small
+result sets of relational shape. PostgreSQL supplies joins, ACID transactions (a
+billing run lands entirely or not at all, which matters for monetary data),
+\texttt{JSONB} for the per-tier breakdown, and \texttt{ON CONFLICT DO UPDATE} for
+idempotent upserts.
+
+\paragraph{Rejected: Cassandra.} Excellent at high write throughput at scale, but
+queries are restricted to the partition key, joins and ad-hoc aggregation are
+unavailable, and consistency is eventual. Our post-aggregation write volume is a few
+hundred rows per simulated day; selecting Cassandra would optimise for a problem this
+system does not have.
+
+\subsection{Orchestration and Observability}
+
+Airflow supplies a dependency graph, sensors that wait for the tariff file, retries
+with backoff, SLA alerting and---most significantly---\textbf{backfill}, which
+re-executes the billing job across a date range and is therefore the restatement
+mechanism of the architecture, executable and demonstrable rather than merely
+described. The DAGs are deliberately thin: they submit Spark jobs and verify results,
+containing no business logic. This isolates Airflow's constrained dependency set from
+PySpark and FastAPI, and keeps the architecture honest---Airflow orchestrates, Spark
+computes. Cron was rejected as it offers no dependency graph, no retry semantics, no
+execution history and no backfill.
+
+Prometheus scrapes a \texttt{/metrics} endpoint on each service, a pull model that
+suits containers because services need only expose an endpoint. Metrics are labelled
+time series, so one metric labelled by zone supports per-zone slicing. Alertmanager
+consumes rules from a repository file, making alerting itself version-controlled and
+reviewable.
+
+\section{Implementation}
+\label{sec:implementation}
+
+\subsection{Deployment Topology}
+
+Eleven containers are arranged in four dependency tiers under Docker Compose with
+health-condition dependencies. The tier-2 bootstrap containers execute once and exit;
+without them, tier-3 services start correctly but fail on first write.
+
+The four tiers are infrastructure (Kafka, PostgreSQL, MinIO), bootstrap jobs that
+create topics, apply schema and create buckets before exiting, the five long-running
+application containers, and the orchestration and observability stack.
+
+\begin{figure}[H]
+\centering
+% \includegraphics[width=\textwidth]{fig/deployment.png}
+\figph{Figure 3 --- Container deployment view: four dependency tiers with health-gated
+startup ordering}{4.2cm}
+\caption{Deployment topology.}
+\label{fig:deployment}
+\end{figure}
+
+\subsection{Data Contracts}
+
+The event contract is frozen before parallel implementation begins, because three
+components are built against it concurrently.
+
+\begin{lstlisting}[caption={Event published to topic \texttt{meter.readings}, keyed by \texttt{household\_id}.},label={lst:event}]
+{
+  "schema_version": "1.0",     // forward-compatible evolution
+  "event_id": "uuid4",         // idempotency safeguard
+  "trace_id": "uuid4",         // propagated end to end (correlation tracing)
+  "meter_id": "MTR-0042",  "household_id": "HH-0042",  "grid_zone": "ZONE-C",
+  "event_ts": "2026-08-10T14:23:00Z",   // SIMULATED time; drives all windowing
+  "consumption_kwh": 0.412,  "solar_generation_kwh": 0.180,
+  "voltage": 232.4,            // unused by billing; demonstrates column pruning
+  "producer_id": "sim-01"
+}
+\end{lstlisting}
+
+The tariff file supplies \texttt{household\_id}, \texttt{tariff\_rate},
+\texttt{billing\_tier}, \texttt{subsidy\_flag}, \texttt{fixed\_charge},
+\texttt{export\_rate} and \texttt{effective\_date}; the weather file supplies
+\texttt{grid\_zone}, \texttt{forecast\_date}, \texttt{cloud\_cover\_pct} and
+\texttt{solar\_irradiance\_index}. Both are dropped as CSV into the object-storage
+landing zone once per simulated day.
+
+\subsection{Serving Schema}
+
+\begin{table}[H]
+\centering
+\caption{Serving-layer tables and their provenance.}
+\label{tab:tables}
+\small
+\begin{tabularx}{\textwidth}{L{4.4cm} L{1.6cm} X}
+\toprule
+\textbf{Table} & \textbf{Written by} & \textbf{Purpose} \\
+\midrule
+\texttt{zone\_metrics\_rt} & Speed & Per-zone windowed load and renewable ratio \\
+\texttt{household\_running\_rt} & Speed & Provisional running total and estimated bill \\
+\texttt{household\_bill\_daily} & Batch & Authoritative bill with tier breakdown \\
+\texttt{zone\_metrics\_daily} & Batch & Exact daily zone rollup \\
+\texttt{rejected\_records} & Both & Dead-lettered records with rejection reason \\
+\texttt{pipeline\_runs} & Batch & Run ledger; the finalisation flag the merge reads \\
+\texttt{reconciliation\_daily} & Batch & Speed-versus-batch divergence per household \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The two views occupy \emph{separate tables}, so neither layer overwrites the other and
+every row carries unambiguous provenance.
+
+\subsection{Ingestion}
+
+Two Python simulators provide the sources. The \textbf{meter producer} evaluates each
+household's load and solar curves for the current simulated hour, adds stochastic
+noise, applies configured fault-injection rates and publishes to Kafka; it runs
+continuously and coordinates with nothing. The \textbf{reference dropper} wakes once
+per simulated day, writes the tariff and weather files to the landing zone, and sleeps.
+
+\paragraph{Deliberate fault injection.} Robustness claims are unfalsifiable without
+adverse data, so the producer emits---at independently configurable rates---duplicate
+events, out-of-order events, nulls in required fields, negative kWh values, unknown
+household identifiers and periodic meter dropouts. Invalid records are routed to a
+dead-letter topic and recorded in \texttt{rejected\_records} with a categorised
+reason, giving the alert rules genuine conditions to detect.
+
+\subsection{Processing}
+
+The \textbf{raw archiver} consumes from Kafka and writes Parquet to the master dataset
+with \emph{no transformation whatsoever}, partitioned by simulated date and hour, with
+checkpointing for exactly-once file commits across restarts.
+
+The \textbf{speed layer} consumes the same topic in a separate consumer group,
+validates records, assigns each to a 15-simulated-minute event-time tumbling window
+under a 30-second watermark, aggregates by zone, and upserts into PostgreSQL through
+\texttt{foreachBatch} at a 10-second trigger interval. Writes are bulk upserts per
+micro-batch rather than per-record inserts.
+
+The \textbf{batch layer} reads the entire day's partition, deduplicates on
+$(\mathit{meter\_id}, \mathit{event\_ts})$, joins the effective-dated tariff and
+weather dimensions, applies the shared netting and tariff functions, writes
+\texttt{household\_bill\_daily}, computes the reconciliation metric, and inserts a
+success row into \texttt{pipeline\_runs} to mark the day finalised.
+
+\subsection{Runtime Behaviour}
+
+\begin{figure}[H]
+\centering
+% \includegraphics[width=\textwidth]{fig/timeline.png}
+\figph{Figure 4 --- Timeline of one simulated day: continuous speed path, day-boundary
+tariff drop, sensor-triggered batch run, and the merge transition}{4.2cm}
+\caption{One simulated day. The two paths run concurrently; neither waits for the
+other.}
+\label{fig:timeline}
+\end{figure}
+
+\begin{table}[H]
+\centering
+\caption{Contrast between the two processing paths.}
+\label{tab:paths}
+\small
+\begin{tabularx}{\textwidth}{L{2.8cm} X X}
+\toprule
+ & \textbf{Speed path} & \textbf{Batch path} \\
+\midrule
+Order & Process, then store & Store, then process \\
+Reads from & Kafka (live) & Parquet (closed day) \\
+Triggered by & Continuous micro-batches & Sensor on file arrival \\
+Latency & 10--40\,s & Minutes after day close \\
+Late data & Discarded past watermark & Included; full rescan \\
+Output & Approximate, provisional & Exact, authoritative \\
+On failure & Dashboard gap; no data lost & Report delayed; rerun the DAG \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+A consequence worth stating: \textbf{neither path failing causes data loss}, because
+raw events persist in Kafka within its retention window and in Parquet indefinitely.
+Failure produces delay, not loss---the operational expression of why the master
+dataset exists.
+
+On restart, the stateless components (producer, API) resume immediately; the two Spark
+jobs resume at their last committed offset from checkpoints held on named volumes; and
+Airflow does not repeat completed runs unless explicitly backfilled.
+
+\section{Observability Design}
+\label{sec:observability}
+
+\begin{figure}[H]
+\centering
+% \includegraphics[width=\textwidth]{fig/observability.png}
+\figph{Figure 5 --- Observability instrumentation: structured logs, metric scrape
+paths, alert rules and dashboards across every pipeline stage}{4.2cm}
+\caption{Observability instrumentation across pipeline stages.}
+\label{fig:observability}
+\end{figure}
+
+\subsection{Structured Logging}
+
+Every service emits JSON lines to stdout under a fixed envelope containing timestamp,
+level, service, stage, \texttt{trace\_id}, \texttt{sim\_date}, message, and per-batch
+counts of rows read, written and rejected. Structured rather than free-text logging is
+used because it is machine-parseable, filterable by correlation identifier, and
+survives later shipment to an aggregator without reformatting. The fixed
+\texttt{service} and \texttt{stage} fields permit following one record's journey across
+container boundaries.
+
+\subsection{Metrics}
+
+\begin{table}[H]
+\centering
+\caption{Exported metrics and the question each answers.}
+\label{tab:metrics}
+\small
+\begin{tabularx}{\textwidth}{L{5.2cm} L{1.6cm} X}
+\toprule
+\textbf{Metric} & \textbf{Type} & \textbf{Answers} \\
+\midrule
+\texttt{events\_produced\_total} & Counter & Is the source alive? \\
+\texttt{events\_consumed\_total} & Counter & Is each consumer keeping pace? \\
+\texttt{records\_rejected\_total} & Counter & What kind of bad data, and how much? \\
+\texttt{e2e\_latency\_seconds} & Histogram & Where does latency actually accumulate? \\
+\texttt{consumer\_lag} & Gauge & Is a branch falling behind? \\
+\texttt{zone\_renewable\_ratio} & Gauge & Business metric; drives an alert \\
+\texttt{batch\_duration\_seconds} & Histogram & Is the nightly job degrading? \\
+\texttt{lambda\_divergence} & Gauge & Are the two layers agreeing? \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+All metrics are labelled, so \texttt{zone\_renewable\_ratio} slices by zone without
+five separate definitions. Two deserve comment. \texttt{e2e\_latency\_seconds} allows
+the latency budget to be \emph{measured} rather than asserted.
+\texttt{lambda\_divergence} reports the absolute difference between speed estimate and
+batch final per household, meaning the system monitors its own architectural weakness
+and alerts when the two layers disagree beyond a configured threshold.
+
+\subsection{Tracing}
+\label{sec:tracing}
+
+True distributed tracing through Spark executors, with spans crossing the JVM and
+Python boundary inside a micro-batch, is impractical within this project's scope. We
+implement \textbf{correlation-identifier tracing} instead: a \texttt{trace\_id} is
+generated at the producer, carried in Kafka message headers, propagated into the
+master dataset and emitted in every log line at every stage, alongside an end-to-end
+latency histogram. Any record's path and timing across the pipeline can be
+reconstructed by filtering on one identifier.
+
+This is a deliberate trade rather than an oversight: a partially functional
+distributed-tracing deployment would demonstrate less than a complete correlation-based
+implementation whose limitation is stated.
+
+\subsection{Alert Rules}
+
+Alert rules are declarative files held in the repository, and are therefore reviewable
+and version-controlled alongside the code they monitor.
+
+\begin{table}[H]
+\centering
+\caption{Alert rules and the failure each detects.}
+\label{tab:alerts}
+\small
+\begin{tabularx}{\textwidth}{L{4.4cm} X}
+\toprule
+\textbf{Rule} & \textbf{Condition and purpose} \\
+\midrule
+\texttt{MeterDataStale} & No reading from a zone for more than two real minutes; detects producer or broker failure \\
+\texttt{LowRenewableContribution} & Zone renewable ratio below threshold across three consecutive windows; the business alert required by the brief \\
+\texttt{HighRejectRate} & Rejected records exceed 5\% of total over five minutes; detects upstream schema or data-quality regression \\
+\texttt{BatchSLAMiss} & Billing DAG incomplete within the configured window after simulated day close \\
+\texttt{LambdaDivergenceHigh} & Mean speed-versus-batch divergence exceeds threshold; detects logic drift between layers \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{lstlisting}[caption={Representative alert rule definition.},label={lst:alert}]
+- alert: LowRenewableContribution
+  expr: voltstream_zone_renewable_ratio < 0.15
+  for: 3m
+  labels:     { severity: warning }
+  annotations: { summary: "Zone {{ $labels.grid_zone }} renewable below threshold" }
+\end{lstlisting}
+
+The API additionally exposes a liveness endpoint, a readiness endpoint confirming
+PostgreSQL and object storage are reachable, and an alert-status endpoint surfacing
+firing alerts to the dashboard.
+
+\section{Results}
+\label{sec:results}
+
+% =====================================================================
+% TO BE COMPLETED. Suggested content:
+%   8.1 Real-time zone dashboard        - screenshot + commentary
+%   8.2 Daily per-household bill report - sample rows + screenshot
+%   8.3 Provisional-to-final transition - API response before/after finalisation
+%   8.4 Observability in action         - Grafana boards, each alert firing
+%   8.5 Restatement demonstration       - corrupt tariff, backfill, corrected output
+%   8.6 Measured latency budget         - histogram from e2e_latency_seconds
+% =====================================================================
+
+\subsection{Real-Time Zone Monitoring}
+% TODO
+
+\subsection{Daily Per-Household Billing Report}
+% TODO
+
+\subsection{Provisional-to-Final Transition}
+% TODO: same household and date queried before and after finalisation, showing the
+% source field changing and the delta between the two figures.
+
+\subsection{Observability in Operation}
+% TODO: each alert firing under deliberately induced failure.
+
+\subsection{Restatement Demonstration}
+% TODO: corrupt tariff file, incorrect bills, corrected file, backfill, correct bills.
+
+\subsection{Measured Latency Budget}
+% TODO
+
+\section{Discussion}
+\label{sec:discussion}
+
+% =====================================================================
+% TO BE COMPLETED. Suggested content:
+%   Did the architecture decision hold up under implementation?
+%   Where did latency actually accumulate, versus expectation?
+%   What did the reconciliation metric reveal about layer divergence?
+%   Which failures did observability catch, and which did it miss?
+% =====================================================================
+
+\subsection{Validity of the Architecture Decision}
+% TODO
+
+\subsection{Observed Latency Distribution}
+% TODO
+
+\subsection{Speed-versus-Batch Divergence}
+% TODO
+
+\section{Limitations and Production-Scale Considerations}
+\label{sec:limitations}
+
+The following simplifications were conscious decisions rather than oversights.
+
+\subsection{Simulation Fidelity}
+
+\begin{itemize}
+  \item \textbf{Time compression scales event time but not processing time.} Network
+        latency, garbage-collection pauses and micro-batch intervals proceed at
+        wall-clock speed, so watermark tuning is not representative of production,
+        where watermarks derive from empirically observed lateness distributions.
+  \item \textbf{Interval readings rather than cumulative registers.} Real meters report
+        a cumulative register; production would require per-meter stateful
+        differencing with meter-reset and rollover detection.
+  \item \textbf{Deterministic curves with additive noise} rather than measured data,
+        with cross-zone weather correlation limited to the forecast index.
+  \item \textbf{Scale.} Fifty households across five zones is three to four orders of
+        magnitude below a real utility deployment.
+\end{itemize}
+
+\subsection{Architecture, Storage and Operations}
+
+\begin{itemize}
+  \item \textbf{Small-file problem.} Streaming Parquet writes produce many small files,
+        degrading subsequent read performance; production requires periodic compaction.
+  \item \textbf{Object-store commit protocol.} The default file commit relies on
+        rename, which object stores implement as a copy rather than an atomic
+        operation; production requires the S3A magic committer or a table format
+        handling commits natively.
+  \item \textbf{No schema registry.} Producer-consumer schema agreement is by
+        convention, enforced only by validation at the ingestion boundary.
+  \item \textbf{Simplified dimension handling.} The tariff dimension uses an
+        effective-dated join rather than a full slowly-changing-dimension
+        implementation with validity intervals.
+  \item \textbf{Single points of failure.} Single-broker Kafka, single-node Spark and a
+        single PostgreSQL instance, with no replication or failover.
+  \item \textbf{Executor metrics} are emitted from the driver within
+        \texttt{foreachBatch} rather than scraped directly, because executors are
+        transient; tracing is approximated by correlation identifiers
+        (Section~\ref{sec:tracing}).
+\end{itemize}
+
+\subsection{Scale Boundary of the Serving Layer}
+
+PostgreSQL is appropriate at our data volume and would remain so up to roughly the low
+millions of aggregate rows per day. Beyond that threshold the serving layer should
+migrate to a time-series or columnar analytical store such as TimescaleDB, ClickHouse
+or Cassandra. Selecting PostgreSQL reflects our actual data volume rather than
+aspirational scale, which we consider the correct basis for the decision.
+
+\subsection{What We Would Change at Production Scale}
+
+\begin{table}[H]
+\centering
+\caption{Production-scale evolution of the current design.}
+\label{tab:production}
+\small
+\begin{tabularx}{\textwidth}{L{4.0cm} X}
+\toprule
+\textbf{Change} & \textbf{Motivation} \\
+\midrule
+Iceberg or Delta Lake over raw Parquet & ACID transactions, time travel, schema
+evolution and automatic compaction; removes the small-file and commit problems \\
+Schema registry with Avro or Protobuf & Enforces backward-compatible evolution;
+producer-consumer drift is a common production failure \\
+Change data capture replacing file drops & Streaming tariff changes directly from the
+billing system removes the daily-file dependency \\
+Spark on Kubernetes with autoscaling & Batch capacity appears at day close and
+disappears afterwards \\
+Data quality gates between stages & Row-count bounds, null checks, and a cross-check
+that zone totals reconcile against household totals; fail the DAG rather than publish
+a wrong report \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\paragraph{The architectural consequence.} Iceberg and Kafka tiered storage both
+remove the retention constraint identified in Section~\ref{sec:arch} as the decisive
+argument for Lambda. Once the log itself is durable, queryable and unbounded, Kappa's
+single codebase becomes the better trade and we would migrate. We regard this as the
+honest conclusion of the architecture chapter: the decision is correct \emph{given the
+constraints as they stand}, and we can name precisely the change that would reverse it.
+
+\paragraph{Functional extensions.} The weather feed is already present in the
+pipeline, so joining forecast cloud cover to each zone's historical solar profile
+would permit predicting renewable shortfall an hour ahead---converting a monitoring
+system into a decision-support system in which the operator pre-ramps generation
+rather than reacting to a frequency deviation. Theft detection through deviation from
+a household's own baseline, and demand-response simulation quantifying peak-shifting
+potential, are natural further extensions.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+% =====================================================================
+% TO BE COMPLETED once Results and Discussion are written. Suggested shape:
+%   - restate the problem in one sentence
+%   - restate the architecture decision and its single decisive reason
+%   - state what was built and demonstrated
+%   - state the most significant limitation honestly
+%   - close on the contingency: what would change the decision
+% =====================================================================
+
+% TODO
+
+\clearpage
+\phantomsection
+\addcontentsline{toc}{section}{References}
+\begin{thebibliography}{9}
+
+\bibitem{marz}
+N. Marz and J. Warren, \emph{Big Data: Principles and Best Practices of Scalable
+Real-Time Data Systems}. Shelter Island, NY: Manning Publications, 2015.
+
+\bibitem{kreps}
+J. Kreps, ``Questioning the Lambda Architecture,'' O'Reilly Radar, 2014.
+
+\bibitem{kafka}
+Apache Software Foundation, \emph{Apache Kafka Documentation}. [Online]. Available:
+\url{https://kafka.apache.org/documentation/}
+
+\bibitem{spark}
+Apache Software Foundation, \emph{Structured Streaming Programming Guide}. [Online].
+Available: \url{https://spark.apache.org/docs/latest/structured-streaming-programming-guide.html}
+
+\bibitem{airflow}
+Apache Software Foundation, \emph{Apache Airflow Documentation}. [Online]. Available:
+\url{https://airflow.apache.org/docs/}
+
+\bibitem{parquet}
+Apache Software Foundation, \emph{Apache Parquet Documentation}. [Online]. Available:
+\url{https://parquet.apache.org/docs/}
+
+\bibitem{prometheus}
+Prometheus Authors, \emph{Prometheus Documentation}. [Online]. Available:
+\url{https://prometheus.io/docs/}
+
+\end{thebibliography}
+
+\clearpage
+\phantomsection
+\addcontentsline{toc}{section}{Appendix A: Assumptions and Simplifications}
+\section*{Appendix A: Assumptions and Simplifications}
+
+\begin{enumerate}[itemsep=2pt]
+  \item Simulated time is compressed by a factor of 288, so one simulated day elapses
+        in five real minutes (Section~\ref{sec:simclock}).
+  \item Meters emit interval energy in kWh rather than cumulative register readings.
+  \item Tariff block rates and fixed charges are synthetic values chosen to exercise
+        the tiered billing logic; they are not drawn from a published tariff schedule.
+  \item Fifty households are distributed across five grid zones with fixed membership.
+  \item Fault-injection rates are configured to exercise validation and alerting paths
+        and do not represent realistic meter failure rates.
+  \item Kafka retention is left at its default of approximately seven days.
+  \item All timestamps are handled in UTC.
+\end{enumerate}
+
+\phantomsection
+\addcontentsline{toc}{section}{Appendix B: Statement of Individual Contributions}
+\section*{Appendix B: Statement of Individual Contributions}
+
+% =====================================================================
+% TO BE COMPLETED. Required by the submission guidelines for group submissions.
+% =====================================================================
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{L{3.0cm} L{3.2cm} X}
+\toprule
+\textbf{Registration} & \textbf{Name} & \textbf{Contribution} \\
+\midrule
+EG/2021/4511 & Fernando S.A.U. & \\
+EG/2021/4516 & Fonseka C. M.   & \\
+EG/2021/4525 &                 & \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\end{document}
