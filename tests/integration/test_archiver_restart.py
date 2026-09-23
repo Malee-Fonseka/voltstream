@@ -40,7 +40,12 @@ import pytest
 pytestmark = pytest.mark.integration
 
 _SERVICE = "raw-archiver"
-_COMPOSE = ["docker", "compose", "-f", str(Path(__file__).resolve().parents[2] / "docker" / "docker-compose.yml")]
+_COMPOSE = [
+    "docker",
+    "compose",
+    "-f",
+    str(Path(__file__).resolve().parents[2] / "docker" / "docker-compose.yml"),
+]
 
 # Real seconds. A simulated hour is 12.5 real seconds, so these spans cover several
 # partitions and several micro-batches at a 10-real-second trigger.
@@ -130,7 +135,10 @@ def test_archiver_survives_a_kill_without_losing_data() -> None:
                 f"{expected} distinct offsets, found {stats['distinct_offsets']} "
                 f"({expected - stats['distinct_offsets']} missing)"
             )
-    assert not gaps, "Offset gap after restart — data published during the outage was skipped:\n" + "\n".join(gaps)
+    assert not gaps, (
+        "Offset gap after restart — data published during the outage was skipped:\n"
+        + "\n".join(gaps)
+    )
 
     # 3. Duplicates: reported, not asserted away. See the module docstring.
     duplicates = after["rows"] - after["distinct_event_ids"]

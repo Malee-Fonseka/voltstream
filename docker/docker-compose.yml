@@ -164,6 +164,10 @@ services:
     environment:
       VOLTSTREAM_ENV: docker
       VOLTSTREAM_CONFIG_DIR: /app/config
+      # Shared simulated-clock anchor so every container maps the same real instant
+      # to the same simulated one. Unset means each process anchors on its own
+      # start, and they drift apart by their startup skew times time_scale.
+      VOLTSTREAM__SIMULATION__ANCHOR_REAL: ${VOLTSTREAM_ANCHOR_REAL:-}
       VOLTSTREAM__KAFKA__BOOTSTRAP_SERVERS: kafka:9092
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-voltstream}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-voltstream-dev}
@@ -189,6 +193,10 @@ services:
     environment:
       VOLTSTREAM_ENV: docker
       VOLTSTREAM_CONFIG_DIR: /app/config
+      # Shared simulated-clock anchor so every container maps the same real instant
+      # to the same simulated one. Unset means each process anchors on its own
+      # start, and they drift apart by their startup skew times time_scale.
+      VOLTSTREAM__SIMULATION__ANCHOR_REAL: ${VOLTSTREAM_ANCHOR_REAL:-}
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-voltstream}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-voltstream-dev}
       AWS_DEFAULT_REGION: us-east-1
@@ -216,6 +224,10 @@ services:
     environment:
       VOLTSTREAM_ENV: docker
       VOLTSTREAM_CONFIG_DIR: /app/config
+      # Shared simulated-clock anchor so every container maps the same real instant
+      # to the same simulated one. Unset means each process anchors on its own
+      # start, and they drift apart by their startup skew times time_scale.
+      VOLTSTREAM__SIMULATION__ANCHOR_REAL: ${VOLTSTREAM_ANCHOR_REAL:-}
       VOLTSTREAM__KAFKA__BOOTSTRAP_SERVERS: kafka:9092
       # T044: the checkpoint lives on the named volume mounted below, never in /tmp.
       VOLTSTREAM_CHECKPOINT_DIR: /var/lib/voltstream/checkpoints
