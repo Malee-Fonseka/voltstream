@@ -202,6 +202,46 @@ services:
       minio-init:
         condition: service_completed_successfully
 
+  # Raw archiver (T082, §8.3) — Kafka to the master dataset, no transformation.
+  # On the Spark image, not the app image: it needs the hadoop-aws and kafka connector
+  # JARs baked into spark.Dockerfile.
+  raw-archiver:
+    build:
+      context: ..
+      dockerfile: docker/images/spark.Dockerfile
+    image: voltstream-spark:${VOLTSTREAM_IMAGE_TAG:-local}
+    container_name: voltstream-raw-archiver
+    restart: unless-stopped
+    command: ["voltstream-archiver"]
+    environment:
+      VOLTSTREAM_ENV: docker
+      VOLTSTREAM_CONFIG_DIR: /app/config
+      VOLTSTREAM__KAFKA__BOOTSTRAP_SERVERS: kafka:9092
+      # T044: the checkpoint lives on the named volume mounted below, never in /tmp.
+      VOLTSTREAM_CHECKPOINT_DIR: /var/lib/voltstream/checkpoints
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-voltstream}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-voltstream-dev}
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://minio:9000
+      SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-1g}
+    ports:
+      # Driver metrics (T081). Mapped so Prometheus (Phase 12) and a developer can
+      # both reach it; the port itself comes from observability.metrics_port.
+      - "${ARCHIVER_METRICS_PORT:-8011}:8001"
+    volumes:
+      - ../config:/app/config:ro
+      - archiver_checkpoints:/var/lib/voltstream/checkpoints
+    networks: [voltstream]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+
 networks:
   voltstream:
     name: voltstream
