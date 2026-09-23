@@ -74,6 +74,13 @@ ENV PATH="/opt/venv/bin:${PATH}" \
     PYSPARK_PYTHON="/opt/venv/bin/python" \
     PYSPARK_DRIVER_PYTHON="/opt/venv/bin/python"
 
+# Checkpoint root, created and chowned BEFORE the volume is mounted. Docker seeds a
+# fresh named volume from the image's contents at the mount path, ownership included;
+# if the path does not exist in the image the volume is created root-owned and the
+# voltstream user cannot mkdir inside it.
+RUN mkdir -p /var/lib/voltstream/checkpoints \
+    && chown -R voltstream:voltstream /var/lib/voltstream
+
 WORKDIR /app
 USER voltstream
 
