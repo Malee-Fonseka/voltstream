@@ -68,15 +68,27 @@ METER_READING_SCHEMA = StructType(
 _KAFKA_METADATA_COLUMNS = ("kafka_key", "kafka_timestamp", "kafka_partition", "kafka_offset")
 
 
-def read_meter_stream(spark: SparkSession, *, starting_offsets: str = "earliest") -> DataFrame:
+def read_meter_stream(
+    spark: SparkSession,
+    *,
+    starting_offsets: str = "earliest",
+    group_id: str | None = None,
+) -> DataFrame:
     """Read `meter.readings` as a stream, parsed against the frozen contract.
 
     `starting_offsets` applies only on the very first run of a query; afterwards the
-    checkpoint's committed offsets win, which is exactly the behaviour Gate 2 tests.
+    checkpoint's committed offsets win, which is exactly the behaviour the restart test
+    exercises.
+
+    `group_id` names the Kafka consumer group. Spark tracks offsets in its own checkpoint
+    either way, so this does not change delivery — it makes the two branches *visible* as
+    separate groups in `kafka-consumer-groups --describe`, which is how the archiver and
+    the speed layer are shown to consume the same topic independently (§5.2). Left unset,
+    Spark generates a random group per run and the two branches cannot be told apart.
     """
     config = get_config()
 
-    raw = (
+    reader = (
         spark.readStream.format("kafka")
         .option("kafka.bootstrap.servers", config.kafka.bootstrap_servers)
         .option("subscribe", config.kafka.topic)
@@ -85,10 +97,11 @@ def read_meter_stream(spark: SparkSession, *, starting_offsets: str = "earliest"
         .option("includeHeaders", "true")
         # A lost offset must be loud, not silently skipped to the newest record.
         .option("failOnDataLoss", "true")
-        .load()
     )
+    if group_id:
+        reader = reader.option("kafka.group.id", group_id)
 
-    return raw.select(
+    return reader.load().select(
         F.from_json(F.col("value").cast("string"), METER_READING_SCHEMA).alias("r"),
         F.col("key").cast("string").alias("kafka_key"),
         F.col("timestamp").alias("kafka_timestamp"),

@@ -121,7 +121,9 @@ def start(await_termination: bool = True) -> StreamingQuery:
     spark = build_session(f"voltstream-{_JOB_NAME}")
     spark.sparkContext.setLogLevel("WARN")
 
-    stream = with_partition_columns(read_meter_stream(spark))
+    # Named group so the archiver and the speed layer are distinguishable as two
+    # independent consumers of one topic (§5.2).
+    stream = with_partition_columns(read_meter_stream(spark, group_id="voltstream-archiver"))
 
     query = (
         stream.writeStream.queryName(_JOB_NAME)
