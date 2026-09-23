@@ -254,6 +254,50 @@ services:
       minio-init:
         condition: service_completed_successfully
 
+  # Speed layer (T095, §8.4). Its own consumer group and its own checkpoint volume:
+  # independent consumer groups are what let the two Lambda branches read one topic
+  # without either noticing the other (§5.2).
+  speed-layer:
+    build:
+      context: ..
+      dockerfile: docker/images/spark.Dockerfile
+    image: voltstream-spark:${VOLTSTREAM_IMAGE_TAG:-local}
+    container_name: voltstream-speed-layer
+    restart: unless-stopped
+    command: ["voltstream-speed-layer"]
+    environment:
+      VOLTSTREAM_ENV: docker
+      VOLTSTREAM_CONFIG_DIR: /app/config
+      VOLTSTREAM__SIMULATION__ANCHOR_REAL: ${VOLTSTREAM_ANCHOR_REAL:-}
+      VOLTSTREAM__KAFKA__BOOTSTRAP_SERVERS: kafka:9092
+      VOLTSTREAM__POSTGRES__HOST: postgres
+      VOLTSTREAM__POSTGRES__PASSWORD: ${POSTGRES_PASSWORD:-voltstream}
+      VOLTSTREAM_CHECKPOINT_DIR: /var/lib/voltstream/checkpoints
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-voltstream}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-voltstream-dev}
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://minio:9000
+      SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-1g}
+    ports:
+      - "${SPEED_LAYER_METRICS_PORT:-8012}:8001"
+    volumes:
+      - ../config:/app/config:ro
+      - speed_checkpoints:/var/lib/voltstream/checkpoints
+    networks: [voltstream]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      postgres-init:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+
 networks:
   voltstream:
     name: voltstream
