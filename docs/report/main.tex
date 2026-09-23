@@ -583,10 +583,10 @@ reviewable.
 
 \subsection{Deployment Topology}
 
-% VERIFY BEFORE SUBMISSION: container count. docker-compose.yml currently defines 9
-% services (tiers 1-2 plus meter-producer, reference-dropper, app). Phases 6-12 add the
-% raw archiver, speed layer, Airflow, Prometheus, Grafana, Alertmanager and the API.
-% Recount and update "Eleven" once Phase 12 is complete.
+% VERIFY BEFORE SUBMISSION: container count. docker-compose.yml defines 9 services as of
+% Phase 6 (kafka, postgres, minio, the three -init jobs, meter-producer,
+% reference-dropper, raw-archiver). Phases 7-12 add the speed layer, Airflow, the API,
+% Prometheus, Grafana and Alertmanager. Recount and update "Eleven" once Phase 12 lands.
 Eleven containers are arranged in four dependency tiers under Docker Compose with
 health-condition dependencies. The tier-2 bootstrap containers execute once and exit;
 without them, tier-3 services start correctly but fail on first write.
