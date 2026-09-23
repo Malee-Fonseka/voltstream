@@ -110,7 +110,12 @@ def zone_aggregation(valid_df: DataFrame) -> DataFrame:
         .agg(
             F.sum("consumption_kwh").cast(_KWH).alias("total_consumption_kwh"),
             F.sum("solar_generation_kwh").cast(_KWH).alias("total_solar_kwh"),
-            F.countDistinct("meter_id").alias("active_meters"),
+            # Not countDistinct: distinct aggregations are rejected outright on a
+            # streaming DataFrame. Spark suggests approx_count_distinct, but this count
+            # is reported per zone and ~10 meters is far too small a cardinality to want
+            # a HyperLogLog estimate. collect_set is exact, and its state is bounded by
+            # the meters in one zone in one window.
+            F.size(F.collect_set("meter_id")).alias("active_meters"),
         )
         .select(
             F.col("grid_zone"),
@@ -385,19 +390,26 @@ def start(await_termination: bool = True) -> list[StreamingQuery]:
         config.simulation.epoch_sim + timedelta(days=365 * 50),
     )
 
-    # Its own consumer group, distinct from the archiver's (§5.2). Spark tracks offsets
-    # in its checkpoint either way; the group id is what makes the two branches visible
-    # as independent consumers.
-    raw = read_meter_stream(spark, group_id="voltstream-speed-layer")
-    valid_df, _ = split_valid_invalid(
-        raw, known_household_ids=known_households, event_ts_bounds=bounds
-    )
+    # One source per query, each with its own consumer group. Spark is explicit that a
+    # group id must not be shared across queries: they would join the same group, have
+    # partitions revoked from under each other, and interfere on restart. All three stay
+    # distinct from the archiver's group, which is what §5.2's independence claim needs.
+    #
+    # The cost is that each query reads the topic separately. At this volume (~7,500
+    # events per simulated day) that is cheap, and it buys genuinely independent failure:
+    # the zone view keeps serving if the household query dies.
+    def valid_stream(group_id: str) -> DataFrame:
+        raw_stream = read_meter_stream(spark, group_id=group_id)
+        valid, _ = split_valid_invalid(
+            raw_stream, known_household_ids=known_households, event_ts_bounds=bounds
+        )
+        return valid
 
     trigger = f"{config.speed_layer.trigger_interval_real_seconds} seconds"
     output_mode = config.speed_layer.output_mode
 
     zone_query = (
-        zone_aggregation(valid_df)
+        zone_aggregation(valid_stream("voltstream-speed-zone"))
         .writeStream.queryName(_ZONE_JOB)
         .outputMode(output_mode)
         .option("checkpointLocation", checkpoint_path(_ZONE_JOB))
@@ -407,7 +419,7 @@ def start(await_termination: bool = True) -> list[StreamingQuery]:
     )
 
     household_query = (
-        household_aggregation(valid_df)
+        household_aggregation(valid_stream("voltstream-speed-household"))
         .writeStream.queryName(_HOUSEHOLD_JOB)
         .outputMode(output_mode)
         .option("checkpointLocation", checkpoint_path(_HOUSEHOLD_JOB))
@@ -420,7 +432,8 @@ def start(await_termination: bool = True) -> list[StreamingQuery]:
     # separate because the two aggregations consume only valid rows by construction, so
     # neither of them ever sees a rejected record to dead-letter.
     validation_query = (
-        raw.writeStream.queryName("speed_layer_validation")
+        read_meter_stream(spark, group_id="voltstream-speed-validation")
+        .writeStream.queryName("speed_layer_validation")
         .outputMode("append")
         .option("checkpointLocation", checkpoint_path("speed_layer_validation"))
         .trigger(processingTime=trigger)
