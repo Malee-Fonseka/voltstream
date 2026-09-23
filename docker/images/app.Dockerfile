@@ -15,9 +15,16 @@ WORKDIR /build
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
 
+# Dependencies first, source second, so a source edit does not re-resolve and re-download
+# the whole dependency tree. Same reasoning as spark.Dockerfile, where it matters far more.
 COPY pyproject.toml README.md ./
+RUN mkdir -p src/voltstream \
+    && touch src/voltstream/__init__.py \
+    && pip install --no-cache-dir ".[api,sim]" \
+    && pip uninstall -y voltstream
+
 COPY src/ ./src/
-RUN pip install --no-cache-dir ".[api,sim]"
+RUN pip install --no-cache-dir --no-deps ".[api,sim]"
 
 FROM python:3.11-slim-bookworm
 

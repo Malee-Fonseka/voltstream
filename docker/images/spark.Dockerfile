@@ -27,9 +27,21 @@ WORKDIR /build
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
 
+# Dependencies first, source second. pyspark is a ~317 MB wheel and installing it takes
+# the better part of an hour on a slow link; copying src/ before this step put every
+# source edit ahead of that layer, so changing one line of Python rebuilt PySpark from
+# scratch. Installing the dependencies from pyproject.toml alone keeps that layer cached
+# across source changes, and only the (fast) package install below re-runs.
 COPY pyproject.toml README.md ./
+RUN mkdir -p src/voltstream \
+    && touch src/voltstream/__init__.py \
+    && pip install --no-cache-dir ".[spark]" \
+    && pip uninstall -y voltstream
+
 COPY src/ ./src/
-RUN pip install --no-cache-dir ".[spark]"
+# --no-deps: everything above is already installed and pinned; without it pip re-resolves
+# the whole tree and can silently pull a different pyspark than the JARs below match.
+RUN pip install --no-cache-dir --no-deps ".[spark]"
 
 # ---------------------------------------------------------------------------
 # Stage: jars — fetch the connector JARs pyspark does not bundle
