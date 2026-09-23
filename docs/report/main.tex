@@ -922,8 +922,14 @@ The following simplifications were conscious decisions rather than oversights.
 \subsection{Architecture, Storage and Operations}
 
 \begin{itemize}
-  \item \textbf{Small-file problem.} Streaming Parquet writes produce many small files,
-        degrading subsequent read performance; production requires periodic compaction.
+  \item \textbf{Small-file problem.} Streaming Parquet writes produce many small files.
+        Measured over one complete simulated day: \textbf{245 files averaging 10.2\,kB}
+        across 24 hour partitions, against a Parquet row-group target of roughly
+        128\,MB. The cause is structural rather than a misconfiguration --- a streaming
+        sink commits at least one file per partition per micro-batch, so a simulated day
+        at a 10-real-second trigger produces roughly 30 commits, each writing into
+        whichever hour partitions its rows fall in. Production requires a compaction job,
+        or a table format that compacts as part of its commit protocol.
   \item \textbf{Object-store commit protocol.} The default file commit relies on
         rename, which object stores implement as a copy rather than an atomic
         operation; production requires the S3A magic committer or a table format

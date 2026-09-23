@@ -86,14 +86,30 @@ problem here; it would become one if the design ever needed in-place correction.
 **Limitation — streaming writes produce many small files** (§10.2), degrading subsequent
 read performance. Production requires a periodic compaction job.
 
-> **T084 — measured file count and average size for one simulated day:**
-> _pending; measure after the archiver has run one full simulated day and record here._
->
-> | Metric | Value | Measured on |
-> |---|---|---|
-> | Parquet files per simulated day | _TBD_ | _TBD_ |
-> | Average file size | _TBD_ | _TBD_ |
-> | Partition directories per simulated day | _TBD_ (expect 24, one per hour) | _TBD_ |
+**Measured**, over one complete simulated day, archiver at a 10-real-second trigger with
+4 shuffle partitions:
+
+| Metric | Value |
+|---|---|
+| Parquet files | 245 |
+| Total size | 2.49 MB |
+| Average file size | **10.2 kB** |
+| Smallest / largest file | 6.0 kB / 24.6 kB |
+| Hour partition directories | 24 |
+| Rows archived | 6,946 |
+
+Measured 2026-09-23 against the full Compose stack.
+
+The average file is **10.2 kB against a Parquet row-group target of roughly 128 MB** —
+about four orders of magnitude too small. Every one carries a footer, schema and
+row-group metadata, so the fixed overhead dominates the payload, and a full-day read
+pays 245 object-store round trips where a compacted day would pay a handful.
+
+The cause is structural, not a misconfiguration: a streaming sink commits at least one
+file per partition per micro-batch. At 10 real seconds per trigger a simulated day is
+about 30 triggers, and each writes into whichever hour partitions its rows fall in.
+Production fixes this with a compaction job, or with a table format (Iceberg, Delta Lake)
+that compacts as part of its commit protocol.
 
 **Limitation — the object-store commit protocol.** The default file-output committer
 relies on rename, which object stores implement as copy-then-delete rather than as an
