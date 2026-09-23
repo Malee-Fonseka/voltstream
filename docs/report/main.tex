@@ -201,9 +201,10 @@ Simulated time is compressed so the pipeline is demonstrable within a session:
   1 \text{ simulated day} = 5 \text{ real minutes}, \qquad \mathrm{TIME\_SCALE} = 288
 \]
 
-With a 2-second emit interval, each meter produces 144 readings per simulated day.
-Across 50 households in 5 grid zones this yields approximately 7{,}200 raw events,
-480 zone-metric rows and 50 bill rows per simulated day.
+With a 2-second emit interval, each meter produces 150 readings per simulated day---a
+simulated day elapses in 300 real seconds, one reading every 2 of them. Across 50
+households in 5 grid zones this yields approximately 7{,}500 raw events, 480
+zone-metric rows and 50 bill rows per simulated day.
 
 All timestamps and all windowing operate on \emph{simulated} time; only
 ingestion-latency metrics use wall-clock time. A single module, \texttt{simclock.py},
@@ -319,7 +320,10 @@ Our mitigation is structural rather than procedural:
         provisional estimates, while the Spark path must use Column expressions rather
         than user-defined functions to preserve query optimisation and avoid per-row
         serialisation. \texttt{tests/consistency/test\_pure\_vs\_spark.py} generates
-        several thousand random inputs, executes both, and asserts identical output.
+        5{,}000 random inputs, executes both implementations, and asserts identical
+        output. It additionally sweeps each tariff block boundary in hundredth-kWh
+        steps, because an off-by-one at a boundary is precisely the defect uniform
+        random sampling is least likely to find.
 \end{enumerate}
 
 Divergence between the layers is therefore a test failure rather than a matter of
@@ -579,6 +583,10 @@ reviewable.
 
 \subsection{Deployment Topology}
 
+% VERIFY BEFORE SUBMISSION: container count. docker-compose.yml defines 9 services as of
+% Phase 6 (kafka, postgres, minio, the three -init jobs, meter-producer,
+% reference-dropper, raw-archiver). Phases 7-12 add the speed layer, Airflow, the API,
+% Prometheus, Grafana and Alertmanager. Recount and update "Eleven" once Phase 12 lands.
 Eleven containers are arranged in four dependency tiers under Docker Compose with
 health-condition dependencies. The tier-2 bootstrap containers execute once and exit;
 without them, tier-3 services start correctly but fail on first write.
@@ -669,9 +677,25 @@ checkpointing for exactly-once file commits across restarts.
 
 The \textbf{speed layer} consumes the same topic in a separate consumer group,
 validates records, assigns each to a 15-simulated-minute event-time tumbling window
-under a 30-second watermark, aggregates by zone, and upserts into PostgreSQL through
-\texttt{foreachBatch} at a 10-second trigger interval. Writes are bulk upserts per
-micro-batch rather than per-record inserts.
+under a \textbf{30-simulated-minute} watermark, aggregates by zone, and upserts into
+PostgreSQL through \texttt{foreachBatch} at a 10-real-second trigger interval. Writes
+are bulk upserts per micro-batch rather than per-record inserts.
+
+\paragraph{Watermark units, and what actually governs lateness.} The watermark applies
+to \texttt{event\_ts}, which advances at $288\times$ wall-clock, so it is expressed in
+\emph{simulated} minutes: 30 simulated minutes is 6.25 real seconds. Stating it as ``30
+seconds'' would be ambiguous in a way that changes behaviour---read as 30 simulated
+seconds it is 0.104 real seconds, effectively no watermark at all. Every duration in
+\texttt{config/base.yaml} therefore carries an explicit \texttt{\_sim\_minutes} or
+\texttt{\_real\_seconds} suffix, and no component converts between the two outside
+\texttt{simclock.py}.
+
+A more consequential observation follows from the time compression. The 10-real-second
+trigger interval is 48 \emph{simulated} minutes---longer than the 30-simulated-minute
+watermark. At this time scale the trigger interval, not the watermark, is the dominant
+term in what gets dropped, and a watermark shorter than one trigger is decorative. This
+is an artefact of compressing a day into five minutes rather than a property of the
+architecture; Section~\ref{sec:limitations} records it as such.
 
 The \textbf{batch layer} reads the entire day's partition, deduplicates on
 $(\mathit{meter\_id}, \mathit{event\_ts})$, joins the effective-dated tariff and
@@ -898,8 +922,14 @@ The following simplifications were conscious decisions rather than oversights.
 \subsection{Architecture, Storage and Operations}
 
 \begin{itemize}
-  \item \textbf{Small-file problem.} Streaming Parquet writes produce many small files,
-        degrading subsequent read performance; production requires periodic compaction.
+  \item \textbf{Small-file problem.} Streaming Parquet writes produce many small files.
+        Measured over one complete simulated day: \textbf{245 files averaging 10.2\,kB}
+        across 24 hour partitions, against a Parquet row-group target of roughly
+        128\,MB. The cause is structural rather than a misconfiguration --- a streaming
+        sink commits at least one file per partition per micro-batch, so a simulated day
+        at a 10-real-second trigger produces roughly 30 commits, each writing into
+        whichever hour partitions its rows fall in. Production requires a compaction job,
+        or a table format that compacts as part of its commit protocol.
   \item \textbf{Object-store commit protocol.} The default file commit relies on
         rename, which object stores implement as a copy rather than an atomic
         operation; production requires the S3A magic committer or a table format
@@ -1023,14 +1053,69 @@ Prometheus Authors, \emph{Prometheus Documentation}. [Online]. Available:
   \item Simulated time is compressed by a factor of 288, so one simulated day elapses
         in five real minutes (Section~\ref{sec:simclock}).
   \item Meters emit interval energy in kWh rather than cumulative register readings.
-  \item Tariff block rates and fixed charges are synthetic values chosen to exercise
-        the tiered billing logic; they are not drawn from a published tariff schedule.
+  \item Tariff block boundaries, rates, fixed charges and the subsidy percentage are
+        synthetic values chosen to exercise the tiered billing logic
+        (Table~\ref{tab:tariffvals}); they are not drawn from a published tariff
+        schedule. Only the \emph{boundaries} are configuration; every rate reaches the
+        billing logic through the day's tariff file.
   \item Fifty households are distributed across five grid zones with fixed membership.
-  \item Fault-injection rates are configured to exercise validation and alerting paths
-        and do not represent realistic meter failure rates.
+  \item Fault-injection rates (Table~\ref{tab:faultvals}) are configured to exercise
+        validation and alerting paths and do not represent realistic meter failure
+        rates. Setting every rate to zero yields output identical to input, which is
+        asserted as a test.
   \item Kafka retention is left at its default of approximately seven days.
   \item All timestamps are handled in UTC.
 \end{enumerate}
+
+All values below are the defaults in \texttt{config/base.yaml}; no number reaching the
+billing arithmetic is hard-coded in source.
+
+\begin{table}[H]
+\centering
+\caption{Synthetic tariff structure. Boundaries are configuration; rates and charges are
+supplied per household by the daily tariff file and are shown here as the values the
+reference generator writes.}
+\label{tab:tariffvals}
+\small
+\begin{tabularx}{\textwidth}{L{4.6cm} L{4.4cm} X}
+\toprule
+\textbf{Parameter} & \textbf{Value} & \textbf{Source} \\
+\midrule
+Block boundaries (cumulative kWh) & 0--60, 60--120, $>$120 & \texttt{base.yaml} (fixed) \\
+Block energy rates & 8.00, 16.50, 24.50 per kWh & Daily tariff file \\
+Fixed charge by tier & 120.00 / 240.00 / 480.00 & Daily tariff file \\
+Subsidy discount & 25\,\% & Daily tariff file \\
+Net-metering export rate & 18.00 per kWh & Daily tariff file \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Fault-injection rates. Each is a per-reading probability except the dropout,
+which is evaluated per meter per tick.}
+\label{tab:faultvals}
+\small
+\begin{tabularx}{\textwidth}{L{4.6cm} L{2.2cm} X}
+\toprule
+\textbf{Fault} & \textbf{Rate} & \textbf{Exercises} \\
+\midrule
+Duplicate event & 2.0\,\% & Deduplication on $(\mathit{meter\_id}, \mathit{event\_ts})$ \\
+Out-of-order event & 3.0\,\% & Watermark; shift is uniform over 1--30 simulated minutes, bounded by the watermark so reordering is always absorbed \\
+Null required field & 1.0\,\% & Validation; dead-letter routing \\
+Negative kWh value & 0.5\,\% & Validation; dead-letter routing \\
+Unknown household & 0.5\,\% & Referential check against the seeded dimension \\
+Meter dropout & 0.2\,\% per tick & Store-and-forward: 30 real seconds of buffering, then flushed with \texttt{event\_ts} unchanged \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The two lateness mechanisms are deliberately separated. Out-of-order events model
+network reordering and are bounded by the watermark, so they are always absorbed.
+Dropouts model a communications outage and flush a backlog far beyond the watermark, so
+the speed layer misses them while the batch layer, rescanning a closed day, does not.
+That gap is the source of the speed-versus-batch divergence the reconciliation metric
+measures, and it is injected on purpose rather than hoped for.
 
 \phantomsection
 \addcontentsline{toc}{section}{Appendix B: Statement of Individual Contributions}
