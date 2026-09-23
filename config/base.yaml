@@ -28,12 +28,19 @@ simulation:
   households: 50
   # Grid zones meter readings and tariff/weather rows are partitioned by.
   zones: ["ZONE-A", "ZONE-B", "ZONE-C", "ZONE-D", "ZONE-E"]
-  # The REAL wall-clock instant that simulated time is anchored to (RFC 3339, UTC).
-  # sim_now() = epoch_real + (real_now() - process_start_real) * time_scale, so every
-  # process in a run must agree on this value for windows/dates to line up. Override per
-  # run with VOLTSTREAM__SIMULATION__EPOCH_REAL (see .env.example) for a reproducible demo
-  # start; this default is only used when that override is unset.
-  epoch_real: "2026-01-01T00:00:00Z"
+  # The SIMULATED instant a run begins at (RFC 3339, UTC). Fixed, so every run's data
+  # starts on the same simulated date and partition paths stay stable.
+  epoch_sim: "2026-01-01T00:00:00Z"
+  # The REAL instant that maps to epoch_sim. Left null it means "this process started
+  # now", which keeps a single process sane but lets two processes drift apart by their
+  # startup skew times time_scale (5 real seconds = 24 simulated minutes). Compose sets
+  # VOLTSTREAM__SIMULATION__ANCHOR_REAL so every container in a run shares one anchor.
+  #
+  # Do NOT fold this into epoch_sim. One field serving as both the simulated start and
+  # the real anchor means real time drifting past it gets multiplied by time_scale: an
+  # anchor left at 2026-01-01 and read 265 days later put every partition in the year
+  # 2235. See simclock's module docstring.
+  anchor_real: null
 
 # ==============================================================================
 # faults — deliberate fault injection rates (simulators/faults.py, T069-T070)

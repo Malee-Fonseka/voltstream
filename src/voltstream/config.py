@@ -62,7 +62,12 @@ class SimulationConfig(_StrictModel):
     emit_interval_seconds: float
     households: int
     zones: list[str]
-    epoch_real: datetime
+    # The simulated instant a run starts at. Fixed, so partition dates are stable.
+    epoch_sim: datetime
+    # The real instant that maps to epoch_sim. None = this process's start time; set it
+    # explicitly whenever more than one process takes part in a run, or they will
+    # disagree by their startup skew times time_scale. See simclock's module docstring.
+    anchor_real: datetime | None = None
 
 
 class FaultsConfig(_StrictModel):
@@ -176,6 +181,12 @@ def _apply_env_overrides(config: dict[str, Any]) -> dict[str, Any]:
     result = dict(config)
     for env_key, env_value in os.environ.items():
         if not env_key.startswith(_ENV_VAR_PREFIX):
+            continue
+        # Compose interpolates an unset `${VAR:-}` to an empty string rather than leaving
+        # the variable out, so an empty value means "not configured", not "the empty
+        # string". Without this an optional field like simulation.anchor_real would
+        # receive "" and fail validation whenever the stack runs without an anchor.
+        if env_value == "":
             continue
         path = [segment.lower() for segment in env_key[len(_ENV_VAR_PREFIX) :].split("__")]
         if not path or not path[0]:
