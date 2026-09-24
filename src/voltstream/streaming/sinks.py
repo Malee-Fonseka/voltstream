@@ -105,10 +105,16 @@ def write_rejected(df: DataFrame, stage: str) -> int:
     """
     config = get_config()
 
+    # trace_id is nulled rather than assumed when the caller pruned it away. The column
+    # is nullable in rejected_records precisely because not every reader carries it, and
+    # a sink shared by two layers must not fail on the one that reads fewer columns.
+    trace_col = (
+        F.col("trace_id").cast("string") if "trace_id" in df.columns else F.lit(None).cast("string")
+    )
     prepared = df.select(
         F.lit(stage).alias("stage"),
         F.col("reason"),
-        F.col("trace_id").cast("string").alias("trace_id"),
+        trace_col.alias("trace_id"),
         F.col("payload").alias("raw_payload"),
     )
 

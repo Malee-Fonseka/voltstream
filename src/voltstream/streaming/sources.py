@@ -199,9 +199,20 @@ def split_valid_invalid(
     labelled = df.withColumn("reason", reason)
 
     valid_df = labelled.filter(F.col("reason").isNull()).drop("reason")
+
+    # The payload captures the contract columns **this caller actually read**, not every
+    # column the contract defines. The speed layer reads the whole event; the batch job
+    # prunes to the six columns billing needs (T111), so naming all eleven here fails to
+    # resolve against its DataFrame. Intersecting keeps one validation path usable from
+    # both layers, which is the point of sharing it.
+    #
+    # The consequence is honest and worth knowing: a batch-stage rejection stores a
+    # narrower payload than a speed-stage one. The raw event is still in the master
+    # dataset either way, so nothing is unrecoverable — `rejected_records` is the index,
+    # not the archive.
+    present = [f.name for f in METER_READING_SCHEMA.fields if f.name in df.columns]
     invalid_df = labelled.filter(F.col("reason").isNotNull()).withColumn(
-        "payload",
-        F.to_json(F.struct(*[f.name for f in METER_READING_SCHEMA.fields])),
+        "payload", F.to_json(F.struct(*present))
     )
 
     return valid_df, invalid_df

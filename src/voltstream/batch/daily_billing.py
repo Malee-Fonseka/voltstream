@@ -63,6 +63,12 @@ _BILLING_COLUMNS = (
     "event_ts",
     "consumption_kwh",
     "solar_generation_kwh",
+    # Not used by the arithmetic, but carried: a record this job rejects is written to
+    # rejected_records, and without trace_id that row cannot be joined back to the
+    # producer's log lines or to the speed layer's view of the same reading (§10.3). One
+    # short string per row is a cheap price for keeping the correlation story true of the
+    # batch path as well as the streaming one.
+    "trace_id",
 )
 
 # The tariff contract (T031), declared rather than inferred. inferSchema would read the

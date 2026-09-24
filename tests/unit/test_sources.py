@@ -107,3 +107,51 @@ def test_rules_are_evaluated_in_validate_order(spark) -> None:  # type: ignore[n
         configured_zones=_ZONES,
     )
     assert invalid_df.collect()[0]["reason"] == "null_field"
+
+
+def test_split_works_on_a_pruned_frame(spark) -> None:  # type: ignore[no-untyped-def]
+    """The batch job reads six columns, not eleven, and must still be able to split.
+
+    Regression test. The payload was built by naming every field in the contract, which
+    fails to resolve against a frame that pruned columns for performance (T111) — the
+    billing job died with UNRESOLVED_COLUMN on `schema_version`. Sharing one validation
+    path between the layers only works if it adapts to what each of them read.
+    """
+    pruned_fields = [
+        f
+        for f in METER_READING_SCHEMA.fields
+        if f.name
+        in {
+            "meter_id",
+            "household_id",
+            "grid_zone",
+            "event_ts",
+            "consumption_kwh",
+            "solar_generation_kwh",
+        }
+    ]
+    from pyspark.sql.types import StructType
+
+    schema = StructType(pruned_fields)
+    df = spark.createDataFrame(
+        [
+            ("MTR-1", "HH-0001", "ZONE-A", _IN_RANGE, Decimal("1.0000"), Decimal("0.0000")),
+            ("MTR-2", "HH-9999", "ZONE-A", _IN_RANGE, Decimal("1.0000"), Decimal("0.0000")),
+        ],
+        schema=schema,
+    )
+
+    valid_df, invalid_df = split_valid_invalid(
+        df,
+        known_household_ids=_KNOWN_HOUSEHOLDS,
+        event_ts_bounds=(_TS_LOW, _TS_HIGH),
+        configured_zones=_ZONES,
+    )
+
+    assert valid_df.count() == 1
+    rejected = invalid_df.collect()
+    assert len(rejected) == 1
+    assert rejected[0]["reason"] == "unknown_household"
+    # The payload holds what was read, and says so rather than failing.
+    assert "meter_id" in rejected[0]["payload"]
+    assert "schema_version" not in rejected[0]["payload"]
