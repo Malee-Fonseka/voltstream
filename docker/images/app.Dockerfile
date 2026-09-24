@@ -33,6 +33,12 @@ RUN groupadd --system voltstream && useradd --system --gid voltstream --create-h
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
 
+# The dashboard is a single static file served by the API (T135). Copied rather than
+# mounted so the image is self-contained: `docker run voltstream-app` serves the page
+# without needing the repository on the host.
+COPY dashboard/ /app/dashboard/
+COPY config/ /app/config/
+
 WORKDIR /app
 USER voltstream
 

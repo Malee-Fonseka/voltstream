@@ -15,10 +15,13 @@ processes with no HTTP server of their own.
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Response
+from fastapi.staticfiles import StaticFiles
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from voltstream import __version__
@@ -59,6 +62,19 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         log.info("api stopped", extra={"stage": "api"})
 
 
+def _dashboard_dir() -> Path | None:
+    """Locate `dashboard/`, in the image or in a source checkout.
+
+    Two candidates because the API runs both ways: `/app/dashboard` inside the container,
+    and the repository directory when someone runs `voltstream-api` locally.
+    """
+    candidates = [
+        Path(os.environ.get("VOLTSTREAM_DASHBOARD_DIR", "/app/dashboard")),
+        Path(__file__).resolve().parents[3] / "dashboard",
+    ]
+    return next((c for c in candidates if (c / "index.html").is_file()), None)
+
+
 def create_app() -> FastAPI:
     app = FastAPI(
         title="voltstream serving API",
@@ -97,6 +113,20 @@ def create_app() -> FastAPI:
     @app.get("/metrics", include_in_schema=False)
     def metrics() -> Response:
         return Response(generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
+
+    # The dashboard is served from this same app (T135) so it shares an origin with the
+    # API. A separate static server would mean cross-origin requests, and CORS is exactly
+    # the sort of thing that goes wrong in front of an audience.
+    #
+    # Mounted last, at "/", because a mount at the root matches everything — registering
+    # it before the routers would shadow /api, /docs and /metrics.
+    dashboard = _dashboard_dir()
+    if dashboard is not None:
+        app.mount("/", StaticFiles(directory=str(dashboard), html=True), name="dashboard")
+    else:
+        # Not fatal. The API is useful without the dashboard, and the image that serves
+        # the API in a headless test has no reason to carry a static page.
+        log.warning("dashboard directory not found; API served without it", extra={"stage": "api"})
 
     return app
 
