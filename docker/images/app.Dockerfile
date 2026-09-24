@@ -19,7 +19,7 @@ ENV PATH="/opt/venv/bin:${PATH}"
 # the whole dependency tree. Same reasoning as spark.Dockerfile, where it matters far more.
 COPY pyproject.toml README.md ./
 RUN mkdir -p src/voltstream \
-    && touch src/voltstream/__init__.py \
+    && printf "__version__ = \"0.0.0\"\n" > src/voltstream/__init__.py \
     && pip install --no-cache-dir ".[api,sim]" \
     && pip uninstall -y voltstream
 

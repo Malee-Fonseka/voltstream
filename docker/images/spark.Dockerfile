@@ -33,8 +33,11 @@ ENV PATH="/opt/venv/bin:${PATH}"
 # scratch. Installing the dependencies from pyproject.toml alone keeps that layer cached
 # across source changes, and only the (fast) package install below re-runs.
 COPY pyproject.toml README.md ./
+# The stub carries a __version__ line because [tool.hatch.version] reads it out of this
+# file by regex; an empty placeholder fails metadata generation before pip resolves
+# anything. The real file replaces it with the next COPY.
 RUN mkdir -p src/voltstream \
-    && touch src/voltstream/__init__.py \
+    && printf "__version__ = \"0.0.0\"\n" > src/voltstream/__init__.py \
     && pip install --no-cache-dir ".[spark]" \
     && pip uninstall -y voltstream
 
