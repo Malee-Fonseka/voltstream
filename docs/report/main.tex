@@ -351,7 +351,8 @@ position than defending Lambda unconditionally.
 \figph{Figure 1 --- Lambda architecture: sources, Kafka and landing zone, speed and
 batch layers, master dataset, serving store, merge API}{5.5cm}
 \caption{End-to-end architecture. The speed path (process then store) and the batch
-path (store then process) consume the same topic through independent consumer groups.}
+path (store then process) consume the same topic independently, each tracking its own
+offsets.}
 \label{fig:lambda}
 \end{figure}
 
@@ -471,9 +472,19 @@ consumers track their own offsets. Three capabilities follow, all load-bearing h
 \textbf{Replay}---a speed-layer defect is corrected by resetting the offset and
 reprocessing. \textbf{Decoupling}---the producer is indifferent to consumer
 availability, so Kafka absorbs bursts and outages. \textbf{Independent multi-consumer
-reads}---the speed layer and raw archiver read the same topic in separate consumer
-groups with separate offsets, which is what makes the two-branch Lambda shape possible
-from a single source.
+reads}---the speed layer and raw archiver read the same topic with entirely separate
+offsets, which is what makes the two-branch Lambda shape possible from a single source.
+
+\paragraph{Where those offsets actually live.} Not in Kafka. Spark Structured Streaming
+\emph{assigns} partitions directly rather than subscribing as a consumer group, and
+commits its offsets to its own checkpoint. A consequence worth stating plainly, because
+it contradicts the usual description of Kafka fan-out: \texttt{kafka-consumer-groups
+-{}-list} shows nothing for either branch, and setting \texttt{kafka.group.id} does not
+change that---it labels the client without registering a group. We verified this
+directly. The independence is real and was measured; it is simply visible in the
+checkpoints rather than in Kafka's group metadata. During the restart test the archiver
+had committed 73 micro-batches while the speed layer's queries sat at 8--9, each
+advancing at its own rate on its own volume, and killing one left the other untouched.
 
 Three partitions are configured, bounding consumer parallelism. Default retention of
 approximately seven days is the mechanical fact underlying Section~\ref{sec:arch}.
@@ -675,7 +686,7 @@ The \textbf{raw archiver} consumes from Kafka and writes Parquet to the master d
 with \emph{no transformation whatsoever}, partitioned by simulated date and hour, with
 checkpointing for exactly-once file commits across restarts.
 
-The \textbf{speed layer} consumes the same topic in a separate consumer group,
+The \textbf{speed layer} consumes the same topic independently of the archiver,
 validates records, assigns each to a 15-simulated-minute event-time tumbling window
 under a \textbf{30-simulated-minute} watermark, aggregates by zone, and upserts into
 PostgreSQL through \texttt{foreachBatch} at a 10-real-second trigger interval. Writes
