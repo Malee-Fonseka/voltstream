@@ -71,8 +71,14 @@ def landing_tariff_path(sim_date: date) -> str:
 
 
 def archive_tariff_path(sim_date: date) -> str:
-    """Where a processed tariff file is moved once the batch job has consumed it."""
-    return f"s3a://{get_config().minio.bucket_archive}/{landing_tariff_key(sim_date)}"
+    """Where a consumed tariff file is archived, per §6.3.
+
+    Partitioned Parquet (`tariff/sim_date=…/`) rather than the CSV it came from. The
+    landing zone gets cleaned up; this is what a restatement months later reads, so it
+    wants the same typed, columnar format as the master dataset rather than text whose
+    types have to be re-inferred — which is exactly how a Decimal rate becomes a float.
+    """
+    return f"s3a://{get_config().minio.bucket_archive}/{_TARIFF_PREFIX}/sim_date={sim_date.isoformat()}"
 
 
 # --------------------------------------------------------------------------------------
