@@ -594,11 +594,11 @@ reviewable.
 
 \subsection{Deployment Topology}
 
-% VERIFY BEFORE SUBMISSION: container count. docker-compose.yml defines 9 services as of
-% Phase 6 (kafka, postgres, minio, the three -init jobs, meter-producer,
-% reference-dropper, raw-archiver). Phases 7-12 add the speed layer, Airflow, the API,
-% Prometheus, Grafana and Alertmanager. Recount and update "Eleven" once Phase 12 lands.
-Eleven containers are arranged in four dependency tiers under Docker Compose with
+% VERIFY BEFORE SUBMISSION: docker-compose.yml defines 13 services as of Phase 10 --
+% kafka, postgres, minio, the three -init jobs, meter-producer, reference-dropper,
+% raw-archiver, speed-layer, api, docker-socket-proxy, airflow. Phase 12 adds Prometheus,
+% Alertmanager and Grafana. Recount once Phase 12 lands.
+Thirteen containers are arranged in four dependency tiers under Docker Compose with
 health-condition dependencies. The tier-2 bootstrap containers execute once and exit;
 without them, tier-3 services start correctly but fail on first write.
 
@@ -683,8 +683,18 @@ reason, giving the alert rules genuine conditions to detect.
 \subsection{Processing}
 
 The \textbf{raw archiver} consumes from Kafka and writes Parquet to the master dataset
-with \emph{no transformation whatsoever}, partitioned by simulated date and hour, with
-checkpointing for exactly-once file commits across restarts.
+with \emph{no transformation whatsoever}, partitioned by simulated date and hour,
+checkpointing its Kafka offsets so it resumes where it stopped.
+
+\paragraph{The guarantee is no loss, not exactly-once.} Kafka delivers at least once,
+and a Spark file sink commits its data files and its offsets in two separate steps; a
+kill between them leaves committed files whose offsets were never recorded, so the
+restarted query re-reads that range. We measured this rather than assuming it: killing
+the archiver with 	exttt{SIGKILL} mid-run and restarting it produced 	extbf{334
+duplicate rows out of 14{,}012}, with no lost 	exttt{event\_id} and no gap in the
+Kafka offsets on any partition. Duplicates are removed downstream by the batch layer's
+deduplication on $(\mathit{meter\_id}, \mathit{event\_ts})$, which is why that key
+exists. Claiming exactly-once here would be an overclaim the file sink does not support.
 
 The \textbf{speed layer} consumes the same topic independently of the archiver,
 validates records, assigns each to a 15-simulated-minute event-time tumbling window
@@ -1112,7 +1122,7 @@ which is evaluated per meter per tick.}
 \textbf{Fault} & \textbf{Rate} & \textbf{Exercises} \\
 \midrule
 Duplicate event & 2.0\,\% & Deduplication on $(\mathit{meter\_id}, \mathit{event\_ts})$ \\
-Out-of-order event & 3.0\,\% & Watermark; shift is uniform over 1--30 simulated minutes, bounded by the watermark so reordering is always absorbed \\
+Out-of-order event & 3.0\,\% & Watermark; shift is uniform over 1--30 simulated minutes. Measured: \emph{not} fully absorbed --- see below \\
 Null required field & 1.0\,\% & Validation; dead-letter routing \\
 Negative kWh value & 0.5\,\% & Validation; dead-letter routing \\
 Unknown household & 0.5\,\% & Referential check against the seeded dimension \\
@@ -1121,12 +1131,33 @@ Meter dropout & 0.2\,\% per tick & Store-and-forward: 30 real seconds of bufferi
 \end{tabularx}
 \end{table}
 
-The two lateness mechanisms are deliberately separated. Out-of-order events model
-network reordering and are bounded by the watermark, so they are always absorbed.
-Dropouts model a communications outage and flush a backlog far beyond the watermark, so
-the speed layer misses them while the batch layer, rescanning a closed day, does not.
-That gap is the source of the speed-versus-batch divergence the reconciliation metric
-measures, and it is injected on purpose rather than hoped for.
+The two lateness mechanisms are deliberately separated so the divergence is
+attributable. Out-of-order events model network reordering; dropouts model a
+communications outage, buffering readings and flushing them 10--144 simulated minutes
+late. Both are injected on purpose --- without them there would be nothing for the merge
+function to correct.
+
+\paragraph{What the watermark actually absorbs.} The design predicted that reordering,
+being bounded by the watermark ($L \le W$), would be absorbed entirely, leaving dropped
+backfill as the sole cause of divergence. 	extbf{Measurement refuted this.} Over one
+complete simulated day on an idle host, the 15-minute operational view was short by
+	extbf{0.9996\,\%} with dropouts \emph{disabled} and 	extbf{1.1624\,\%} with them
+enabled --- so roughly 1.0 point of the gap is reordering and only about 0.16 is dropped
+backfill, the reverse of the assumption.
+
+The cause is one this design had already identified and then contradicted itself about:
+the trigger interval is 48 simulated minutes and the watermark is 30, and a watermark
+shorter than one trigger is decorative. Raising the watermark above one trigger would
+restore the intended behaviour; it is recorded as a production-scale recommendation
+rather than applied, because the measured finding demonstrates the time-compression
+limitation (Section~
+ef{sec:simclock}) more usefully than a tuned number would.
+
+Two consequences are worth stating. The real-time view is measurably incomplete, which is
+the speed layer trading completeness for latency as intended. The \emph{daily} totals are
+not: a one-day window tolerates lateness far beyond anything the fault model injects, and
+measured 	extbf{0.00\,\%} missing in every run. The speed-versus-batch divergence
+\emph{on bills} is therefore the stale tariff alone.
 
 \phantomsection
 \addcontentsline{toc}{section}{Appendix B: Statement of Individual Contributions}
