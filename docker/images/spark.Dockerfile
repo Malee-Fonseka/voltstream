@@ -27,9 +27,24 @@ WORKDIR /build
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
 
+# Dependencies first, source second. pyspark is a ~317 MB wheel and installing it takes
+# the better part of an hour on a slow link; copying src/ before this step put every
+# source edit ahead of that layer, so changing one line of Python rebuilt PySpark from
+# scratch. Installing the dependencies from pyproject.toml alone keeps that layer cached
+# across source changes, and only the (fast) package install below re-runs.
 COPY pyproject.toml README.md ./
+# The stub carries a __version__ line because [tool.hatch.version] reads it out of this
+# file by regex; an empty placeholder fails metadata generation before pip resolves
+# anything. The real file replaces it with the next COPY.
+RUN mkdir -p src/voltstream \
+    && printf "__version__ = \"0.0.0\"\n" > src/voltstream/__init__.py \
+    && pip install --no-cache-dir ".[spark]" \
+    && pip uninstall -y voltstream
+
 COPY src/ ./src/
-RUN pip install --no-cache-dir ".[spark]"
+# --no-deps: everything above is already installed and pinned; without it pip re-resolves
+# the whole tree and can silently pull a different pyspark than the JARs below match.
+RUN pip install --no-cache-dir --no-deps ".[spark]"
 
 # ---------------------------------------------------------------------------
 # Stage: jars — fetch the connector JARs pyspark does not bundle
@@ -80,6 +95,22 @@ ENV PATH="/opt/venv/bin:${PATH}" \
 # voltstream user cannot mkdir inside it.
 RUN mkdir -p /var/lib/voltstream/checkpoints \
     && chown -R voltstream:voltstream /var/lib/voltstream
+
+# Versioned configuration, baked in. The long-running services mount ../config over this
+# so it can be edited without a rebuild, but a container launched by DockerOperator gets
+# no mounts — the DAG starts it through the socket proxy, which has no access to the
+# repository on the host. Without a copy in the image the batch jobs cannot find
+# base.yaml at all.
+#
+# Safe to bake because this file holds structure and defaults only: every secret comes
+# from the environment (T018), and the package itself is already baked from the same
+# commit, so the two cannot drift apart.
+COPY config/ /app/config/
+
+# Operational scripts that are not part of the importable package but do run inside this
+# image — the report generator is launched as a DAG task. Kept out of src/voltstream on
+# purpose: they are entry points for the orchestrator, not library code anything imports.
+COPY scripts/ /app/scripts/
 
 WORKDIR /app
 USER voltstream

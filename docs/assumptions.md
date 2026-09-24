@@ -61,19 +61,89 @@ failure. With every rate set to zero, output equals input exactly — asserted a
 | Fault | Rate | Exercises |
 |---|---|---|
 | Duplicate event | 2.0 % | dedup on `(meter_id, event_ts)` |
-| Out-of-order event | 3.0 % | watermark; shift uniform over 1–30 simulated minutes |
+| Out-of-order event | 3.0 % | watermark; shift uniform over 1–30 simulated minutes. Measured: *not* fully absorbed — see below |
 | Null required field | 1.0 % | validation → `null_field` |
 | Negative kWh | 0.5 % | validation → `negative_kwh` |
 | Unknown household | 0.5 % | validation → `unknown_household` |
 | Meter dropout | 0.2 % per meter per tick | store-and-forward, 30 real s buffer |
 
 **The two lateness mechanisms are deliberately separated** (D3). Out-of-order events model
-network reordering and are bounded by the watermark, so they are *always* absorbed.
+network reordering and are bounded by the watermark, so D3 expects them to be *always*
+absorbed — **a claim the measurement below refutes.**
 Dropouts model a communications outage and flush a backlog far beyond the watermark, so
-the speed layer misses them while the batch layer, rescanning a closed day, does not. That
-gap is the source of the speed-versus-batch divergence the reconciliation metric measures.
-It is injected on purpose; without it the divergence would be zero and the merge function
-would demonstrate nothing.
+the speed layer misses some of them while the batch layer, rescanning a closed day, does
+not. It is injected on purpose; without it there would be nothing for the merge function
+to correct.
+
+### Where the dropped energy actually goes — measured
+
+Whether a late reading is dropped depends on the size of the window it belongs to. A
+window stops accepting data at roughly `watermark + trigger + tick + window`:
+
+| Aggregation | Window | Lateness certainly dropped beyond |
+|---|---|---|
+| Zone metrics | 15 sim min | **102.6 sim min** |
+| Household running total | 1 sim day | **1527.6 sim min** |
+
+A dropout buffers for 30 real seconds and flushes readings **10–144 simulated minutes**
+late. That straddles the 15-minute threshold and is nowhere near the daily one, so the
+consequence is asymmetric — measured over one complete simulated day:
+
+| View | kWh | Gap vs archived |
+|---|---|---|
+| Archived, after the same validation | 508.5150 | — |
+| Household daily totals | 508.5150 | **0.0000 %** |
+| 15-minute zone windows | 506.6273 | **0.3712 %** |
+
+### The control, and what it overturned
+
+Disabling dropouts should take the 15-minute gap to zero: reordering is bounded by the
+watermark (`L <= W`), so D3 states it is "always absorbed, by construction". It is not.
+
+| Host | Dropouts | 15-min gap | Daily gap |
+|---|---|---|---|
+| Loaded | on | 0.3712 % | 0.0000 % |
+| Loaded | **off** | 0.5635 % | — |
+| Idle | on | 1.1624 % | 0.0000 % |
+| Idle | **off** | **0.9996 %** | 0.0162 % |
+
+The first control failure was provisionally blamed on host saturation — a probe waited
+fifteen minutes for CPU during that run, and a starved driver spans more event time per
+micro-batch, which advances the watermark in leaps. **Re-running on an idle host refuted
+that**: the gap went *up*, to 0.9996 %.
+
+So the finding is real and reproducible. **Reordering within the watermark is dropped.**
+Of the 1.16 % missing with dropouts enabled, roughly 1.0 point is reordering and only
+about 0.16 is dropout backfill — the reverse of the assumed attribution.
+
+The mechanism is the one D3 identifies and then contradicts itself about: the trigger
+interval is 48 simulated minutes and the watermark is 30, and *"a watermark smaller than
+one trigger is decorative"*. Both statements are in D3; only one survives measurement.
+
+**Consequences.** D3's regime table needs correcting — network reordering is not fully
+absorbed. Any attribution of the speed-versus-batch divergence to "dropped backfill,
+nothing else" is wrong as written. Raising the watermark above one trigger (60 simulated
+minutes rather than 30) is the change D3's own analysis implies if the stated intent is
+to be met; that has not been done, because it revises a pinned decision.
+
+What is *not* affected: the daily totals, which stay complete in every run.
+
+**Two consequences worth stating plainly.** The real-time *operational* view is
+measurably incomplete — about 1 % of the day's energy on an idle host — which is the
+speed layer doing its job, trading completeness for latency. The *provisional bill* is
+not incomplete at all: nothing the fault model injects arrives late enough to miss the
+day it belongs to. So the speed-versus-batch divergence on bills comes from the **stale
+tariff**, not from lost readings, and the reconciliation metric should be read
+accordingly.
+
+**Figures to quote.** The 15-minute gap is **1.16 %** with the default fault
+configuration, measured on an idle host over one complete simulated day; the daily gap is
+**0.00 %**. The loaded-host figures (0.37 % / 0.56 %) are recorded above only to document
+how the control was chased down, and should not be quoted as results — they were taken
+while four Spark drivers competed for one machine.
+
+D3's sizing model put the drop near 1.7 %, attributed entirely to dropout backfill. The
+measured total is 1.16 %, and the attribution is wrong: most of it is reordering.
 
 ---
 
@@ -171,3 +241,39 @@ PostgreSQL is appropriate at our volume and would remain so to roughly the low m
 aggregate rows per day. Beyond that the serving layer should migrate to a time-series or
 columnar analytical store (TimescaleDB, ClickHouse, Cassandra). Selecting PostgreSQL
 reflects actual data volume rather than aspirational scale.
+
+---
+
+## 7. Gate evidence
+
+Recorded as each gate passed, so the report's results chapter quotes measurements rather
+than reconstructing them later.
+
+### Gate 2 — archiver restart (Phase 6)
+
+SIGKILL, 20 s outage, restart:
+
+| Metric | Value |
+|---|---|
+| Rows before kill | 10,661 |
+| Rows after recovery | 14,012 |
+| Distinct `event_id` | 13,678 |
+| Duplicate rows | 334 |
+| Kafka partitions with contiguous offsets | 3 / 3 |
+
+No loss and no offset gap. The 334 duplicates are expected under at-least-once delivery
+and are removed downstream by the batch dedup on `(meter_id, event_ts)` — see §4.
+
+### Gate 3 — speed path complete (Phase 7)
+
+| Criterion | Evidence |
+|---|---|
+| Pure-vs-Spark consistency test green | `tests/consistency/test_pure_vs_spark.py` passes: 5,000 random inputs plus per-block boundary sweeps |
+| Live zone data | 40 real seconds advanced the newest window from 07:30 to 10:45 simulated (3 h 15 min, i.e. 288x); `zone_metrics_rt` grew 119 → 180 rows |
+| Rejects in both sinks, counted | 53 rows in `rejected_records` and 53 messages in `meter.readings.dlq` — exact match |
+| Reject reasons | `null_field` 27, `negative_kwh` 13, `unknown_household` 13 |
+| One identifier across both sinks | `trace_id` 389048a5… present in the Postgres row and in the DLQ message |
+| Provisional bills | 50 / 50 households, every D4 component non-null, `estimated_bill = energy + fixed − subsidy − export` on every row, `tariff_source_date = sim_date − 1` on every row |
+
+The API endpoint named in the gate does not exist until Phase 8, so the zone view was
+verified directly against PostgreSQL, which that task permits.

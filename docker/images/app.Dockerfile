@@ -15,9 +15,16 @@ WORKDIR /build
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
 
+# Dependencies first, source second, so a source edit does not re-resolve and re-download
+# the whole dependency tree. Same reasoning as spark.Dockerfile, where it matters far more.
 COPY pyproject.toml README.md ./
+RUN mkdir -p src/voltstream \
+    && printf "__version__ = \"0.0.0\"\n" > src/voltstream/__init__.py \
+    && pip install --no-cache-dir ".[api,sim]" \
+    && pip uninstall -y voltstream
+
 COPY src/ ./src/
-RUN pip install --no-cache-dir ".[api,sim]"
+RUN pip install --no-cache-dir --no-deps ".[api,sim]"
 
 FROM python:3.11-slim-bookworm
 
@@ -25,6 +32,12 @@ RUN groupadd --system voltstream && useradd --system --gid voltstream --create-h
 
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
+
+# The dashboard is a single static file served by the API (T135). Copied rather than
+# mounted so the image is self-contained: `docker run voltstream-app` serves the page
+# without needing the repository on the host.
+COPY dashboard/ /app/dashboard/
+COPY config/ /app/config/
 
 WORKDIR /app
 USER voltstream

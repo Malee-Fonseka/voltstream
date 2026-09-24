@@ -49,8 +49,12 @@ spark = [
 api = [
   "fastapi>=0.110,<1",
   "uvicorn[standard]>=0.29,<1",
-  "psycopg[binary]>=3.1,<4",
-  "prometheus-fastapi-instrumentator>=7,<8",
+  # `pool` only here: the API holds a long-lived pool, while the Spark driver opens a
+  # short-lived connection per micro-batch and must not share it (see storage/postgres.py).
+  "psycopg[binary,pool]>=3.1,<4",
+  # prometheus-fastapi-instrumentator was removed: incompatible with FastAPI >= 0.116, and
+  # its per-endpoint HTTP counters are not among the eight metrics S10.1 names.
+  "prometheus-client>=0.20,<1",
   "boto3>=1.34,<2",
 ]
 # App image, simulator half: Kafka producer, load/solar curves, MinIO writes.
@@ -167,7 +171,6 @@ module = [
   "pyspark.*",
   "py4j.*",
   "confluent_kafka.*",
-  "prometheus_fastapi_instrumentator.*",
   "boto3.*",
   "botocore.*",
   "hypothesis.*",

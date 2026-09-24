@@ -344,8 +344,55 @@ Two regimes of lateness, deliberately separated so the divergence is attributabl
 
 | Regime | Mechanism | Lateness | Speed-layer behaviour |
 |---|---|---|---|
-| **Network reordering** | `faults.out_of_order_rate: 0.03` — individual readings with `event_ts` shifted back by U[1, 30] sim min | ≤ W | **Always absorbed.** Demonstrates the watermark *tolerating* modest lateness correctly. |
+| **Network reordering** | `faults.out_of_order_rate: 0.03` — individual readings with `event_ts` shifted back by U[1, 30] sim min | ≤ W | ~~**Always absorbed.**~~ **Superseded — see the measurement below.** Predicted absorbed by construction; measured otherwise. |
 | **Comms outage** | `faults.dropout_probability_per_meter_tick: 0.002` — the meter goes silent for 30 real s (144 sim min), **buffers** its readings, and flushes all of them on reconnect with their original `event_ts` (store-and-forward) | 10–144 sim min | **~57 % dropped**, the rest absorbed. The batch layer sees all of them from Parquet. This is §5.4 reason 2 ("a meter was offline and backfills") made concrete. |
+
+#### Correction (measured 2026-09-24, T094)
+
+**The "always absorbed" prediction above is wrong, and the measurement supersedes it.**
+
+Disabling dropouts and leaving reordering on should take the speed layer's 15-minute gap
+to zero. Measured over a complete simulated day on an idle host, it was **0.9996 %** —
+against **1.1624 %** with dropouts also enabled. So of the energy the 15-minute view
+misses, roughly 1.0 percentage point is *reordering* and only about 0.16 is dropout
+backfill. That is the reverse of the attribution this decision assumed.
+
+An earlier run on a loaded host gave 0.5635 % and 0.3712 %, and the discrepancy was
+provisionally blamed on CPU starvation advancing the watermark in leaps. Re-running idle
+refuted that: the gap went *up*, not to zero.
+
+The cause is the one this document already identifies two sections above and then
+contradicts: **the trigger interval is 48 simulated minutes and the watermark is 30**, and
+*"a watermark smaller than one trigger is decorative"*. Both claims are in D3. Only the
+second survives measurement.
+
+**What this changes.**
+
+- The `L ≤ W` guarantee does not hold at this time compression. Reordering within the
+  watermark is dropped.
+- `T140`'s attribution — "the kWh gap is dropped backfill, nothing else" — is false as
+  written and must be stated as measured instead. **A prediction for Phase 11, so it is
+  not rediscovered there:** `T140` splits divergence into `data_effect` (backfill dropped
+  past the watermark) and `tariff_effect` (yesterday's rates vs today's), and expects
+  `data_effect` to carry D3's ~1.7 %. It will not. `reconciliation_daily` compares a
+  household's *daily* speed bill against its batch bill, and the daily window loses
+  nothing — so `data_effect` should come out at or near **zero**, with essentially all
+  divergence in `tariff_effect`. `T140`'s stated acceptance ("the `data_effect` share is
+  inside T094's band") therefore cannot pass as written, for the same structural reason
+  T094's original framing could not: the band was measured on 15-minute windows, and
+  bills are daily.
+- The daily household totals are **unaffected**: they use a 1-day window, which tolerates
+  lateness far beyond anything the fault model injects, and measured 0.00 % missing in
+  every run. The speed-versus-batch divergence *on bills* therefore remains the stale
+  tariff alone, exactly as designed.
+
+**What would fix it, and why we did not.** Raising the watermark above one trigger — 60
+simulated minutes rather than 30 — is what this decision's own analysis implies if the
+stated intent is to be met. It is recorded as a production-scale recommendation rather
+than applied: the measured finding is more useful than the tuned number, because it
+demonstrates the time-compression limitation (§3.4) with data rather than asserting it.
+
+Full figures and method: `docs/assumptions.md` §2.
 
 Pinned values:
 

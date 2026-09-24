@@ -25,7 +25,6 @@ from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql.streaming import StreamingQuery
 
-from voltstream.config import get_config
 from voltstream.logging_setup import get_logger
 from voltstream.metrics import (
     consumer_lag,
@@ -33,6 +32,7 @@ from voltstream.metrics import (
     events_consumed_total,
     start_metrics_server,
 )
+from voltstream.storage.objectstore import raw_root
 from voltstream.streaming.session import build_session, checkpoint_path
 from voltstream.streaming.sources import read_meter_stream
 
@@ -115,8 +115,7 @@ def _write_batch(batch_df: DataFrame, batch_id: int, *, output_path: str) -> Non
 
 def start(await_termination: bool = True) -> StreamingQuery:
     """Build the session, start the archiving query, and return it."""
-    config = get_config()
-    output_path = f"s3a://{config.minio.bucket_raw}/meter_readings"
+    output_path = raw_root()
 
     spark = build_session(f"voltstream-{_JOB_NAME}")
     spark.sparkContext.setLogLevel("WARN")

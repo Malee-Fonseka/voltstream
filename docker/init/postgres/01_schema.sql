@@ -140,7 +140,15 @@ CREATE TABLE IF NOT EXISTS pipeline_runs (
     rows_in BIGINT,
     rows_out BIGINT,
     started_at TIMESTAMPTZ NOT NULL,
-    finished_at TIMESTAMPTZ
+    finished_at TIMESTAMPTZ,
+    -- Airflow's dag_run_id for this execution (T122). Nullable because the job runs
+    -- standalone too, from `make backfill` or a bare spark-submit, and a run without an
+    -- orchestrator is a normal run rather than an incomplete one.
+    --
+    -- This is what makes a restatement legible after the fact: two rows for the same
+    -- sim_date, one superseded and one success, each naming the DAG run that produced it.
+    -- Without it the ledger says a day was rebuilt but not by which execution.
+    orchestrator_run_id TEXT
 );
 
 -- ============================================================================

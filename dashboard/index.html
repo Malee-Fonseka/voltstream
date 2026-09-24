@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>voltstream</title>
+<!--
+  Single file, no build step (§7.2). Plain HTML, CSS and fetch - no framework, no bundler,
+  no node_modules. A dashboard that needs a build step is a dashboard that does not open
+  on the marker's machine.
+
+  Served by FastAPI from the same origin as the API (T135), so there is no CORS to debug
+  during a demo.
+
+  The badge (T134) is the point of this page. §1.2 claims the architecture becomes a
+  user-facing feature; the badge is that claim in one screenshot, flipping from
+  "Provisional (speed)" to "Final (batch)" when the batch layer closes the day.
+-->
+<style>
+  :root {
+    --bg: #0f1419;
+    --panel: #18202a;
+    --line: #253040;
+    --text: #e6edf3;
+    --muted: #8b98a8;
+    --speed: #d97706;
+    --batch: #16a34a;
+    --accent: #3b82f6;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f8fa; --panel: #ffffff; --line: #d8dee4; --text: #1f2328; --muted: #656d76;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px 16px; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; }
+  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 4px; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .grid { display: grid; gap: 16px; grid-template-columns: 1fr; margin-top: 20px; }
+  @media (min-width: 860px) { .grid { grid-template-columns: 1.4fr 1fr; } }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px;
+  }
+  .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--muted); margin: 0 0 12px; font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 7px 8px; border-bottom: 1px solid var(--line); }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  tbody tr:last-child td { border-bottom: none; }
+  .bar { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; min-width: 60px; }
+  .bar > i { display: block; height: 100%; background: var(--accent); }
+
+  /* T134: the provisional/final badge. */
+  .badge {
+    display: inline-flex; align-items: center; gap: 8px; padding: 8px 14px;
+    border-radius: 999px; font-weight: 700; font-size: 14px; letter-spacing: 0.01em;
+    border: 2px solid transparent; transition: background .3s, border-color .3s;
+  }
+  .badge .dot { width: 9px; height: 9px; border-radius: 50%; background: currentColor; }
+  .badge.speed { background: color-mix(in srgb, var(--speed) 18%, transparent);
+    color: var(--speed); border-color: var(--speed); }
+  .badge.batch { background: color-mix(in srgb, var(--batch) 18%, transparent);
+    color: var(--batch); border-color: var(--batch); }
+  .badge.unknown { background: var(--line); color: var(--muted); }
+
+  .figure { font-size: 30px; font-weight: 700; font-variant-numeric: tabular-nums; margin: 10px 0 2px; }
+  .label { color: var(--muted); font-size: 12px; }
+  .row { display: flex; gap: 20px; flex-wrap: wrap; margin-top: 12px; }
+  input, select {
+    background: var(--bg); color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 8px; font: inherit;
+  }
+  .note { color: var(--muted); font-size: 12px; margin-top: 10px; }
+  .stale { opacity: .45; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>voltstream</h1>
+    <span class="sub">Lambda architecture &middot; smart-grid monitoring and billing</span>
+  </header>
+  <div class="sub" id="clock">connecting&hellip;</div>
+
+  <div class="grid">
+    <section class="panel">
+      <h2>Grid load by zone &mdash; speed layer</h2>
+      <table>
+        <thead>
+          <tr><th>Zone</th><th>Consumption kWh</th><th>Solar kWh</th>
+              <th>Renewable</th><th></th><th>Meters</th></tr>
+        </thead>
+        <tbody id="zones"><tr><td colspan="6" class="label">loading&hellip;</td></tr></tbody>
+      </table>
+      <div class="note">
+        15-simulated-minute windows, updated every trigger. This view is deliberately
+        approximate &mdash; it trades completeness for latency.
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Household bill &mdash; the merge function</h2>
+      <div class="row">
+        <label class="label">Household
+          <br><input id="hh" value="HH-0001" size="10">
+        </label>
+        <label class="label">Simulated date
+          <br><input id="day" type="date">
+        </label>
+      </div>
+
+      <div style="margin-top:16px">
+        <span id="badge" class="badge unknown"><span class="dot"></span><span id="badgeText">&mdash;</span></span>
+      </div>
+
+      <div class="figure" id="total">&mdash;</div>
+      <div class="label" id="tariffNote">&nbsp;</div>
+
+      <table style="margin-top:14px">
+        <tbody id="breakdown"></tbody>
+      </table>
+      <div class="note" id="mergeNote">
+        The badge is the architecture as a user-facing feature: the same URL answers from
+        the speed layer while the day is open, and from the batch layer once it closes.
+      </div>
+    </section>
+  </div>
+</div>
+
+<script>
+// Poll every 5 s (§8.3). Same origin as the API, so no CORS.
+const POLL_MS = 5000;
+const $ = (id) => document.getElementById(id);
+const fmt = (v, dp = 2) =>
+  v === null || v === undefined ? "—" : Number(v).toLocaleString(undefined,
+    { minimumFractionDigits: dp, maximumFractionDigits: dp });
+
+async function getJSON(url) {
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error(`${res.status} ${url}`);
+  return res.json();
+}
+
+async function refreshZones() {
+  try {
+    const zones = await getJSON("/api/v1/zones/load");
+    $("zones").innerHTML = zones.map((z) => {
+      const pct = Number(z.renewable_ratio) * 100;
+      return `<tr>
+        <td>${z.grid_zone}</td>
+        <td>${fmt(z.total_consumption_kwh, 4)}</td>
+        <td>${fmt(z.total_solar_kwh, 4)}</td>
+        <td>${pct.toFixed(1)}%</td>
+        <td><span class="bar"><i style="width:${Math.min(100, pct).toFixed(1)}%"></i></span></td>
+        <td>${z.active_meters}</td>
+      </tr>`;
+    }).join("");
+    const newest = zones.map((z) => z.window_end).sort().pop();
+    $("clock").textContent = `newest window ${newest ?? "—"} (simulated)`;
+    $("zones").classList.remove("stale");
+  } catch (err) {
+    // Keep the last good values on screen but mark them stale, rather than blanking the
+    // page on one failed poll — a dashboard that clears itself on a blip is worse than
+    // one that says it is out of date.
+    $("zones").classList.add("stale");
+    $("clock").textContent = `zone data unavailable (${err.message})`;
+  }
+}
+
+function paintBadge(source, provisional) {
+  const badge = $("badge");
+  const text = $("badgeText");
+  badge.classList.remove("speed", "batch", "unknown");
+  if (source === "batch") {
+    badge.classList.add("batch");
+    text.textContent = "Final (batch)";
+  } else if (source === "speed") {
+    badge.classList.add("speed");
+    text.textContent = "Provisional (speed)";
+  } else {
+    badge.classList.add("unknown");
+    text.textContent = "—";
+  }
+  badge.title = provisional === undefined ? "" :
+    provisional ? "The day is still open; this is an estimate."
+                : "The day has been closed by a successful billing run.";
+}
+
+async function refreshBill() {
+  const hh = $("hh").value.trim();
+  const day = $("day").value;
+  if (!hh || !day) return;
+  try {
+    const bill = await getJSON(
+      `/api/v1/households/${encodeURIComponent(hh)}/bill?date=${day}`);
+    paintBadge(bill.source, bill.provisional);
+    $("total").textContent = fmt(bill.total);
+    $("tariffNote").textContent =
+      bill.source === "speed"
+        ? `computed against the tariff for ${bill.tariff_date} — deliberately stale`
+        : `computed against the tariff for ${bill.tariff_date}`;
+    $("breakdown").innerHTML = [
+      ["Consumption", fmt(bill.consumption_kwh, 4) + " kWh"],
+      ["Solar", fmt(bill.solar_kwh, 4) + " kWh"],
+      ["Billable import", fmt(bill.billable_import_kwh, 4) + " kWh"],
+      ["Exported", fmt(bill.export_kwh, 4) + " kWh"],
+      ["Energy charge", fmt(bill.energy_charge)],
+      ["Fixed charge", fmt(bill.fixed_charge)],
+      ["Subsidy discount", "-" + fmt(bill.subsidy_discount)],
+      ["Export credit", "-" + fmt(bill.export_credit)],
+      ["Readings", bill.readings_count ?? "—"],
+      ["Duplicates removed", bill.duplicates_removed ?? "—"],
+    ].map(([k, v]) => `<tr><td class="label">${k}</td><td>${v}</td></tr>`).join("");
+  } catch (err) {
+    paintBadge(null, undefined);
+    $("total").textContent = "—";
+    $("tariffNote").textContent = "no bill for this household and date";
+    $("breakdown").innerHTML = "";
+  }
+}
+
+function tick() { refreshZones(); refreshBill(); }
+
+// Default the date box to the newest simulated day the speed layer has seen, so the page
+// is useful on load without the operator knowing what "today" is in simulated time.
+(async function init() {
+  try {
+    const zones = await getJSON("/api/v1/zones/load");
+    const newest = zones.map((z) => z.window_start).sort().pop();
+    if (newest) $("day").value = newest.slice(0, 10);
+  } catch { /* leave the field empty; the user can pick a date */ }
+  tick();
+  setInterval(tick, POLL_MS);
+  $("hh").addEventListener("change", refreshBill);
+  $("day").addEventListener("change", refreshBill);
+})();
+</script>
+</body>
+</html>

@@ -72,11 +72,20 @@ def read_meter_stream(spark: SparkSession, *, starting_offsets: str = "earliest"
     """Read `meter.readings` as a stream, parsed against the frozen contract.
 
     `starting_offsets` applies only on the very first run of a query; afterwards the
-    checkpoint's committed offsets win, which is exactly the behaviour Gate 2 tests.
+    checkpoint's committed offsets win, which is exactly the behaviour the restart test
+    exercises.
+
+    The Kafka consumer group is deliberately left to Spark, which generates a unique one
+    per query. Setting `kafka.group.id` looked attractive for making the two branches
+    visible to `kafka-consumer-groups`, but it does nothing of the sort: this source
+    *assigns* partitions directly rather than subscribing, so no group is ever registered
+    with the coordinator and `--describe` reports it does not exist. Spark also warns that
+    a shared group id makes concurrent queries interfere. Branch independence is real, and
+    it is visible where it actually lives — each query's own checkpoint (§5.2).
     """
     config = get_config()
 
-    raw = (
+    reader = (
         spark.readStream.format("kafka")
         .option("kafka.bootstrap.servers", config.kafka.bootstrap_servers)
         .option("subscribe", config.kafka.topic)
@@ -85,17 +94,20 @@ def read_meter_stream(spark: SparkSession, *, starting_offsets: str = "earliest"
         .option("includeHeaders", "true")
         # A lost offset must be loud, not silently skipped to the newest record.
         .option("failOnDataLoss", "true")
-        .load()
     )
 
-    return raw.select(
-        F.from_json(F.col("value").cast("string"), METER_READING_SCHEMA).alias("r"),
-        F.col("key").cast("string").alias("kafka_key"),
-        F.col("timestamp").alias("kafka_timestamp"),
-        F.col("partition").alias("kafka_partition"),
-        F.col("offset").alias("kafka_offset"),
-        F.col("headers").alias("kafka_headers"),
-    ).select("r.*", *_KAFKA_METADATA_COLUMNS, "kafka_headers")
+    return (
+        reader.load()
+        .select(
+            F.from_json(F.col("value").cast("string"), METER_READING_SCHEMA).alias("r"),
+            F.col("key").cast("string").alias("kafka_key"),
+            F.col("timestamp").alias("kafka_timestamp"),
+            F.col("partition").alias("kafka_partition"),
+            F.col("offset").alias("kafka_offset"),
+            F.col("headers").alias("kafka_headers"),
+        )
+        .select("r.*", *_KAFKA_METADATA_COLUMNS, "kafka_headers")
+    )
 
 
 def trace_id_from_headers(headers_col: str = "kafka_headers") -> Column:
@@ -187,9 +199,20 @@ def split_valid_invalid(
     labelled = df.withColumn("reason", reason)
 
     valid_df = labelled.filter(F.col("reason").isNull()).drop("reason")
+
+    # The payload captures the contract columns **this caller actually read**, not every
+    # column the contract defines. The speed layer reads the whole event; the batch job
+    # prunes to the six columns billing needs (T111), so naming all eleven here fails to
+    # resolve against its DataFrame. Intersecting keeps one validation path usable from
+    # both layers, which is the point of sharing it.
+    #
+    # The consequence is honest and worth knowing: a batch-stage rejection stores a
+    # narrower payload than a speed-stage one. The raw event is still in the master
+    # dataset either way, so nothing is unrecoverable — `rejected_records` is the index,
+    # not the archive.
+    present = [f.name for f in METER_READING_SCHEMA.fields if f.name in df.columns]
     invalid_df = labelled.filter(F.col("reason").isNotNull()).withColumn(
-        "payload",
-        F.to_json(F.struct(*[f.name for f in METER_READING_SCHEMA.fields])),
+        "payload", F.to_json(F.struct(*present))
     )
 
     return valid_df, invalid_df

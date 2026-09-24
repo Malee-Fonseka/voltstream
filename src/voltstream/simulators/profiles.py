@@ -32,7 +32,18 @@ _LOAD_MORNING_WEIGHT = 0.5
 _LOAD_EVENING_WEIGHT = 0.7
 _LOAD_NOISE_STDDEV = 0.08
 
-_SOLAR_PEAK_CAPACITY_KWH = Decimal("2.00")
+# Peak generation for one tick, i.e. one 9.6-simulated-minute interval — so this is an
+# energy figure, not a power rating. 0.30 kWh per tick is roughly a 1.9 kW array, a
+# plausible domestic rooftop.
+#
+# Calibrated rather than guessed. At the original 2.00 a solar household generated about
+# 450 % of its own daily consumption: every zone's daily renewable ratio pinned at 100 %,
+# a third of households billed a negative total from export credits alone, and the
+# headline metric the use case asks about — renewable contribution by zone — carried no
+# information at all. 0.30 puts a solar household at roughly two-thirds of its own use,
+# which leaves it exporting at midday and importing at dusk, and puts the zone daily
+# ratio near 20 % with 32 % of households on solar.
+_SOLAR_PEAK_CAPACITY_KWH = Decimal("0.30")
 _SOLAR_SUNRISE_HOUR = 6.0
 _SOLAR_SUNSET_HOUR = 18.0
 _SOLAR_NOISE_STDDEV = 0.05
