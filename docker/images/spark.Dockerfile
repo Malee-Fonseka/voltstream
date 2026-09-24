@@ -96,6 +96,17 @@ ENV PATH="/opt/venv/bin:${PATH}" \
 RUN mkdir -p /var/lib/voltstream/checkpoints \
     && chown -R voltstream:voltstream /var/lib/voltstream
 
+# Versioned configuration, baked in. The long-running services mount ../config over this
+# so it can be edited without a rebuild, but a container launched by DockerOperator gets
+# no mounts — the DAG starts it through the socket proxy, which has no access to the
+# repository on the host. Without a copy in the image the batch jobs cannot find
+# base.yaml at all.
+#
+# Safe to bake because this file holds structure and defaults only: every secret comes
+# from the environment (T018), and the package itself is already baked from the same
+# commit, so the two cannot drift apart.
+COPY config/ /app/config/
+
 WORKDIR /app
 USER voltstream
 
