@@ -339,6 +339,86 @@ services:
       postgres-init:
         condition: service_completed_successfully
 
+  # ============================================================================
+  # Tier 4 — orchestration (T120, D6)
+  # ============================================================================
+  # The Docker socket is mounted into the proxy and NOWHERE else. Handing
+  # /var/run/docker.sock to Airflow would give any DAG — or anything that can write a DAG
+  # file — full control of the host daemon, which is root-equivalent. The proxy exposes
+  # only the four capabilities DockerOperator needs and refuses the rest, so the blast
+  # radius of a compromised DAG is "can run containers", not "owns the machine".
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.1.1
+    container_name: voltstream-docker-socket-proxy
+    restart: unless-stopped
+    environment:
+      CONTAINERS: 1
+      IMAGES: 1
+      NETWORKS: 1
+      POST: 1
+      # Everything else stays off. EXEC and VOLUMES in particular are container-escape
+      # primitives, and nothing here needs them.
+      EXEC: 0
+      VOLUMES: 0
+      INFO: 0
+      SERVICES: 0
+      TASKS: 0
+      SECRETS: 0
+      SWARM: 0
+      SYSTEM: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [voltstream]
+
+  airflow:
+    build:
+      context: ..
+      dockerfile: docker/images/airflow.Dockerfile
+    image: voltstream-airflow:${VOLTSTREAM_IMAGE_TAG:-local}
+    container_name: voltstream-airflow
+    restart: unless-stopped
+    # One container, LocalExecutor (D6). A full scheduler/webserver/worker/triggerer split
+    # buys nothing at one DAG run per simulated day and costs four containers of memory on
+    # a laptop that is already running Kafka, Spark and Postgres.
+    command: ["standalone"]
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
+        postgresql+psycopg2://${POSTGRES_USER:-voltstream}:${POSTGRES_PASSWORD:-voltstream}@postgres:5432/airflow
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:-}
+      AIRFLOW_UID: ${AIRFLOW_UID:-50000}
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-airflow}
+      # Connections as environment variables, so a fresh clone needs no UI clicking and
+      # the configuration is in version control rather than in someone's browser session.
+      AIRFLOW_CONN_MINIO_S3: >-
+        aws://${MINIO_ROOT_USER:-voltstream}:${MINIO_ROOT_PASSWORD:-voltstream-dev}@/?endpoint_url=http%3A%2F%2Fminio%3A9000&region_name=us-east-1
+      AIRFLOW_CONN_VOLTSTREAM_PG: >-
+        postgresql://${POSTGRES_USER:-voltstream}:${POSTGRES_PASSWORD:-voltstream}@postgres:5432/${POSTGRES_DB:-voltstream}
+      # Passed to the Spark container the DAG launches.
+      VOLTSTREAM_SPARK_IMAGE: voltstream-spark:${VOLTSTREAM_IMAGE_TAG:-local}
+      VOLTSTREAM_NETWORK: voltstream
+      VOLTSTREAM_ANCHOR_REAL: ${VOLTSTREAM_ANCHOR_REAL:-}
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
+    ports:
+      - "${AIRFLOW_HOST_PORT:-8080}:8080"
+    volumes:
+      - ../airflow/dags:/opt/airflow/dags
+      - ../airflow/plugins:/opt/airflow/plugins
+      # The DAGs' three tunables come from here via yaml.safe_load — configuration, not a
+      # code dependency on the voltstream package (which this image deliberately lacks).
+      - ../config:/opt/airflow/voltstream-config:ro
+    networks: [voltstream]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      postgres-init:
+        condition: service_completed_successfully
+      docker-socket-proxy:
+        condition: service_started
+
 networks:
   voltstream:
     name: voltstream
