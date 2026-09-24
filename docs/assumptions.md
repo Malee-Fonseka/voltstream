@@ -70,10 +70,43 @@ failure. With every rate set to zero, output equals input exactly — asserted a
 **The two lateness mechanisms are deliberately separated** (D3). Out-of-order events model
 network reordering and are bounded by the watermark, so they are *always* absorbed.
 Dropouts model a communications outage and flush a backlog far beyond the watermark, so
-the speed layer misses them while the batch layer, rescanning a closed day, does not. That
-gap is the source of the speed-versus-batch divergence the reconciliation metric measures.
-It is injected on purpose; without it the divergence would be zero and the merge function
-would demonstrate nothing.
+the speed layer misses some of them while the batch layer, rescanning a closed day, does
+not. It is injected on purpose; without it there would be nothing for the merge function
+to correct.
+
+### Where the dropped energy actually goes — measured
+
+Whether a late reading is dropped depends on the size of the window it belongs to. A
+window stops accepting data at roughly `watermark + trigger + tick + window`:
+
+| Aggregation | Window | Lateness certainly dropped beyond |
+|---|---|---|
+| Zone metrics | 15 sim min | **102.6 sim min** |
+| Household running total | 1 sim day | **1527.6 sim min** |
+
+A dropout buffers for 30 real seconds and flushes readings **10–144 simulated minutes**
+late. That straddles the 15-minute threshold and is nowhere near the daily one, so the
+consequence is asymmetric — measured over one complete simulated day:
+
+| View | kWh | Gap vs archived |
+|---|---|---|
+| Archived, after the same validation | 508.5150 | — |
+| Household daily totals | 508.5150 | **0.0000 %** |
+| 15-minute zone windows | 506.6273 | **0.3712 %** |
+
+With dropouts disabled the 15-minute gap falls to zero, which is what shows the 0.37 %
+is dropped backfill rather than reordering the watermark failed to absorb.
+
+**Two consequences worth stating plainly.** The real-time *operational* view is
+measurably incomplete, by about a third of a percent — that is the speed layer doing its
+job, trading completeness for latency. The *provisional bill* is not incomplete at all:
+nothing a dropout injects arrives late enough to miss the day it belongs to. So the
+speed-versus-batch divergence on bills comes from the **stale tariff**, not from lost
+readings, and the reconciliation metric should be read accordingly.
+
+D3's sizing model put the drop near 1.7 %. Measured against the day's total energy it is
+0.37 %, about a fifth of that. The measured figure is the one quoted here and in the
+report.
 
 ---
 
