@@ -86,12 +86,26 @@ def get_pool() -> ConnectionPool:
 def transaction() -> Iterator[Any]:
     """A cursor inside a transaction, committed on success and rolled back on error.
 
-    Reads use it too. A read-only transaction costs nothing here and means a handler that
-    later grows a write cannot accidentally leave it uncommitted.
+    Uses the pool when one is open and a single short-lived connection when it is not.
+    That is what lets `storage/repositories.py` be the one place SQL lives: the API runs
+    pooled, while a batch script in the Spark image has no pool at all — `psycopg_pool`
+    is deliberately only in the `api` extra, because a Spark driver must not hold pooled
+    connections across a stalled micro-batch. Without this fallback every batch-side
+    caller would have to re-implement the same queries against a raw connection, and the
+    two copies would drift.
+
+    Reads use it too. A read-only transaction costs nothing and means a caller that later
+    grows a write cannot accidentally leave it uncommitted.
     """
     try:
-        with get_pool().connection() as conn, conn.cursor() as cur:
-            yield cur
+        if _pool is not None:
+            with _pool.connection() as conn, conn.cursor() as cur:
+                yield cur
+        else:
+            import psycopg
+
+            with psycopg.connect(connection_string()) as conn, conn.cursor() as cur:
+                yield cur
     except DatabaseUnavailable:
         raise
     except Exception as exc:  # noqa: BLE001 - re-raised as a typed error below

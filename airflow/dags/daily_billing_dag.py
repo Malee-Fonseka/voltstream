@@ -234,10 +234,41 @@ with DAG(
         retries=0,
     )
 
+    # Last, because it reports on everything above it — bills, rollup and the run ledger.
+    # Generated rather than served on request: the brief's deliverable is a report that
+    # exists, not an endpoint someone has to know to call.
+    generate_report = DockerOperator(
+        task_id="generate_report",
+        image=os.environ.get("VOLTSTREAM_SPARK_IMAGE", "voltstream-spark:local"),
+        docker_url="tcp://docker-socket-proxy:2375",
+        network_mode=os.environ.get("VOLTSTREAM_NETWORK", "voltstream"),
+        mount_tmp_dir=False,
+        force_pull=False,
+        auto_remove="force",
+        tty=False,
+        command=[
+            "python",
+            "/app/scripts/generate_report.py",
+            "--sim-date",
+            "{{ params.sim_date }}",
+        ],
+        environment={
+            "VOLTSTREAM_ENV": "docker",
+            "VOLTSTREAM_CONFIG_DIR": "/app/config",
+            "VOLTSTREAM__POSTGRES__HOST": "postgres",
+            "VOLTSTREAM_REPORT_DIR": "/var/lib/voltstream/reports",
+        },
+        private_environment={
+            "VOLTSTREAM__POSTGRES__PASSWORD": os.environ.get("POSTGRES_PASSWORD", "voltstream"),
+        },
+        retries=1,
+    )
+
     (
         wait_for_tariff
         >> grace
         >> run_daily_billing
         >> [verify_row_count, verify_bill_sanity]
         >> run_zone_rollup
+        >> generate_report
     )

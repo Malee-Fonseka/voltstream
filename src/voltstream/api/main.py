@@ -22,7 +22,7 @@ from fastapi import FastAPI, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from voltstream import __version__
-from voltstream.api.routers import health, households, zones
+from voltstream.api.routers import alerts, health, households, reports, zones
 from voltstream.config import get_config
 from voltstream.logging_setup import get_logger
 from voltstream.metrics import REGISTRY
@@ -71,6 +71,8 @@ def create_app() -> FastAPI:
                 "name": "households",
                 "description": "Per-household bills. The merge function lives here.",
             },
+            {"name": "reports", "description": "Consolidated daily reports."},
+            {"name": "alerts", "description": "Firing alerts, proxied from Alertmanager."},
             {"name": "health", "description": "Liveness and dependency readiness."},
         ],
     )
@@ -78,6 +80,8 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(zones.router)
     app.include_router(households.router)
+    app.include_router(reports.router)
+    app.include_router(alerts.router)
 
     # /metrics serves the shared registry directly rather than through
     # prometheus-fastapi-instrumentator. Two reasons:

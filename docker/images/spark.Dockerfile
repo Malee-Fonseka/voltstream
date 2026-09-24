@@ -107,6 +107,11 @@ RUN mkdir -p /var/lib/voltstream/checkpoints \
 # commit, so the two cannot drift apart.
 COPY config/ /app/config/
 
+# Operational scripts that are not part of the importable package but do run inside this
+# image — the report generator is launched as a DAG task. Kept out of src/voltstream on
+# purpose: they are entry points for the orchestrator, not library code anything imports.
+COPY scripts/ /app/scripts/
+
 WORKDIR /app
 USER voltstream
 

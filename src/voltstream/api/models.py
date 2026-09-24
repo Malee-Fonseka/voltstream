@@ -140,6 +140,64 @@ class BillDelta(BaseModel):
     )
 
 
+class ReportZone(BaseModel):
+    """One zone's authoritative daily totals, from the batch rollup."""
+
+    grid_zone: str
+    total_consumption_kwh: Decimal
+    total_solar_kwh: Decimal
+    self_consumed_kwh: Decimal
+    export_kwh: Decimal
+    renewable_ratio: Decimal
+    peak_window_start: datetime
+    peak_consumption_kwh: Decimal
+    active_meters: int
+    readings_count: int
+
+
+class ReportBilling(BaseModel):
+    households: int
+    total_consumption_kwh: Decimal
+    total_billed: Decimal
+    readings_count: int
+    duplicates_removed: int
+
+
+class ReportRun(BaseModel):
+    """One billing run. Superseded runs are included on purpose — a restated day has a
+    history, and the report is where it should be visible."""
+
+    status: str
+    rows_in: int | None = None
+    rows_out: int | None = None
+    started_at: datetime
+    finished_at: datetime | None = None
+    orchestrator_run_id: str | None = None
+
+
+class DailyReport(BaseModel):
+    """The consolidated daily document.
+
+    Returned for an open day as well as a finalised one. `finalised` and `completeness`
+    tell the reader which sections are authoritative and which are simply not written yet,
+    so an absent figure is never mistaken for a zero.
+    """
+
+    sim_date: date
+    finalised: bool = Field(
+        description="True once a billing run has succeeded for this simulated day."
+    )
+    completeness: dict[str, bool] = Field(
+        description="Which sections have been produced: bills, zone_rollup, reconciliation."
+    )
+
+    zones: list[ReportZone]
+    billing: ReportBilling | None = None
+    runs: list[ReportRun]
+    rejected: list[dict]
+    reconciliation: dict | None = None
+
+
 class RejectedReason(BaseModel):
     reason: str
     count: int
@@ -152,6 +210,19 @@ class AlertStatus(BaseModel):
     severity: str
     summary: str
     since: datetime | None = None
+
+
+class AlertsResponse(BaseModel):
+    """Firing alerts, plus whether we could actually ask.
+
+    `available` distinguishes "no alerts are firing" from "we could not find out", which
+    look identical if the response is just a list. A dashboard showing an empty list for
+    the second case is quietly claiming everything is fine.
+    """
+
+    alerts: list[AlertStatus]
+    available: bool
+    warning: str | None = None
 
 
 class DependencyHealth(BaseModel):

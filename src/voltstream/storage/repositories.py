@@ -214,3 +214,115 @@ def get_rejected_summary(minutes: int = 60) -> list[RejectedSummary]:
             (minutes,),
         )
         return [RejectedSummary(reason, total) for reason, total in cur.fetchall()]
+
+
+# --------------------------------------------------------------------------------------
+# Daily report (T130)
+# --------------------------------------------------------------------------------------
+
+
+class ZoneDaily(NamedTuple):
+    grid_zone: str
+    total_consumption_kwh: Decimal
+    total_solar_kwh: Decimal
+    self_consumed_kwh: Decimal
+    export_kwh: Decimal
+    renewable_ratio: Decimal
+    peak_window_start: datetime
+    peak_consumption_kwh: Decimal
+    active_meters: int
+    readings_count: int
+
+
+class BillingSummary(NamedTuple):
+    households: int
+    total_kwh: Decimal
+    total_billed: Decimal
+    readings_count: int
+    duplicates_removed: int
+
+
+class RunSummary(NamedTuple):
+    status: str
+    rows_in: int | None
+    rows_out: int | None
+    started_at: datetime
+    finished_at: datetime | None
+    orchestrator_run_id: str | None
+
+
+def get_zone_daily(sim_date: date) -> list[ZoneDaily]:
+    """Authoritative per-zone totals for a day, from the batch rollup."""
+    with transaction() as cur:
+        cur.execute(
+            "SELECT grid_zone, total_consumption_kwh, total_solar_kwh, self_consumed_kwh, "
+            "export_kwh, renewable_ratio, peak_window_start, peak_consumption_kwh, "
+            "active_meters, readings_count FROM zone_metrics_daily "
+            "WHERE sim_date = %s ORDER BY grid_zone",
+            (sim_date,),
+        )
+        return [ZoneDaily(*r) for r in cur.fetchall()]
+
+
+def get_billing_summary(sim_date: date) -> BillingSummary | None:
+    """Totals across every household's finalised bill, or None if the day is not billed."""
+    with transaction() as cur:
+        cur.execute(
+            "SELECT count(*), COALESCE(SUM(consumption_kwh), 0), COALESCE(SUM(final_bill), 0), "
+            "COALESCE(SUM(readings_count), 0), COALESCE(SUM(duplicates_removed), 0) "
+            "FROM household_bill_daily WHERE sim_date = %s",
+            (sim_date,),
+        )
+        row = cur.fetchone()
+        if row is None or row[0] == 0:
+            return None
+        return BillingSummary(*row)
+
+
+def get_run_summary(sim_date: date) -> list[RunSummary]:
+    """Every billing run for a day, newest first.
+
+    All of them, not only the successful one: a day that was restated has a history, and
+    the report is where that history should be visible rather than hidden behind the
+    final number.
+    """
+    with transaction() as cur:
+        cur.execute(
+            "SELECT status, rows_in, rows_out, started_at, finished_at, orchestrator_run_id "
+            "FROM pipeline_runs WHERE sim_date = %s AND layer = 'batch_billing' "
+            "ORDER BY started_at DESC",
+            (sim_date,),
+        )
+        return [RunSummary(*r) for r in cur.fetchall()]
+
+
+def get_rejected_for_day(sim_date: date) -> list[RejectedSummary]:
+    """Rejections attributable to a simulated day.
+
+    Matched on the payload's `event_ts` rather than `rejected_at`: a record rejected by
+    the batch layer is rejected when the job runs, which can be a different real day from
+    the simulated one it belongs to. Counting by wall clock would attribute a restatement
+    of last week's data to today.
+    """
+    with transaction() as cur:
+        cur.execute(
+            "SELECT reason, count(*) FROM rejected_records "
+            "WHERE (raw_payload ->> 'event_ts')::timestamptz::date = %s "
+            "GROUP BY reason ORDER BY count(*) DESC",
+            (sim_date,),
+        )
+        return [RejectedSummary(reason, total) for reason, total in cur.fetchall()]
+
+
+def get_reconciliation_summary(sim_date: date) -> tuple[int, Decimal, Decimal] | None:
+    """Count, mean absolute divergence and mean percent divergence for a day."""
+    with transaction() as cur:
+        cur.execute(
+            "SELECT count(*), COALESCE(AVG(abs_divergence), 0), COALESCE(AVG(pct_divergence), 0) "
+            "FROM reconciliation_daily WHERE sim_date = %s",
+            (sim_date,),
+        )
+        row = cur.fetchone()
+        if row is None or row[0] == 0:
+            return None
+        return (row[0], row[1], row[2])
