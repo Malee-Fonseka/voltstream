@@ -179,6 +179,11 @@ with DAG(
         # the bound is on magnitude rather than sign.
         sql="""
             SELECT
+              -- First and load-bearing: every predicate below is a count-is-zero test,
+              -- and all of them are trivially true of an empty table. Without this the
+              -- sanity check passes on a day that produced no bills at all, which is
+              -- exactly the failure it should catch.
+              count(*) > 0                                           AS day_has_bills,
               count(*) FILTER (WHERE final_bill IS NULL)        = 0 AS no_null_bills,
               count(*) FILTER (WHERE tier_breakdown IS NULL)    = 0 AS no_null_breakdown,
               count(*) FILTER (WHERE readings_count <= 0)       = 0 AS every_bill_has_readings,
