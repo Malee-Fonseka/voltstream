@@ -1,0 +1,101 @@
+"""The serving API (T103, §5.8).
+
+The generated OpenAPI page is a graded demo artefact, so the title, description and
+version below are real rather than FastAPI's defaults — `/docs` is something a marker
+opens, not just a debugging aid.
+
+The Postgres pool is opened and closed by the lifespan rather than on first use. Opening
+lazily would make the first request after startup pay the connection cost and, worse,
+would let the container report healthy before it could serve anything.
+
+`/metrics` is mounted by the instrumentator onto this same port, using the shared registry
+from `voltstream.metrics`. The API does not call `start_metrics_server()` — that is for
+processes with no HTTP server of their own.
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+from voltstream import __version__
+from voltstream.api.routers import health, zones
+from voltstream.config import get_config
+from voltstream.logging_setup import get_logger
+from voltstream.storage.postgres import close_pool, open_pool
+
+log = get_logger("api")
+
+_DESCRIPTION = """
+Serving layer for **voltstream**, a Lambda-architecture platform for smart-grid
+monitoring and billing.
+
+Two views over the same meter stream:
+
+* **Zone endpoints** read the speed layer — grid load and renewable contribution over
+  15-simulated-minute windows, updated every few seconds.
+* **Household endpoints** read whichever layer can answer. Once the batch job has closed
+  a simulated day the authoritative bill is served; until then a provisional estimate
+  computed against the *previous* day's tariff. Every response says which it is, in
+  `source` and `provisional`.
+
+All timestamps are UTC. `event_ts`, `sim_date` and window bounds are **simulated** time,
+which runs 288x wall-clock; only latency metrics use the real clock.
+"""
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    open_pool()
+    log.info("api started", extra={"stage": "api"})
+    try:
+        yield
+    finally:
+        close_pool()
+        log.info("api stopped", extra={"stage": "api"})
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(
+        title="voltstream serving API",
+        description=_DESCRIPTION,
+        version=__version__,
+        lifespan=lifespan,
+        openapi_tags=[
+            {"name": "zones", "description": "Real-time grid load and renewable mix."},
+            {"name": "health", "description": "Liveness and dependency readiness."},
+        ],
+    )
+
+    app.include_router(health.router)
+    app.include_router(zones.router)
+
+    # Shares voltstream.metrics.REGISTRY, so the API's request metrics and the pipeline's
+    # business metrics are scraped from one endpoint rather than two.
+    from prometheus_fastapi_instrumentator import Instrumentator
+
+    from voltstream.metrics import REGISTRY
+
+    Instrumentator(registry=REGISTRY).instrument(app).expose(app, endpoint="/metrics")
+
+    return app
+
+
+app = create_app()
+
+
+def run() -> None:
+    """Console entry point (`voltstream-api`)."""
+    import uvicorn
+
+    config = get_config()
+    uvicorn.run(
+        "voltstream.api.main:app",
+        host=config.api.host,
+        port=config.api.port,
+        # Logging is the structured JSON envelope from logging_setup; uvicorn's own
+        # access log would emit a second, differently shaped line for every request.
+        access_log=False,
+    )

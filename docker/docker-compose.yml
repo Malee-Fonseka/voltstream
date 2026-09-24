@@ -298,6 +298,47 @@ services:
       minio-init:
         condition: service_completed_successfully
 
+  # Serving API (T108, §5.8). On the app image — no PySpark, so it stays small and starts
+  # in seconds, which is what lets the healthcheck below be meaningful.
+  api:
+    build:
+      context: ..
+      dockerfile: docker/images/app.Dockerfile
+    image: voltstream-app:${VOLTSTREAM_IMAGE_TAG:-local}
+    container_name: voltstream-api
+    restart: unless-stopped
+    command: ["voltstream-api"]
+    environment:
+      VOLTSTREAM_ENV: docker
+      VOLTSTREAM_CONFIG_DIR: /app/config
+      VOLTSTREAM__SIMULATION__ANCHOR_REAL: ${VOLTSTREAM_ANCHOR_REAL:-}
+      VOLTSTREAM__POSTGRES__HOST: postgres
+      VOLTSTREAM__POSTGRES__PASSWORD: ${POSTGRES_PASSWORD:-voltstream}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-voltstream}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-voltstream-dev}
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://minio:9000
+    ports:
+      - "${API_HOST_PORT:-8000}:8000"
+    volumes:
+      - ../config:/app/config:ro
+    networks: [voltstream]
+    healthcheck:
+      # /health/ready, not /health/live: the container is only useful once Postgres and
+      # MinIO are reachable, and readiness is what reports that (T105).
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health/ready', timeout=3).status == 200 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      postgres-init:
+        condition: service_completed_successfully
+
 networks:
   voltstream:
     name: voltstream
