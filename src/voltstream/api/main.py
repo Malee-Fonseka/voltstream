@@ -18,12 +18,14 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from voltstream import __version__
 from voltstream.api.routers import health, zones
 from voltstream.config import get_config
 from voltstream.logging_setup import get_logger
+from voltstream.metrics import REGISTRY
 from voltstream.storage.postgres import close_pool, open_pool
 
 log = get_logger("api")
@@ -72,13 +74,20 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(zones.router)
 
-    # Shares voltstream.metrics.REGISTRY, so the API's request metrics and the pipeline's
-    # business metrics are scraped from one endpoint rather than two.
-    from prometheus_fastapi_instrumentator import Instrumentator
-
-    from voltstream.metrics import REGISTRY
-
-    Instrumentator(registry=REGISTRY).instrument(app).expose(app, endpoint="/metrics")
+    # /metrics serves the shared registry directly rather than through
+    # prometheus-fastapi-instrumentator. Two reasons:
+    #
+    # The instrumentator (7.1) does not work with FastAPI 0.141 — it walks `app.routes`
+    # expecting every entry to have `.path`, and newer FastAPI puts `_IncludedRouter`
+    # objects there, so every request 500s inside the middleware. Pinning FastAPI back a
+    # dozen minor versions to keep one optional dependency is the wrong trade.
+    #
+    # And what it adds is per-endpoint HTTP counters, which are not among the eight
+    # metrics §10.1 names. `voltstream.metrics` is deliberately the only place a metric is
+    # defined; exposing its registry is all this endpoint owes the design.
+    @app.get("/metrics", include_in_schema=False)
+    def metrics() -> Response:
+        return Response(generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
 
     return app
 
