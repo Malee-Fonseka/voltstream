@@ -68,23 +68,20 @@ METER_READING_SCHEMA = StructType(
 _KAFKA_METADATA_COLUMNS = ("kafka_key", "kafka_timestamp", "kafka_partition", "kafka_offset")
 
 
-def read_meter_stream(
-    spark: SparkSession,
-    *,
-    starting_offsets: str = "earliest",
-    group_id: str | None = None,
-) -> DataFrame:
+def read_meter_stream(spark: SparkSession, *, starting_offsets: str = "earliest") -> DataFrame:
     """Read `meter.readings` as a stream, parsed against the frozen contract.
 
     `starting_offsets` applies only on the very first run of a query; afterwards the
     checkpoint's committed offsets win, which is exactly the behaviour the restart test
     exercises.
 
-    `group_id` names the Kafka consumer group. Spark tracks offsets in its own checkpoint
-    either way, so this does not change delivery — it makes the two branches *visible* as
-    separate groups in `kafka-consumer-groups --describe`, which is how the archiver and
-    the speed layer are shown to consume the same topic independently (§5.2). Left unset,
-    Spark generates a random group per run and the two branches cannot be told apart.
+    The Kafka consumer group is deliberately left to Spark, which generates a unique one
+    per query. Setting `kafka.group.id` looked attractive for making the two branches
+    visible to `kafka-consumer-groups`, but it does nothing of the sort: this source
+    *assigns* partitions directly rather than subscribing, so no group is ever registered
+    with the coordinator and `--describe` reports it does not exist. Spark also warns that
+    a shared group id makes concurrent queries interfere. Branch independence is real, and
+    it is visible where it actually lives — each query's own checkpoint (§5.2).
     """
     config = get_config()
 
@@ -98,17 +95,19 @@ def read_meter_stream(
         # A lost offset must be loud, not silently skipped to the newest record.
         .option("failOnDataLoss", "true")
     )
-    if group_id:
-        reader = reader.option("kafka.group.id", group_id)
 
-    return reader.load().select(
-        F.from_json(F.col("value").cast("string"), METER_READING_SCHEMA).alias("r"),
-        F.col("key").cast("string").alias("kafka_key"),
-        F.col("timestamp").alias("kafka_timestamp"),
-        F.col("partition").alias("kafka_partition"),
-        F.col("offset").alias("kafka_offset"),
-        F.col("headers").alias("kafka_headers"),
-    ).select("r.*", *_KAFKA_METADATA_COLUMNS, "kafka_headers")
+    return (
+        reader.load()
+        .select(
+            F.from_json(F.col("value").cast("string"), METER_READING_SCHEMA).alias("r"),
+            F.col("key").cast("string").alias("kafka_key"),
+            F.col("timestamp").alias("kafka_timestamp"),
+            F.col("partition").alias("kafka_partition"),
+            F.col("offset").alias("kafka_offset"),
+            F.col("headers").alias("kafka_headers"),
+        )
+        .select("r.*", *_KAFKA_METADATA_COLUMNS, "kafka_headers")
+    )
 
 
 def trace_id_from_headers(headers_col: str = "kafka_headers") -> Column:

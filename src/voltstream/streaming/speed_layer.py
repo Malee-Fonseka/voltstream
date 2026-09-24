@@ -403,18 +403,18 @@ def start(await_termination: bool = True) -> list[StreamingQuery]:
         config.simulation.epoch_sim + timedelta(days=365 * 50),
     )
 
-    # One source per query, each with its own consumer group. Spark is explicit that a
-    # group id must not be shared across queries: they would join the same group, have
-    # partitions revoked from under each other, and interfere on restart. All three stay
-    # distinct from the archiver's group, which is what §5.2's independence claim needs.
+    # One source per query. Each gets its own Spark-generated consumer group and, more to
+    # the point, its own checkpoint — which is where offsets actually live and what makes
+    # the branches independent (§5.2).
     #
     # The cost is that each query reads the topic separately. At this volume (~7,500
     # events per simulated day) that is cheap, and it buys genuinely independent failure:
     # the zone view keeps serving if the household query dies.
-    def valid_stream(group_id: str) -> DataFrame:
-        raw_stream = read_meter_stream(spark, group_id=group_id)
+    def valid_stream() -> DataFrame:
         valid, _ = split_valid_invalid(
-            raw_stream, known_household_ids=known_households, event_ts_bounds=bounds
+            read_meter_stream(spark),
+            known_household_ids=known_households,
+            event_ts_bounds=bounds,
         )
         return valid
 
@@ -422,7 +422,7 @@ def start(await_termination: bool = True) -> list[StreamingQuery]:
     output_mode = config.speed_layer.output_mode
 
     zone_query = (
-        zone_aggregation(valid_stream("voltstream-speed-zone"))
+        zone_aggregation(valid_stream())
         .writeStream.queryName(_ZONE_JOB)
         .outputMode(output_mode)
         .option("checkpointLocation", checkpoint_path(_ZONE_JOB))
@@ -432,7 +432,7 @@ def start(await_termination: bool = True) -> list[StreamingQuery]:
     )
 
     household_query = (
-        household_aggregation(valid_stream("voltstream-speed-household"))
+        household_aggregation(valid_stream())
         .writeStream.queryName(_HOUSEHOLD_JOB)
         .outputMode(output_mode)
         .option("checkpointLocation", checkpoint_path(_HOUSEHOLD_JOB))
@@ -445,7 +445,7 @@ def start(await_termination: bool = True) -> list[StreamingQuery]:
     # separate because the two aggregations consume only valid rows by construction, so
     # neither of them ever sees a rejected record to dead-letter.
     validation_query = (
-        read_meter_stream(spark, group_id="voltstream-speed-validation")
+        read_meter_stream(spark)
         .writeStream.queryName("speed_layer_validation")
         .outputMode("append")
         .option("checkpointLocation", checkpoint_path("speed_layer_validation"))
