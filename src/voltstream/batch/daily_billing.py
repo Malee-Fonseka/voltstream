@@ -23,6 +23,7 @@ A partially written billing day is worse than no billing day.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 import uuid
@@ -283,12 +284,23 @@ def archive_tariff(tariff: DataFrame, sim_date: date) -> str:
 # --------------------------------------------------------------------------------------
 
 
+def _orchestrator_run_id() -> str | None:
+    """Airflow's dag_run_id, when this job was launched by a DAG.
+
+    None when it was not — a bare `spark-submit` or `make backfill` is a legitimate way to
+    run this, not a degraded one. Recording it is what makes a restatement legible later:
+    two ledger rows for one simulated day, each naming the execution that produced it.
+    """
+    return os.environ.get("VOLTSTREAM_ORCHESTRATOR_RUN_ID") or None
+
+
 def _start_run(run_id: uuid.UUID, sim_date: date) -> None:
     with psycopg.connect(pg_connection_string()) as conn, conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO pipeline_runs (run_id, sim_date, layer, status, started_at) "
-            "VALUES (%s, %s, 'batch_billing', 'running', now())",
-            (run_id, sim_date),
+            "INSERT INTO pipeline_runs "
+            "(run_id, sim_date, layer, status, started_at, orchestrator_run_id) "
+            "VALUES (%s, %s, 'batch_billing', 'running', now(), %s)",
+            (run_id, sim_date, _orchestrator_run_id()),
         )
         conn.commit()
 

@@ -85,9 +85,14 @@ lint:
 	$(PY) -m ruff check src tests
 	$(PY) -m ruff format --check src tests
 	$(PY) -m mypy src
-	@# D7: the misspelling is permitted only in the README's note and in repository URLs.
-	@if grep -rni "volstream" src/ docker/ config/ airflow/ scripts/ tests/ 2>/dev/null; then \
-	  echo "found 'volstream' (missing a t) outside the permitted places — see D7"; \
+	@# D7: no identifier may use the misspelling. Comment lines are excluded, because the
+	@# places that legitimately mention it are explaining exactly this decision — the
+	@# compose header saying why `name: voltstream` is mandatory, and the README's note.
+	@# What the rule is for is a misspelled container, volume, package or column name, and
+	@# those cannot live in a comment.
+	@if grep -rni "volstream" src/ docker/ config/ airflow/ scripts/ tests/ 2>/dev/null \
+	     | grep -vE ':\s*(#|--|//)' ; then \
+	  echo "found 'volstream' (missing a t) in an identifier — see D7"; \
 	  exit 1; \
 	fi
 	@echo "lint clean"
