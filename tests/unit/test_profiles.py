@@ -135,3 +135,39 @@ def test_renewable_ratio_crosses_the_alert_threshold_both_ways() -> None:
         above = any(zone_ratio(zone, hour) > threshold for hour in (10, 11, 12, 13, 14))
         assert below, f"{zone} never dropped below the threshold overnight"
         assert above, f"{zone} never rose above the threshold at midday"
+
+
+def test_daily_solar_is_a_plausible_fraction_of_daily_consumption() -> None:
+    """A solar household must not generate wildly more than it uses over a whole day.
+
+    The companion to the crossing test above, which is one-sided: it asserts the ratio
+    gets *high* enough to clear the alert threshold, and is satisfied by any non-trivial
+    solar curve — including one four times too large.
+
+    That gap shipped. At the original peak capacity a solar household generated about
+    450 % of its own daily consumption, which pinned every zone's daily renewable ratio at
+    100 %, made a third of households net exporters with negative bills, and drained the
+    use case's headline metric of any information. The arithmetic was right the whole
+    time; the input was not.
+
+    The band is deliberately wide — this guards against an order-of-magnitude mistake, not
+    against a tuning preference.
+    """
+    solar_household = "HH-0003"  # _has_solar(3) is True
+    ticks_per_day = 150
+    step = timedelta(hours=24) / ticks_per_day
+
+    consumption = Decimal(0)
+    solar = Decimal(0)
+    for i in range(ticks_per_day):
+        ts = _DAY + step * i
+        consumption += consumption_kwh(solar_household, ts)
+        solar += solar_kwh(solar_household, ts, has_solar=True)
+
+    ratio = solar / consumption
+    assert Decimal("0.3") <= ratio <= Decimal("1.5"), (
+        f"a solar household generates {ratio:.2f}x its own daily consumption. "
+        "Below 0.3 the renewable contribution is invisible; above 1.5 it is a commercial "
+        "array on a domestic roof, every zone ratio saturates at 100% and most bills go "
+        "negative on export credits alone."
+    )
