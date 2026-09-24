@@ -68,7 +68,8 @@ failure. With every rate set to zero, output equals input exactly — asserted a
 | Meter dropout | 0.2 % per meter per tick | store-and-forward, 30 real s buffer |
 
 **The two lateness mechanisms are deliberately separated** (D3). Out-of-order events model
-network reordering and are bounded by the watermark, so they are *always* absorbed.
+network reordering and are bounded by the watermark, so D3 expects them to be *always*
+absorbed — a claim the measurement below has not yet confirmed.
 Dropouts model a communications outage and flush a backlog far beyond the watermark, so
 the speed layer misses some of them while the batch layer, rescanning a closed day, does
 not. It is injected on purpose; without it there would be nothing for the merge function
@@ -94,8 +95,23 @@ consequence is asymmetric — measured over one complete simulated day:
 | Household daily totals | 508.5150 | **0.0000 %** |
 | 15-minute zone windows | 506.6273 | **0.3712 %** |
 
-With dropouts disabled the 15-minute gap falls to zero, which is what shows the 0.37 %
-is dropped backfill rather than reordering the watermark failed to absorb.
+**The control for this is not yet passing, and the attribution is provisional until it
+does.** Disabling dropouts should take the 15-minute gap to zero, since reordering is
+bounded by the watermark. Measured, it went to 0.5635 % — *larger* than the run with
+dropouts on. Two explanations fit and that run could not separate them:
+
+1. D3's `L <= W` guarantee does not hold, and the trigger interval drops modest
+   reordering too. That would make the 0.37 % above mostly reordering, not backfill.
+2. The host was saturated. A probe container waited fifteen minutes for CPU during that
+   run, and a starved driver processes a micro-batch spanning far more event time than
+   one trigger, which advances the watermark in leaps and drops late data a healthy run
+   would absorb.
+
+The watermark arithmetic favours (2): a reading late by `L` is dropped only when
+`L >= x + 45`, where `x` is its offset within the batch's event-time span, and `L` is
+capped at 30 — which holds only while a batch spans about one trigger. The test now stops
+the writers before probing; this needs re-running on an idle host before either
+explanation goes in the report.
 
 **Two consequences worth stating plainly.** The real-time *operational* view is
 measurably incomplete, by about a third of a percent — that is the speed layer doing its
@@ -204,3 +220,39 @@ PostgreSQL is appropriate at our volume and would remain so to roughly the low m
 aggregate rows per day. Beyond that the serving layer should migrate to a time-series or
 columnar analytical store (TimescaleDB, ClickHouse, Cassandra). Selecting PostgreSQL
 reflects actual data volume rather than aspirational scale.
+
+---
+
+## 7. Gate evidence
+
+Recorded as each gate passed, so the report's results chapter quotes measurements rather
+than reconstructing them later.
+
+### Gate 2 — archiver restart (Phase 6)
+
+SIGKILL, 20 s outage, restart:
+
+| Metric | Value |
+|---|---|
+| Rows before kill | 10,661 |
+| Rows after recovery | 14,012 |
+| Distinct `event_id` | 13,678 |
+| Duplicate rows | 334 |
+| Kafka partitions with contiguous offsets | 3 / 3 |
+
+No loss and no offset gap. The 334 duplicates are expected under at-least-once delivery
+and are removed downstream by the batch dedup on `(meter_id, event_ts)` — see §4.
+
+### Gate 3 — speed path complete (Phase 7)
+
+| Criterion | Evidence |
+|---|---|
+| Pure-vs-Spark consistency test green | `tests/consistency/test_pure_vs_spark.py` passes: 5,000 random inputs plus per-block boundary sweeps |
+| Live zone data | 40 real seconds advanced the newest window from 07:30 to 10:45 simulated (3 h 15 min, i.e. 288x); `zone_metrics_rt` grew 119 → 180 rows |
+| Rejects in both sinks, counted | 53 rows in `rejected_records` and 53 messages in `meter.readings.dlq` — exact match |
+| Reject reasons | `null_field` 27, `negative_kwh` 13, `unknown_household` 13 |
+| One identifier across both sinks | `trace_id` 389048a5… present in the Postgres row and in the DLQ message |
+| Provisional bills | 50 / 50 households, every D4 component non-null, `estimated_bill = energy + fixed − subsidy − export` on every row, `tariff_source_date = sim_date − 1` on every row |
+
+The API endpoint named in the gate does not exist until Phase 8, so the zone view was
+verified directly against PostgreSQL, which that task permits.
