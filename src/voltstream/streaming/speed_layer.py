@@ -50,6 +50,7 @@ from voltstream.metrics import (
     start_metrics_server,
     zone_renewable_ratio,
 )
+from voltstream.storage.objectstore import landing_tariff_path
 from voltstream.streaming.session import build_session, checkpoint_path
 from voltstream.streaming.sinks import upsert_batch, write_rejected
 from voltstream.streaming.sources import read_meter_stream, split_valid_invalid
@@ -210,8 +211,7 @@ def _tariff_for(spark: SparkSession, effective: date) -> DataFrame | None:
     if effective in _tariff_cache:
         return _tariff_cache[effective]
 
-    config = get_config()
-    path = f"s3a://{config.minio.bucket_landing}/tariff/tariff_{effective.isoformat()}.csv"
+    path = landing_tariff_path(effective)
     try:
         frame = (
             spark.read.option("header", "true")
