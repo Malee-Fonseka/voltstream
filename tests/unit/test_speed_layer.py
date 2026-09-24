@@ -193,3 +193,21 @@ def test_tariff_source_date_is_yesterday(bill_row) -> None:  # type: ignore[no-u
     assert bill_row["tariff_source_date"] == date(2026, 1, 1)
     assert bill_row["sim_date"] == date(2026, 1, 2)
     assert bill_row["tariff_source_date"] < bill_row["sim_date"]
+
+
+def test_surplus_solar_saturates_the_ratio(spark) -> None:  # type: ignore[no-untyped-def]
+    """A zone generating more than it consumes must not overflow renewable_ratio.
+
+    Regression test. The column is NUMERIC(5,4), so a ratio of 14.3 — a real value from a
+    low-demand zone at midday — cast to null and violated the NOT NULL constraint, which
+    killed the streaming query outright. The original tests only ever had solar below
+    consumption, so none of them touched this.
+    """
+    df = spark.createDataFrame(
+        [_reading("ZONE-C", "HH-0009", "MTR-0009", "0.4917", "7.0519")],
+        schema=_READING_SCHEMA,
+    )
+    row = zone_aggregation(df).collect()[0]
+    assert row["renewable_ratio"] == Decimal("1.0000")
+    # The surplus is still recoverable: both raw totals are kept on the same row.
+    assert row["total_solar_kwh"] > row["total_consumption_kwh"]

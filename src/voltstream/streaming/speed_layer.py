@@ -123,12 +123,25 @@ def zone_aggregation(valid_df: DataFrame) -> DataFrame:
             F.col("window.end").alias("window_end"),
             F.col("total_consumption_kwh"),
             F.col("total_solar_kwh"),
-            # Guarded against a zero-consumption window: a zone where every meter is
-            # dropped out would otherwise divide by zero and write a null into a NOT NULL
-            # column, killing the query on an edge case that is entirely expected.
+            # Two guards, both for situations that happen routinely rather than rarely.
+            #
+            # Zero consumption: a window where every meter in a zone is dropped out
+            # divides by zero.
+            #
+            # Solar above consumption: a low-demand zone at midday generates more than it
+            # uses, giving a ratio well above 1. The column is NUMERIC(5,4), so anything
+            # from 10.0 up does not fit, casts to null, and violates the NOT NULL
+            # constraint — which killed the query in testing on a ratio of 14.3.
+            # Saturating at 1.0 is the right reading of the metric as well as the safe
+            # one: it answers "what fraction of demand did renewables meet", which cannot
+            # exceed all of it. Surplus is not lost, because the raw numerator and
+            # denominator are both stored in this same row.
             F.when(
                 F.col("total_consumption_kwh") > 0,
-                (F.col("total_solar_kwh") / F.col("total_consumption_kwh")).cast(_RATIO),
+                F.least(
+                    F.col("total_solar_kwh") / F.col("total_consumption_kwh"),
+                    F.lit(Decimal(1)),
+                ).cast(_RATIO),
             )
             .otherwise(F.lit(0).cast(_RATIO))
             .alias("renewable_ratio"),
