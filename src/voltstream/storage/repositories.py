@@ -51,6 +51,15 @@ class RunningEstimate(NamedTuple):
     tariff_source_date: date
 
 
+class ReconciliationEffects(NamedTuple):
+    """D4's decomposition of one household's divergence for one day."""
+
+    tariff_effect: Decimal
+    data_effect: Decimal
+    abs_divergence: Decimal
+    pct_divergence: Decimal
+
+
 class RejectedSummary(NamedTuple):
     reason: str
     # Not `count`: a NamedTuple field of that name shadows tuple.count, so the method is
@@ -141,21 +150,44 @@ def get_running_estimate(household_id: str, sim_date: date) -> RunningEstimate |
         return RunningEstimate(*row) if row else None
 
 
-def get_finalised_bill(household_id: str, sim_date: date) -> tuple | None:
-    """The batch layer's authoritative bill.
+_BILL_COLUMNS = (
+    "household_id, sim_date, consumption_kwh, solar_kwh, self_consumed_kwh, "
+    "billable_import_kwh, export_kwh, energy_charge, fixed_charge, subsidy_discount, "
+    "export_credit, final_bill, tier_breakdown, tariff_effective_date, readings_count, "
+    "duplicates_removed, pipeline_run_id, computed_at"
+)
 
-    Returns the raw row for now: `household_bill_daily` is written by the batch job,
-    which does not exist until Phase 9, so the column set is not yet settled. Typing it
-    against a guess would be worse than typing it once the writer is real.
 
-    ponytail: give this a NamedTuple like the others when the batch job lands.
+def get_finalised_bill_row(household_id: str, sim_date: date) -> dict | None:
+    """The batch layer's authoritative bill, as a column-keyed mapping.
+
+    A dict rather than a positional tuple, and an explicit column list rather than
+    `SELECT *`: this row has eighteen columns and is consumed by the merge function, so
+    a schema change that reorders or inserts one must not silently shift every value one
+    position to the left.
     """
     with transaction() as cur:
         cur.execute(
-            "SELECT * FROM household_bill_daily WHERE household_id = %s AND sim_date = %s",
+            f"SELECT {_BILL_COLUMNS} FROM household_bill_daily "
+            "WHERE household_id = %s AND sim_date = %s",
             (household_id, sim_date),
         )
-        return cur.fetchone()
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return dict(zip([c.name for c in cur.description], row, strict=True))
+
+
+def get_reconciliation_effects(household_id: str, sim_date: date) -> ReconciliationEffects | None:
+    """One household's divergence decomposition, or None before the day is reconciled."""
+    with transaction() as cur:
+        cur.execute(
+            "SELECT tariff_effect, data_effect, abs_divergence, pct_divergence "
+            "FROM reconciliation_daily WHERE household_id = %s AND sim_date = %s",
+            (household_id, sim_date),
+        )
+        row = cur.fetchone()
+        return ReconciliationEffects(*row) if row else None
 
 
 def get_reconciliation(sim_date: date) -> list[tuple]:

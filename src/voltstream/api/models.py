@@ -97,6 +97,49 @@ class BillResponse(BaseModel):
     computed_at: datetime | None = None
 
 
+class BillDelta(BaseModel):
+    """Speed estimate against batch final for one household and day, and why they differ.
+
+    Every figure is optional because the interesting states are the incomplete ones: a day
+    still open has an estimate and no final, a day finalised before the speed layer saw it
+    has the reverse, and the decomposition only exists once reconciliation has run.
+    Returning nulls with `reconciled` saying so is more honest than inventing zeros.
+    """
+
+    household_id: str
+    sim_date: date
+
+    speed_estimate: Decimal | None = Field(
+        default=None, description="Provisional total, computed against yesterday's tariff."
+    )
+    batch_final: Decimal | None = Field(
+        default=None, description="Authoritative total, computed against the day's own tariff."
+    )
+    delta: Decimal | None = Field(
+        default=None,
+        description="batch_final - speed_estimate. Positive means the estimate was low.",
+    )
+    delta_pct: Decimal | None = Field(
+        default=None,
+        description=(
+            "Divergence as a percentage of the final figure, not of the estimate — "
+            "measuring the error against the wrong number would flatter a bad estimate."
+        ),
+    )
+
+    tariff_effect: Decimal | None = Field(
+        default=None,
+        description="Share of the delta explained by the speed layer using yesterday's tariff.",
+    )
+    data_effect: Decimal | None = Field(
+        default=None,
+        description="Share explained by readings the speed layer never saw.",
+    )
+    reconciled: bool = Field(
+        description="False until the reconciliation job has decomposed this day's divergence."
+    )
+
+
 class RejectedReason(BaseModel):
     reason: str
     count: int
