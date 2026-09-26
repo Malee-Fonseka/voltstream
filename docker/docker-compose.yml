@@ -1,10 +1,5 @@
 # voltstream — tiers 1 (infrastructure) and 2 (bootstrap) of the stack (§8.2, T043-T047).
 #
-# `name: voltstream` below is mandatory per D7: Compose otherwise derives the project
-# name from the folder holding this file (`docker/`), and the repository folder is
-# `volstream` (missing a "t") — this key is what makes every network, volume and
-# container come out `voltstream-*` regardless.
-#
 # Tier 1 (kafka, postgres, minio) has real healthchecks, never a `sleep` (§8.2). Tier 2
 # (the three `-init` services) apply schema/topics/buckets and exit 0; every statement
 # they run is idempotent, because they run again on every `compose up`, not only once.
@@ -397,8 +392,10 @@ services:
         aws://${MINIO_ROOT_USER:-voltstream}:${MINIO_ROOT_PASSWORD:-voltstream-dev}@/?endpoint_url=http%3A%2F%2Fminio%3A9000&region_name=us-east-1
       AIRFLOW_CONN_VOLTSTREAM_PG: >-
         postgresql://${POSTGRES_USER:-voltstream}:${POSTGRES_PASSWORD:-voltstream}@postgres:5432/${POSTGRES_DB:-voltstream}
-      # Passed to the Spark container the DAG launches.
+      # The images the DAG launches: Spark for billing and the rollup, the app image for
+      # reconciliation (D6).
       VOLTSTREAM_SPARK_IMAGE: voltstream-spark:${VOLTSTREAM_IMAGE_TAG:-local}
+      VOLTSTREAM_APP_IMAGE: voltstream-app:${VOLTSTREAM_IMAGE_TAG:-local}
       VOLTSTREAM_NETWORK: voltstream
       VOLTSTREAM_ANCHOR_REAL: ${VOLTSTREAM_ANCHOR_REAL:-}
       DOCKER_HOST: tcp://docker-socket-proxy:2375

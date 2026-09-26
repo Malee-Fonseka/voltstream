@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ from pydantic import ValidationError
 
 import voltstream.config as config_module
 from voltstream.config import get_config
+from voltstream.core.tariff import BlockBoundary
 
 _REPO_CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
 
@@ -35,6 +37,18 @@ def test_base_yaml_loads(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = get_config()
     assert cfg.tariff.blocks[0].up_to_kwh == 60
     assert cfg.simulation.households == 50
+
+
+def test_tariff_boundaries_convert_to_core_block_boundaries() -> None:
+    boundaries = get_config().tariff.boundaries()
+
+    assert boundaries == [
+        BlockBoundary("block_1", Decimal(60)),
+        BlockBoundary("block_2", Decimal(120)),
+        BlockBoundary("block_3", None),
+    ]
+    # Decimal, not int: tariff arithmetic is Decimal throughout (D5).
+    assert all(isinstance(b.up_to_kwh, Decimal) for b in boundaries[:2])
 
 
 def test_local_overlay_deep_merge_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -69,9 +83,7 @@ def test_env_var_override_beats_yaml(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_env_var_override_nested_and_typed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("VOLTSTREAM__TARIFF__GENERATOR_DEFAULTS__SUBSIDY_PCT", "42.5")
-    monkeypatch.setenv(
-        "VOLTSTREAM__FAULTS__OUT_OF_ORDER_LATENESS_SIM_MINUTES", "[2, 15]"
-    )
+    monkeypatch.setenv("VOLTSTREAM__FAULTS__OUT_OF_ORDER_LATENESS_SIM_MINUTES", "[2, 15]")
 
     cfg = get_config()
 
@@ -79,9 +91,7 @@ def test_env_var_override_nested_and_typed(monkeypatch: pytest.MonkeyPatch) -> N
     assert cfg.faults.out_of_order_lateness_sim_minutes == (2, 15)
 
 
-def test_unknown_key_in_yaml_raises(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_unknown_key_in_yaml_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     base = yaml.safe_load((_REPO_CONFIG_DIR / "base.yaml").read_text())
     base["simulation"]["bogus_key"] = "surprise"
     (tmp_path / "base.yaml").write_text(yaml.dump(base))
@@ -91,9 +101,7 @@ def test_unknown_key_in_yaml_raises(
         get_config()
 
 
-def test_unknown_top_level_section_raises(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_unknown_top_level_section_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     base = yaml.safe_load((_REPO_CONFIG_DIR / "base.yaml").read_text())
     base["not_a_real_section"] = {"x": 1}
     (tmp_path / "base.yaml").write_text(yaml.dump(base))

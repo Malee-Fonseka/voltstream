@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime
+from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
@@ -27,6 +28,8 @@ from typing import Any, Literal
 import yaml
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict
+
+from voltstream.core.tariff import BlockBoundary
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _ENV_VAR_PREFIX = "VOLTSTREAM__"
@@ -55,6 +58,15 @@ class GeneratorDefaults(_StrictModel):
 class TariffConfig(_StrictModel):
     blocks: list[TariffBlock]
     generator_defaults: GeneratorDefaults
+
+    def boundaries(self) -> list[BlockBoundary]:
+        """The block structure as `core/tariff.py` takes it: `Decimal` edges, `None` for
+        the unbounded top block. `core/` may not read config, so callers translate here —
+        one conversion, rather than one per layer that bills."""
+        return [
+            BlockBoundary(b.name, None if b.up_to_kwh is None else Decimal(b.up_to_kwh))
+            for b in self.blocks
+        ]
 
 
 class SimulationConfig(_StrictModel):
@@ -133,6 +145,8 @@ class ApiConfig(_StrictModel):
 class ObservabilityConfig(_StrictModel):
     metrics_port: int
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"]
+    # Where short-lived batch processes push their metrics. None = do not push.
+    pushgateway_url: str | None = None
 
 
 class VoltstreamConfig(_StrictModel):

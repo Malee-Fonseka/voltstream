@@ -1,8 +1,9 @@
-"""Bill one simulated day (T121–T123, D6).
+"""Bill one simulated day (T121–T123, T139, D6).
 
-Triggered by `tariff_watcher` with `conf={"sim_date": "YYYY-MM-DD"}`. Four steps: wait for
-the tariff file, wait out the late-data grace, run the Spark job in its own container,
-then check what it wrote.
+Triggered by `tariff_watcher` with `conf={"sim_date": "YYYY-MM-DD"}`. In order: wait for
+the tariff file, wait out the late-data grace, run the Spark billing job in its own
+container, check what it wrote, roll up the zones, reconcile the speed layer's estimates
+against the new bills, and write the day's report.
 
 **Every task is keyed on `params.sim_date`, never on the logical date.** That is what makes
 a restatement work (T123): re-running this DAG for an already-billed day with a fresh
@@ -234,7 +235,40 @@ with DAG(
         retries=0,
     )
 
-    # Last, because it reports on everything above it — bills, rollup and the run ledger.
+    # T139 — after the bills and the rollup, because it compares the speed layer's
+    # estimates against the bills this run just committed. On the app image, not the Spark
+    # one (D4, D6): fifty rows of Decimal arithmetic with `core/tariff.py` need no cluster.
+    run_reconciliation = DockerOperator(
+        task_id="run_reconciliation",
+        image=os.environ.get("VOLTSTREAM_APP_IMAGE", "voltstream-app:local"),
+        docker_url="tcp://docker-socket-proxy:2375",
+        network_mode=os.environ.get("VOLTSTREAM_NETWORK", "voltstream"),
+        mount_tmp_dir=False,
+        force_pull=False,
+        auto_remove="force",
+        tty=False,
+        command=["voltstream-reconcile", "--sim-date", "{{ params.sim_date }}"],
+        environment={
+            "VOLTSTREAM_ENV": "docker",
+            "VOLTSTREAM_CONFIG_DIR": "/app/config",
+            "VOLTSTREAM__POSTGRES__HOST": "postgres",
+            "VOLTSTREAM__SIMULATION__ANCHOR_REAL": os.environ.get("VOLTSTREAM_ANCHOR_REAL", ""),
+            "AWS_ENDPOINT_URL": "http://minio:9000",
+            "AWS_DEFAULT_REGION": "us-east-1",
+        },
+        private_environment={
+            "VOLTSTREAM__POSTGRES__PASSWORD": os.environ.get("POSTGRES_PASSWORD", "voltstream"),
+            "AWS_ACCESS_KEY_ID": os.environ.get("MINIO_ROOT_USER", "voltstream"),
+            "AWS_SECRET_ACCESS_KEY": os.environ.get("MINIO_ROOT_PASSWORD", "voltstream-dev"),
+        },
+        # Safe to retry: the job replaces the day's rows in one transaction.
+        retries=2,
+        retry_delay=timedelta(seconds=30),
+        retry_exponential_backoff=True,
+    )
+
+    # Last, because it reports on everything above it — bills, rollup, reconciliation and
+    # the run ledger.
     # Generated rather than served on request: the brief's deliverable is a report that
     # exists, not an endpoint someone has to know to call.
     generate_report = DockerOperator(
@@ -270,5 +304,6 @@ with DAG(
         >> run_daily_billing
         >> [verify_row_count, verify_bill_sanity]
         >> run_zone_rollup
+        >> run_reconciliation
         >> generate_report
     )

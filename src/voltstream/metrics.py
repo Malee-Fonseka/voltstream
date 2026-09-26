@@ -10,6 +10,8 @@ Two usage patterns:
 - **FastAPI** does not call `start_metrics_server()` — it mounts the shared
   `REGISTRY` itself (via `prometheus-fastapi-instrumentator`) so `/metrics` is served on
   the same port as the rest of the API.
+- **One-shot batch containers** exit before Prometheus could scrape them, so they call
+  `push_metrics()` once at the end of the run instead (T138).
 
 Histogram buckets are set explicitly throughout: `prometheus_client`'s defaults top out
 around 10 seconds, which is far too coarse for a latency target measured in single-digit
@@ -19,7 +21,14 @@ minutes (`voltstream_batch_duration_seconds`).
 
 from __future__ import annotations
 
-from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, start_http_server
+from prometheus_client import (
+    CollectorRegistry,
+    Counter,
+    Gauge,
+    Histogram,
+    push_to_gateway,
+    start_http_server,
+)
 
 from voltstream.config import get_config
 
@@ -30,13 +39,31 @@ REGISTRY = CollectorRegistry()
 # Seconds. Covers "well under a second" up to a few minutes, log-ish spacing, so both the
 # speed-layer's sub-60s target and an occasional slow outlier land in a meaningful bucket.
 _E2E_LATENCY_BUCKETS_SECONDS = (
-    0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600,
+    0.5,
+    1,
+    2,
+    5,
+    10,
+    15,
+    30,
+    60,
+    120,
+    300,
+    600,
 )
 
 # Seconds. Covers "well under a minute" up to "worryingly slow", for a nightly batch job
 # whose SLA (alerts.batch_sla_minutes) is expressed in minutes, not seconds.
 _BATCH_DURATION_BUCKETS_SECONDS = (
-    10, 30, 60, 120, 300, 600, 900, 1800, 3600,
+    10,
+    30,
+    60,
+    120,
+    300,
+    600,
+    900,
+    1800,
+    3600,
 )
 
 events_produced_total = Counter(
@@ -104,3 +131,21 @@ def start_metrics_server(port: int | None = None) -> None:
     exposes `/metrics` itself, on its own port, via `prometheus-fastapi-instrumentator`.
     """
     start_http_server(port or get_config().observability.metrics_port, registry=REGISTRY)
+
+
+def push_metrics(job: str, *, timeout_seconds: float = 5.0) -> bool:
+    """Push `REGISTRY` to the Pushgateway, for a process that exits before a scrape.
+
+    Returns False without pushing when `observability.pushgateway_url` is not set. A
+    network failure is raised, not swallowed: whether a missed push matters is the
+    caller's call, not this module's.
+
+    Only samples that exist are sent. Every labelled metric this process never touched
+    has no children and so no samples, which means a job pushes what it set and nothing
+    else — the reconciliation job pushes `voltstream_lambda_divergence` alone.
+    """
+    url = get_config().observability.pushgateway_url
+    if not url:
+        return False
+    push_to_gateway(url, job=job, registry=REGISTRY, timeout=timeout_seconds)
+    return True

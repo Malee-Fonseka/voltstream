@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+from collections.abc import Iterator
 
 import pytest
 from prometheus_client import generate_latest
@@ -34,9 +35,7 @@ def test_all_eight_metric_names_present() -> None:
 
 def test_no_unexpected_metrics_on_the_registry() -> None:
     text = _exposition_text()
-    declared_names = {
-        line.split()[2] for line in text.splitlines() if line.startswith("# TYPE ")
-    }
+    declared_names = {line.split()[2] for line in text.splitlines() if line.startswith("# TYPE ")}
     assert declared_names == _EXPECTED_NAMES
 
 
@@ -94,3 +93,44 @@ def test_start_metrics_server_uses_configured_port_by_default(
 
     assert calls["port"] == get_config().observability.metrics_port
     assert calls["registry"] is metrics.REGISTRY
+
+
+@pytest.fixture
+def _fresh_config() -> Iterator[None]:
+    """Reload config around a test that changes a VOLTSTREAM__* variable."""
+    from voltstream.config import get_config
+
+    get_config.cache_clear()
+    yield
+    get_config.cache_clear()
+
+
+def test_push_metrics_does_nothing_without_a_pushgateway(
+    monkeypatch: pytest.MonkeyPatch, _fresh_config: None
+) -> None:
+    monkeypatch.delenv("VOLTSTREAM__OBSERVABILITY__PUSHGATEWAY_URL", raising=False)
+    calls: list[object] = []
+    monkeypatch.setattr(metrics, "push_to_gateway", lambda *a, **k: calls.append((a, k)))
+
+    assert metrics.push_metrics("reconciliation") is False
+    assert calls == []
+
+
+def test_push_metrics_pushes_the_shared_registry(
+    monkeypatch: pytest.MonkeyPatch, _fresh_config: None
+) -> None:
+    monkeypatch.setenv("VOLTSTREAM__OBSERVABILITY__PUSHGATEWAY_URL", "http://pushgateway:9091")
+    calls: dict[str, object] = {}
+
+    def fake_push(gateway: str, job: str, registry: object, timeout: float) -> None:
+        calls.update(gateway=gateway, job=job, registry=registry, timeout=timeout)
+
+    monkeypatch.setattr(metrics, "push_to_gateway", fake_push)
+
+    assert metrics.push_metrics("reconciliation") is True
+    assert calls == {
+        "gateway": "http://pushgateway:9091",
+        "job": "reconciliation",
+        "registry": metrics.REGISTRY,
+        "timeout": 5.0,
+    }

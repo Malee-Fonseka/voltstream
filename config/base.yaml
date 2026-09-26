@@ -196,3 +196,7 @@ observability:
   metrics_port: 8001
   # Default root log level for logging_setup.py; overridden by VOLTSTREAM_LOG_LEVEL (.env).
   log_level: "INFO"
+  # Pushgateway for one-shot batch containers, which exit before Prometheus could scrape
+  # them (T116, T138). null = do not push. The Pushgateway arrives with Prometheus in
+  # Phase 12 (T142/T143); point this at it then, e.g. "http://pushgateway:9091".
+  pushgateway_url: null

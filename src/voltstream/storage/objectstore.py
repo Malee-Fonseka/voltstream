@@ -94,10 +94,15 @@ def get_client() -> Any:
     plumbed through here. Imported lazily because the Spark image installs `.[spark]`,
     which has no boto3 — the streaming jobs use the path helpers above and never the
     client, and importing boto3 at module scope would break them.
+
+    Path-style addressing, as the reference dropper already uses: MinIO serves buckets at
+    `http://minio:9000/<bucket>`, and a virtual-host request for `<bucket>.minio` does not
+    resolve on the Compose network.
     """
     import boto3
+    from botocore.config import Config
 
-    return boto3.client("s3")
+    return boto3.client("s3", config=Config(s3={"addressing_style": "path"}))
 
 
 def healthcheck() -> bool:
@@ -112,6 +117,13 @@ def healthcheck() -> bool:
     except Exception:  # noqa: BLE001 - any failure means "not ready", and why is logged by the caller
         return False
     return True
+
+
+def get_object_bytes(bucket: str, key: str) -> bytes:
+    """One object's full content. Raises if it is missing: a caller that needs the file
+    has nothing sensible to do without it, and an empty result would read as "empty"."""
+    body: bytes = get_client().get_object(Bucket=bucket, Key=key)["Body"].read()
+    return body
 
 
 def object_exists(bucket: str, key: str) -> bool:

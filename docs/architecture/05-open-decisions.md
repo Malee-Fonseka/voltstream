@@ -630,6 +630,69 @@ Reconciliation and Grafana also lose a stored speed figure.
   nor MinIO reads from the API are required. The only new tariff reader is `reconciliation.py`,
   which already has `objectstore.py`.
 
+### Measured attribution (T140)
+
+**Status: method implemented (T137); no measurement yet.** No simulated day has been
+reconciled on the running stack, so the table below is empty. Fill it from a real run —
+never from the expectations further down.
+
+**Where the numbers come from.** `batch/reconciliation.py` logs every figure below in its
+`reconciliation complete` line: `mean_tariff_effect`, `mean_data_effect`,
+`tariff_share_pct`, `mean_pct_divergence`, `max_pct_divergence` and
+`speed_kwh_shortfall_pct`. The same numbers straight from Postgres:
+
+```sql
+-- Split of the divergence, per day.
+SELECT count(*)                                AS households,
+       round(avg(tariff_effect), 2)            AS mean_tariff_effect,
+       round(avg(data_effect), 2)              AS mean_data_effect,
+       round(100 * sum(abs(tariff_effect))
+             / nullif(sum(abs(tariff_effect)) + sum(abs(data_effect)), 0), 3)
+                                               AS tariff_share_pct,
+       round(avg(pct_divergence), 3)           AS mean_pct_divergence,
+       max(pct_divergence)                     AS max_pct_divergence
+FROM reconciliation_daily
+WHERE sim_date = DATE '<sim_date>';
+
+-- data_effect in kWh terms: the energy the speed layer did not see, as a percentage of
+-- what the batch layer billed. Same sign as T094's gap: positive = speed saw less.
+SELECT round(100 * (sum(b.consumption_kwh) - sum(s.consumption_kwh))
+             / sum(b.consumption_kwh), 3)      AS speed_kwh_shortfall_pct
+FROM household_bill_daily b
+JOIN household_running_rt s ON s.household_id = b.household_id AND s.sim_date = b.sim_date
+WHERE b.sim_date = DATE '<sim_date>';
+```
+
+`tariff_share_pct` uses absolute values because the two effects can have opposite signs for
+the same household and would otherwise cancel.
+
+| sim_date | households | mean `tariff_effect` | mean `data_effect` | tariff share | mean pct | max pct | speed kWh shortfall |
+|---|---|---|---|---|---|---|---|
+| *pending a real run* | | | | | | | |
+
+**Expected result with the code as of 2026-09-26.** Written down before the run, so the
+run confirms or refutes it. Details and evidence are in `docs/debugging-backlog.md`.
+
+- **`tariff_effect` = 0.00 for every household** (backlog R01). The reference dropper's only
+  day-over-day change is `block_2_rate`. No simulated household uses 60 kWh in a day (the
+  measured maximum over a full simulated day is 21.8 kWh), so yesterday's and today's
+  tariffs price every speed-layer total identically. The stale tariff has nothing to change.
+- **`data_effect` positive for almost every household**, at roughly 2 % of the
+  energy-related charges (backlog R02). The speed layer sums the 2 % injected duplicates
+  and the batch layer removes them. `speed_kwh_shortfall_pct` should therefore come out
+  near **−2 %**: the speed layer sees *more* energy than the batch layer, not less.
+- **A small positive contribution on some days.** A meter that drops out in roughly the
+  last simulated hour before midnight flushes its backlog after the 1-day window's state
+  has been evicted, so those readings miss the provisional bill.
+
+**Consequence for T140's acceptance check.** "The `data_effect` share is inside T094's
+band" cannot pass as written. D3's correction already gives the reason: T094's
+0.25 %–5 % band measured a *shortfall* on 15-minute windows, while bills are daily and
+currently show a *surplus* from duplicates. Once R01 and R02 are resolved, the expectation
+reverses to D3's corrected prediction: the stale tariff carries the divergence and
+`data_effect` sits near zero. Re-run and record at that point, and restate the acceptance
+check against the daily grain.
+
 ---
 
 ## D5 — Subsidy and final-bill arithmetic

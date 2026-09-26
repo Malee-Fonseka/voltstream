@@ -16,6 +16,9 @@ from decimal import ROUND_HALF_UP, Decimal
 MONEY = (12, 2)
 KWH = (12, 4)
 PCT = (5, 2)
+# reconciliation_daily.pct_divergence (D5): speed-vs-batch divergence as a percentage of
+# the batch bill's gross charges.
+DIVERGENCE_PCT = (6, 3)
 
 _MONEY_QUANT = Decimal(1).scaleb(-MONEY[1])  # Decimal("0.01")
 _KWH_QUANT = Decimal(1).scaleb(-KWH[1])  # Decimal("0.0001")
