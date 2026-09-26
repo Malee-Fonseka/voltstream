@@ -26,15 +26,11 @@ from pyspark.sql import functions as F
 from pyspark.sql.streaming import StreamingQuery
 
 from voltstream.logging_setup import get_logger
-from voltstream.metrics import (
-    consumer_lag,
-    e2e_latency_seconds,
-    events_consumed_total,
-    start_metrics_server,
-)
+from voltstream.metrics import events_consumed_total, start_metrics_server
 from voltstream.storage.objectstore import raw_root
 from voltstream.streaming.session import build_session, checkpoint_path
-from voltstream.streaming.sources import read_meter_stream
+from voltstream.streaming.sinks import observe_e2e_latency
+from voltstream.streaming.sources import KafkaLagListener, read_meter_stream
 
 _JOB_NAME = "raw_archiver"
 _LAYER = "archiver"
@@ -77,25 +73,11 @@ def _write_batch(batch_df: DataFrame, batch_id: int, *, output_path: str) -> Non
         )
 
         if rows_in:
-            # T030: latency is measured from the Kafka record timestamp — wall clock by
-            # construction. Using event_ts here would report ~288x the real figure and
-            # land every observation in the top bucket.
-            latencies = batch_df.select(
-                F.unix_timestamp(F.current_timestamp()).cast("double")
-                - F.unix_timestamp(F.col("kafka_timestamp")).cast("double")
-            ).collect()
-            for (seconds,) in latencies:
-                if seconds is not None and seconds >= 0:
-                    e2e_latency_seconds.labels(layer=_LAYER).observe(seconds)
-
+            # Per record, after the Parquet write has committed: Kafka to master dataset.
+            # Consumer lag is not set here — KafkaLagListener derives it from the query's
+            # progress, which knows the newest offset in Kafka; a micro-batch does not.
+            observe_e2e_latency(batch_df, "kafka_timestamp", _LAYER)
             events_consumed_total.labels(layer=_LAYER).inc(rows_in)
-
-            for row in (
-                batch_df.groupBy("kafka_partition")
-                .agg(F.max("kafka_offset").alias("max_offset"))
-                .collect()
-            ):
-                consumer_lag.labels(layer=_LAYER, partition=str(row["kafka_partition"])).set(0)
 
         log.info(
             "micro-batch archived",
@@ -119,6 +101,7 @@ def start(await_termination: bool = True) -> StreamingQuery:
 
     spark = build_session(f"voltstream-{_JOB_NAME}")
     spark.sparkContext.setLogLevel("WARN")
+    spark.streams.addListener(KafkaLagListener({_JOB_NAME: _LAYER}))
 
     stream = with_partition_columns(read_meter_stream(spark))
 

@@ -20,10 +20,17 @@ and not handled here.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 
 from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.streaming import StreamingQueryListener
+from pyspark.sql.streaming.listener import (
+    QueryProgressEvent,
+    QueryStartedEvent,
+    QueryTerminatedEvent,
+)
 from pyspark.sql.types import (
     DecimalType,
     DoubleType,
@@ -35,6 +42,7 @@ from pyspark.sql.types import (
 
 from voltstream.config import get_config
 from voltstream.core.validation import REJECTION_REASONS
+from voltstream.metrics import consumer_lag
 
 # D5: kWh precision is (12, 4) everywhere. `voltage` stays a double — §6.2 marks it
 # deliberately unused by billing, so it never enters money arithmetic.
@@ -108,6 +116,82 @@ def read_meter_stream(spark: SparkSession, *, starting_offsets: str = "earliest"
         )
         .select("r.*", *_KAFKA_METADATA_COLUMNS, "kafka_headers")
     )
+
+
+def kafka_lag_by_partition(end_offset: str | None, latest_offset: str | None) -> dict[str, int]:
+    """Per-partition lag of one Kafka source, from a query's progress report.
+
+    Both arguments are offset maps as Spark reports them — `{"meter.readings": {"0": 1234}}`
+    — where `end_offset` is the next offset the query will read and `latest_offset` the
+    next one Kafka will write. The difference is the number of records published but not
+    yet processed. Empty when either side is missing: before a query has fetched anything
+    Spark reports the offsets as the string "None".
+    """
+    try:
+        end = json.loads(end_offset) if end_offset else None
+        latest = json.loads(latest_offset) if latest_offset else None
+    except ValueError:
+        return {}
+    if not isinstance(end, dict) or not isinstance(latest, dict):
+        return {}
+
+    lag: dict[str, int] = {}
+    for topic, newest_by_partition in latest.items():
+        processed = end.get(topic)
+        if not isinstance(newest_by_partition, dict) or not isinstance(processed, dict):
+            continue
+        for partition, newest in newest_by_partition.items():
+            if partition in processed:
+                lag[partition] = max(0, int(newest) - int(processed[partition]))
+    return lag
+
+
+class KafkaLagListener(StreamingQueryListener):
+    """Keeps `voltstream_consumer_lag{layer, partition}` current from query progress.
+
+    Spark's Kafka source assigns partitions itself and commits no offsets to Kafka (see
+    `read_meter_stream`), so `kafka-consumer-groups` has nothing to report for these
+    queries. Their own progress events are where the lag lives: each carries, per source,
+    the offsets the micro-batch ended at and the newest offsets Kafka held.
+
+    A layer can run several queries over the topic — the speed layer runs three — and the
+    gauge reports the worst of them per partition, because "is this branch falling behind"
+    is answered by its slowest query. Progress events arrive one at a time on Spark's
+    listener thread, so the bookkeeping needs no lock.
+    """
+
+    def __init__(self, layer_by_query: dict[str, str]) -> None:
+        super().__init__()
+        self._layer_by_query = dict(layer_by_query)
+        self._lag_by_query: dict[str, dict[str, int]] = {}
+
+    def onQueryStarted(self, event: QueryStartedEvent) -> None:
+        """Nothing to report before the first micro-batch."""
+
+    def onQueryProgress(self, event: QueryProgressEvent) -> None:
+        progress = event.progress
+        query = progress.name  # None for an unnamed query, which is never one of ours
+        layer = self._layer_by_query.get(query) if query is not None else None
+        if query is None or layer is None:
+            return
+
+        lag: dict[str, int] = {}
+        for source in progress.sources:
+            lag.update(kafka_lag_by_partition(source.endOffset, source.latestOffset))
+        if not lag:
+            return
+        self._lag_by_query[query] = lag
+
+        for partition in lag:
+            worst = max(
+                query_lag.get(partition, 0)
+                for query, query_lag in self._lag_by_query.items()
+                if self._layer_by_query[query] == layer
+            )
+            consumer_lag.labels(layer=layer, partition=partition).set(worst)
+
+    def onQueryTerminated(self, event: QueryTerminatedEvent) -> None:
+        """Nothing to do: the job exits with its query, and the scrape target with it."""
 
 
 def trace_id_from_headers(headers_col: str = "kafka_headers") -> Column:

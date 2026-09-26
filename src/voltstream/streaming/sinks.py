@@ -26,7 +26,7 @@ from pyspark.sql import functions as F
 
 from voltstream.config import get_config
 from voltstream.logging_setup import get_logger
-from voltstream.metrics import records_rejected_total
+from voltstream.metrics import e2e_latency_seconds, records_rejected_total
 
 log = get_logger("sinks")
 
@@ -93,6 +93,31 @@ def upsert_batch(
         conn.commit()
 
     return len(rows)
+
+
+def observe_e2e_latency(df: DataFrame, produced_at_col: str, layer: str) -> int:
+    """Observe `voltstream_e2e_latency_seconds{layer}` once per row of `df`: wall-clock
+    now minus the Kafka record timestamp in `produced_at_col`. Returns observations made.
+
+    Call it after the sink has committed, so the figure includes the write. The origin is
+    the Kafka record timestamp (T030), never `event_ts`, which is simulated and would read
+    288 times too large. Casting a timestamp to double keeps its microseconds, where
+    `unix_timestamp()` truncated to whole seconds — below the histogram's first bucket.
+    """
+    latencies = df.select(
+        (F.current_timestamp().cast("double") - F.col(produced_at_col).cast("double")).alias(
+            "seconds"
+        )
+    ).collect()
+
+    observed = 0
+    for (seconds,) in latencies:
+        # Negative only when the producer's clock runs ahead of the driver's. That is not
+        # a latency, so it is dropped rather than clamped to zero.
+        if seconds is not None and seconds >= 0:
+            e2e_latency_seconds.labels(layer=layer).observe(seconds)
+            observed += 1
+    return observed
 
 
 def write_rejected(df: DataFrame, stage: str) -> int:

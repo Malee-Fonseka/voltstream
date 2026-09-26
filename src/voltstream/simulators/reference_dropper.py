@@ -49,11 +49,23 @@ _BLOCK_2_STEP = Decimal("0.50")  # D2/T074: alternate-day step, documented here 
 _POLL_INTERVAL_REAL_SECONDS = 5
 
 _TARIFF_FIELDS = [
-    "household_id", "effective_date", "billing_tier", "subsidy_flag", "subsidy_pct",
-    "fixed_charge", "block_1_rate", "block_2_rate", "block_3_rate", "export_rate",
+    "household_id",
+    "effective_date",
+    "billing_tier",
+    "subsidy_flag",
+    "subsidy_pct",
+    "fixed_charge",
+    "block_1_rate",
+    "block_2_rate",
+    "block_3_rate",
+    "export_rate",
 ]
 _WEATHER_FIELDS = [
-    "grid_zone", "forecast_date", "cloud_cover_pct", "temperature_c", "solar_irradiance_index",
+    "grid_zone",
+    "forecast_date",
+    "cloud_cover_pct",
+    "temperature_c",
+    "solar_irradiance_index",
 ]
 
 

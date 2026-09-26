@@ -1,5 +1,10 @@
 # voltstream — tiers 1 (infrastructure) and 2 (bootstrap) of the stack (§8.2, T043-T047).
 #
+# `name: voltstream` below is mandatory per D7: Compose otherwise derives the project
+# name from the folder holding this file (`docker/`), and the repository folder is not
+# spelled like the package (see D7). This key is what makes every network, volume and
+# container come out `voltstream-*` regardless of where the repository is checked out.
+#
 # Tier 1 (kafka, postgres, minio) has real healthchecks, never a `sleep` (§8.2). Tier 2
 # (the three `-init` services) apply schema/topics/buckets and exit 0; every statement
 # they run is idempotent, because they run again on every `compose up`, not only once.

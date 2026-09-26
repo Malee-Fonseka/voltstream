@@ -8,7 +8,7 @@ for the integration tests.
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -29,6 +29,8 @@ from voltstream.streaming.speed_layer import (
 
 _KWH = DecimalType(12, 4)
 _TS = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+# Wall clock, when the record reached Kafka — unrelated to the simulated _TS on purpose.
+_KAFKA_TS = datetime(2026, 9, 26, 10, 0, 0, tzinfo=UTC)
 
 _READING_SCHEMA = StructType(
     [
@@ -38,6 +40,7 @@ _READING_SCHEMA = StructType(
         StructField("meter_id", StringType()),
         StructField("consumption_kwh", _KWH),
         StructField("solar_generation_kwh", _KWH),
+        StructField("kafka_timestamp", TimestampType()),
     ]
 )
 
@@ -55,8 +58,10 @@ _TARIFF_SCHEMA = StructType(
 )
 
 
-def _reading(zone: str, household: str, meter: str, consumption: str, solar: str, ts=_TS):
-    return (ts, zone, household, meter, Decimal(consumption), Decimal(solar))
+def _reading(
+    zone: str, household: str, meter: str, consumption: str, solar: str, ts=_TS, kafka_ts=_KAFKA_TS
+):
+    return (ts, zone, household, meter, Decimal(consumption), Decimal(solar), kafka_ts)
 
 
 @pytest.fixture(scope="module")
@@ -94,6 +99,22 @@ def test_renewable_ratio_is_solar_over_consumption(zone_rows) -> None:  # type: 
 def test_window_bounds_are_present_and_ordered(zone_rows) -> None:  # type: ignore[no-untyped-def]
     a = zone_rows["ZONE-A"]
     assert a["window_start"] < a["window_end"]
+
+
+def test_each_window_carries_its_newest_kafka_timestamp(spark) -> None:  # type: ignore[no-untyped-def]
+    """R21: the zone sink measures latency from the newest record in each window it
+    writes, so the aggregation has to carry that timestamp through to foreachBatch."""
+    later = _KAFKA_TS + timedelta(seconds=7)
+    df = spark.createDataFrame(
+        [
+            _reading("ZONE-A", "HH-0001", "MTR-0001", "1.0000", "0.0000", kafka_ts=_KAFKA_TS),
+            _reading("ZONE-A", "HH-0002", "MTR-0002", "1.0000", "0.0000", kafka_ts=later),
+        ],
+        schema=_READING_SCHEMA,
+    )
+    [row] = zone_aggregation(df).collect()
+    # collect() returns a naive local-time datetime; compare as epoch seconds.
+    assert row["newest_kafka_ts"].timestamp() == later.timestamp()
 
 
 def test_zero_consumption_zone_does_not_divide_by_zero(spark) -> None:  # type: ignore[no-untyped-def]

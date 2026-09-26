@@ -31,6 +31,7 @@ from prometheus_client import (
 )
 
 from voltstream.config import get_config
+from voltstream.logging_setup import get_logger
 
 # One registry, shared by every metric below and by whichever server exposes them —
 # either start_metrics_server() (non-HTTP services) or the FastAPI instrumentator (API).
@@ -136,9 +137,12 @@ def start_metrics_server(port: int | None = None) -> None:
 def push_metrics(job: str, *, timeout_seconds: float = 5.0) -> bool:
     """Push `REGISTRY` to the Pushgateway, for a process that exits before a scrape.
 
-    Returns False without pushing when `observability.pushgateway_url` is not set. A
-    network failure is raised, not swallowed: whether a missed push matters is the
-    caller's call, not this module's.
+    Returns True once pushed. Returns False without pushing when
+    `observability.pushgateway_url` is not set, and False with a logged warning when the
+    Pushgateway cannot be reached — never raises for that. Every caller is a batch job that
+    pushes after its real output (bills, rollup, reconciliation) is committed, so a
+    monitoring outage must not turn a finished run into a failed DAG task. Anything other
+    than a network failure (`OSError`) is a bug and does propagate.
 
     Only samples that exist are sent. Every labelled metric this process never touched
     has no children and so no samples, which means a job pushes what it set and nothing
@@ -147,5 +151,12 @@ def push_metrics(job: str, *, timeout_seconds: float = 5.0) -> bool:
     url = get_config().observability.pushgateway_url
     if not url:
         return False
-    push_to_gateway(url, job=job, registry=REGISTRY, timeout=timeout_seconds)
+    try:
+        push_to_gateway(url, job=job, registry=REGISTRY, timeout=timeout_seconds)
+    except OSError as exc:  # URLError, HTTP error statuses and timeouts are all OSError
+        get_logger("metrics").warning(
+            "could not push metrics to the Pushgateway",
+            extra={"stage": "metrics", "job": job, "url": url, "detail": str(exc)[:200]},
+        )
+        return False
     return True

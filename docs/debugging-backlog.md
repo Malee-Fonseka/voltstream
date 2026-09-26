@@ -40,14 +40,15 @@ outputs look wrong in predictable ways. Don't debug the symptom in the new code:
 |---|---|
 | `reconciliation_daily.tariff_effect = 0.00` on every row | R01 |
 | `data_effect` ≈ 2 % of energy charge on every row, the reverse of D3's prediction | R02 |
-| Consumer-lag panels flat at 0; T096 impossible to demonstrate | R06 |
 | `billing__<first day − 1>` failed on every cold start; a watchdog built per D6 fires forever | R04 |
-| No batch-duration series in Prometheus/Grafana | R07 |
 | No report file after a DAG run | R08 |
 | API log lines with `trace_id: null`; a `ValueError` traceback per request in `api` logs | R05 |
 | `/bill/delta` effects summing to `−delta` | R09 |
 | `LowRenewableContribution` cannot be forced via cloud cover (T160) | R16 |
-| Latency table (T168) measures Kafka → validation, not Kafka → Postgres | R21 |
+
+R06 (lag), R07 (batch duration) and R21 (latency) were fixed on 2026-09-26, before Phase 12,
+because Phase 12's dashboards and alerts read those metrics directly. Batch pushes only take
+effect once Phase 12 sets `observability.pushgateway_url`.
 
 ---
 
@@ -309,7 +310,7 @@ header, using `TestClient` with default settings (it raises on server errors).
 ---
 
 ### R06 — `voltstream_consumer_lag` is always 0
-- [ ] Fixed
+- [x] Fixed 2026-09-26 — `KafkaLagListener` (`streaming/sources.py`) sets the gauge per partition from each query's progress (`latestOffset − endOffset`); the speed layer reports its slowest of three queries. The hard-coded `set(0)` calls are gone.
 
 **Where:**
 
@@ -338,7 +339,7 @@ stays flat, and the lag falls back after restart.
 ## High
 
 ### R07 — Batch duration never reaches a backend (T116)
-- [ ] Fixed
+- [x] Fixed 2026-09-26 — Pushgateway chosen. `daily_billing` and `daily_zone_rollup` call `metrics.push_metrics()` after committing; a push failure is a logged warning, never a failed run. Pushes are no-ops until `observability.pushgateway_url` is set in Phase 12.
 
 **Where:**
 
@@ -410,7 +411,7 @@ reconciliation) to the app image.
 ---
 
 ### R10 — `ruff format --check` fails
-- [ ] Fixed
+- [x] Fixed 2026-09-26 — `ruff format` applied repo-wide; `net()`'s docstring gained a prose line so the formula block keeps its indent.
 
 12 files: `core/netting.py`, `core/tariff.py`, `logging_setup.py`, `metrics.py`,
 `simulators/reference_dropper.py`, `tests/consistency/test_pure_vs_spark.py`,
@@ -426,7 +427,7 @@ formula block inside them.
 ---
 
 ### R11 — `mypy src` fails
-- [ ] Fixed
+- [x] Fixed 2026-09-26 — `.venv` now has the full CI set (`.[dev,api,sim,spark]`); unused `hypothesis.*` override removed. `mypy src` is clean.
 
 `src/voltstream/storage/postgres.py:26: Cannot find implementation or library stub for module named "psycopg_pool"`
 
@@ -438,7 +439,7 @@ The `.venv` predates the `pool` extra.
 ---
 
 ### R12 — Bare `pytest` cannot import `scripts`
-- [ ] Fixed
+- [x] Fixed 2026-09-26 — `pythonpath = ["."]` in `[tool.pytest.ini_options]`; bare `pytest` collects everything.
 
 [`tests/unit/test_contracts.py:16`](../tests/unit/test_contracts.py#L16) imports
 `scripts.export_schemas`. `python -m pytest` works because it puts the working directory
@@ -450,7 +451,7 @@ list into the package (e.g. `voltstream.contracts.MODELS`).
 ---
 
 ### R13 — Pre-commit D7 hook fails
-- [ ] Fixed
+- [x] Fixed 2026-09-26 — The hook now skips comment lines, as `make lint` does, and the compose comment is restored without the misspelling. `pre-commit run --all-files` passes except the end-of-file fix on `docs/report/main.tex`, left for its owner to avoid a merge conflict.
 
 The `no-volstream-misspelling` pygrep hook matches the explanatory comment at
 [`docker/docker-compose.yml:5`](../docker/docker-compose.yml#L5). `make lint` excludes
@@ -573,7 +574,7 @@ partition. Re-record the evidence.
 ---
 
 ### R21 — E2E latency measured at the wrong point (T081/T092/T168)
-- [ ] Fixed
+- [x] Fixed 2026-09-26 — `sinks.observe_e2e_latency()` casts to double (microseconds). The speed layer observes at the zone sink after the upsert, per window written (the aggregation carries `newest_kafka_ts`); the validation query no longer observes. **Reset `speed_checkpoints` (`make clean`) before the next run: the zone query's state schema changed.**
 
 **Where:**
 

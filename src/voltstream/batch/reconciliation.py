@@ -288,22 +288,6 @@ def summarise(day: DayReconciliation) -> DaySummary:
 # --------------------------------------------------------------------------------------
 
 
-def _push_gauge(sim_date: date) -> bool:
-    """Push the gauge, or say why not. Never fails the run.
-
-    `reconciliation_daily` is the record; the gauge is a notification about it. A missed
-    push is worth a warning, not a failed DAG task that would also skip the day's report.
-    """
-    try:
-        return push_metrics(_JOB)
-    except Exception as exc:  # noqa: BLE001 - any push failure is non-fatal, see above
-        log.warning(
-            "could not push voltstream_lambda_divergence",
-            extra={"stage": "reconcile", "sim_date": sim_date.isoformat(), "detail": str(exc)},
-        )
-        return False
-
-
 def run(sim_date: date) -> DaySummary:
     """Reconcile one simulated day. Returns the day's summary."""
     started = time.monotonic()
@@ -361,8 +345,10 @@ def run(sim_date: date) -> DaySummary:
 
     # T138. One label-less gauge (§10.1), on the mean percentage, which is what
     # alerts.lambda_divergence_threshold_pct is compared against (D5). The max is logged.
+    # A failed push is a logged warning, not a failed run: reconciliation_daily is the
+    # record, and the gauge is a notification about it.
     lambda_divergence.set(float(summary.mean_pct_divergence))
-    pushed = _push_gauge(sim_date)
+    pushed = push_metrics(_JOB)
 
     log.info(
         "reconciliation complete",

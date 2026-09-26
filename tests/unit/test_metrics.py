@@ -36,7 +36,11 @@ def test_all_eight_metric_names_present() -> None:
 def test_no_unexpected_metrics_on_the_registry() -> None:
     text = _exposition_text()
     declared_names = {line.split()[2] for line in text.splitlines() if line.startswith("# TYPE ")}
-    assert declared_names == _EXPECTED_NAMES
+    # Once any counter or histogram has a child, prometheus_client also exposes a
+    # "<name>_created" gauge family for it. That is exposition detail, not a metric this
+    # module defines — and whether it is present depends on which tests ran first.
+    defined_names = {name for name in declared_names if not name.endswith("_created")}
+    assert defined_names == _EXPECTED_NAMES
 
 
 def test_label_sets_match_the_spec() -> None:
@@ -134,3 +138,33 @@ def test_push_metrics_pushes_the_shared_registry(
         "registry": metrics.REGISTRY,
         "timeout": 5.0,
     }
+
+
+def test_push_metrics_survives_an_unreachable_pushgateway(
+    monkeypatch: pytest.MonkeyPatch, _fresh_config: None
+) -> None:
+    """R07: every caller has already committed its real output; a monitoring outage must
+    not turn that into a failed DAG task."""
+    monkeypatch.setenv("VOLTSTREAM__OBSERVABILITY__PUSHGATEWAY_URL", "http://pushgateway:9091")
+
+    def unreachable(*args: object, **kwargs: object) -> None:
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(metrics, "push_to_gateway", unreachable)
+
+    assert metrics.push_metrics("daily_billing") is False
+
+
+def test_push_metrics_does_not_hide_a_bug(
+    monkeypatch: pytest.MonkeyPatch, _fresh_config: None
+) -> None:
+    """Only network failures are swallowed; anything else is a defect and propagates."""
+    monkeypatch.setenv("VOLTSTREAM__OBSERVABILITY__PUSHGATEWAY_URL", "http://pushgateway:9091")
+
+    def broken(*args: object, **kwargs: object) -> None:
+        raise TypeError("not a network problem")
+
+    monkeypatch.setattr(metrics, "push_to_gateway", broken)
+
+    with pytest.raises(TypeError):
+        metrics.push_metrics("daily_billing")

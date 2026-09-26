@@ -36,7 +36,7 @@ from voltstream.batch.daily_billing import (
 )
 from voltstream.core.spark_expr import netting_expr
 from voltstream.logging_setup import get_logger
-from voltstream.metrics import batch_duration_seconds
+from voltstream.metrics import batch_duration_seconds, push_metrics
 from voltstream.streaming.session import build_session
 from voltstream.streaming.sinks import pg_connection_string
 from voltstream.streaming.sources import split_valid_invalid
@@ -212,6 +212,8 @@ def run(sim_date: date) -> int:
 
         duration = time.monotonic() - started
         batch_duration_seconds.labels(job=_JOB).observe(duration)
+        # T116 / R07: a one-shot container cannot be scraped, so the duration is pushed.
+        pushed = push_metrics(_JOB)
         log.info(
             "zone rollup complete",
             extra={
@@ -221,6 +223,7 @@ def run(sim_date: date) -> int:
                 "rows_out": written,
                 "zone_total_kwh": str(zone_total),
                 "duration_seconds": round(duration, 2),
+                "metrics_pushed": pushed,
             },
         )
         return written

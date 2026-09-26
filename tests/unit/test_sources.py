@@ -10,11 +10,18 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
 from voltstream.core.validation import REJECTION_REASONS
-from voltstream.streaming.sources import METER_READING_SCHEMA, split_valid_invalid
+from voltstream.streaming import sources
+from voltstream.streaming.sources import (
+    METER_READING_SCHEMA,
+    KafkaLagListener,
+    kafka_lag_by_partition,
+    split_valid_invalid,
+)
 
 _KNOWN_HOUSEHOLDS = frozenset({"HH-0001", "HH-0002"})
 _ZONES = frozenset({"ZONE-A", "ZONE-B"})
@@ -155,3 +162,61 @@ def test_split_works_on_a_pruned_frame(spark) -> None:  # type: ignore[no-untype
     # The payload holds what was read, and says so rather than failing.
     assert "meter_id" in rejected[0]["payload"]
     assert "schema_version" not in rejected[0]["payload"]
+
+
+# ---------------------------------------------------------------------------
+# Consumer lag (R06): from query progress, not from the micro-batch.
+# ---------------------------------------------------------------------------
+
+
+def test_kafka_lag_is_newest_minus_processed_per_partition() -> None:
+    end = '{"meter.readings": {"0": 100, "1": 250, "2": 7}}'
+    latest = '{"meter.readings": {"0": 130, "1": 250, "2": 9}}'
+    assert kafka_lag_by_partition(end, latest) == {"0": 30, "1": 0, "2": 2}
+
+
+@pytest.mark.parametrize(
+    "end,latest",
+    [
+        # Spark reports a missing offset map as the string "None" (str() of a Java null).
+        ("None", '{"t": {"0": 1}}'),
+        ('{"t": {"0": 1}}', "None"),
+        (None, None),
+        ("", ""),
+    ],
+)
+def test_kafka_lag_is_empty_until_both_offsets_exist(end: str | None, latest: str | None) -> None:
+    assert kafka_lag_by_partition(end, latest) == {}
+
+
+def _progress(query: str, end: str, latest: str) -> SimpleNamespace:
+    """The shape of a QueryProgressEvent, as far as the listener reads it."""
+    source = SimpleNamespace(endOffset=end, latestOffset=latest)
+    return SimpleNamespace(progress=SimpleNamespace(name=query, sources=[source]))
+
+
+def _lag_gauge(layer: str, partition: str) -> float | None:
+    for metric in sources.consumer_lag.collect():
+        for sample in metric.samples:
+            if sample.labels == {"layer": layer, "partition": partition}:
+                return float(sample.value)
+    return None
+
+
+def test_listener_reports_the_slowest_query_of_a_layer() -> None:
+    """The speed layer runs three queries over the topic; the gauge is the worst of them."""
+    listener = KafkaLagListener({"fast": "lagtest", "slow": "lagtest"})
+
+    listener.onQueryProgress(_progress("fast", '{"t": {"0": 90}}', '{"t": {"0": 100}}'))
+    listener.onQueryProgress(_progress("slow", '{"t": {"0": 40}}', '{"t": {"0": 100}}'))
+    assert _lag_gauge("lagtest", "0") == 60
+
+    # The slow query catches up; the gauge now follows the other one.
+    listener.onQueryProgress(_progress("slow", '{"t": {"0": 100}}', '{"t": {"0": 100}}'))
+    assert _lag_gauge("lagtest", "0") == 10
+
+
+def test_listener_ignores_queries_it_was_not_given() -> None:
+    listener = KafkaLagListener({"mine": "lagtest-ignored"})
+    listener.onQueryProgress(_progress("not-mine", '{"t": {"0": 0}}', '{"t": {"0": 5}}'))
+    assert _lag_gauge("lagtest-ignored", "0") is None

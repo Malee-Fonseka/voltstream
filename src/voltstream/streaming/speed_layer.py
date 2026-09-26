@@ -43,21 +43,23 @@ from voltstream.config import get_config
 from voltstream.core.spark_expr import compute_bill_expr
 from voltstream.core.tariff import BlockBoundary
 from voltstream.logging_setup import get_logger
-from voltstream.metrics import (
-    consumer_lag,
-    e2e_latency_seconds,
-    events_consumed_total,
-    start_metrics_server,
-    zone_renewable_ratio,
-)
+from voltstream.metrics import events_consumed_total, start_metrics_server, zone_renewable_ratio
 from voltstream.storage.objectstore import landing_tariff_path
 from voltstream.streaming.session import build_session, checkpoint_path
-from voltstream.streaming.sinks import upsert_batch, write_rejected
-from voltstream.streaming.sources import read_meter_stream, split_valid_invalid
+from voltstream.streaming.sinks import observe_e2e_latency, upsert_batch, write_rejected
+from voltstream.streaming.sources import (
+    KafkaLagListener,
+    read_meter_stream,
+    split_valid_invalid,
+)
 
 _LAYER = "speed"
 _ZONE_JOB = "speed_layer_zone"
 _HOUSEHOLD_JOB = "speed_layer_household"
+_VALIDATION_JOB = "speed_layer_validation"
+
+# Carried through the zone aggregation for the latency metric only; not a table column.
+_NEWEST_KAFKA_TS = "newest_kafka_ts"
 
 log = get_logger("speed-layer")
 
@@ -117,6 +119,14 @@ def zone_aggregation(valid_df: DataFrame) -> DataFrame:
             # a HyperLogLog estimate. collect_set is exact, and its state is bounded by
             # the meters in one zone in one window.
             F.size(F.collect_set("meter_id")).alias("active_meters"),
+            # For the latency metric (R21). In update mode a window is emitted only when a
+            # record in this micro-batch touched it, so its newest Kafka timestamp always
+            # belongs to this micro-batch.
+            #
+            # Adding or removing an aggregate here changes the query's state schema, and
+            # Spark then refuses to resume from the old checkpoint: reset the
+            # speed_checkpoints volume (`make clean`) after any such change.
+            F.max("kafka_timestamp").alias(_NEWEST_KAFKA_TS),
         )
         .select(
             F.col("grid_zone"),
@@ -147,6 +157,7 @@ def zone_aggregation(valid_df: DataFrame) -> DataFrame:
             .otherwise(F.lit(0).cast(_RATIO))
             .alias("renewable_ratio"),
             F.col("active_meters"),
+            F.col(_NEWEST_KAFKA_TS),
         )
     )
 
@@ -155,8 +166,17 @@ def _write_zone_batch(batch_df: DataFrame, batch_id: int) -> None:
     batch_df.persist()
     try:
         written = upsert_batch(
-            batch_df, "zone_metrics_rt", conflict_cols=("grid_zone", "window_start")
+            batch_df.drop(_NEWEST_KAFKA_TS),
+            "zone_metrics_rt",
+            conflict_cols=("grid_zone", "window_start"),
         )
+
+        # R21: e2e latency for the speed layer is measured here, once the zone view has
+        # committed — it is the view the dashboard reads, so "visible in Postgres" is the
+        # end of the path (§2.5's < 60 s). One observation per window written: now minus
+        # the newest record in that window. At 288x a trigger spans about three windows,
+        # so a batch's observations spread across the interval its records waited for it.
+        observe_e2e_latency(batch_df, _NEWEST_KAFKA_TS, _LAYER)
 
         # T092: the gauge is set from the same value written to Postgres. Computing it
         # separately would let the dashboard and the LowRenewableContribution alert
@@ -358,15 +378,9 @@ def _write_validation_batch(
         rows_rejected = write_rejected(invalid_df, _LAYER)
         rows_out = rows_in - rows_rejected
 
+        # Latency is observed at the zone sink, and consumer lag by KafkaLagListener —
+        # this query writes neither view, so neither belongs here.
         events_consumed_total.labels(layer=_LAYER).inc(rows_in)
-        for (seconds,) in batch_df.select(
-            F.unix_timestamp(F.current_timestamp()).cast("double")
-            - F.unix_timestamp(F.col("kafka_timestamp")).cast("double")
-        ).collect():
-            if seconds is not None and seconds >= 0:
-                e2e_latency_seconds.labels(layer=_LAYER).observe(seconds)
-        for row in batch_df.groupBy("kafka_partition").count().collect():
-            consumer_lag.labels(layer=_LAYER, partition=str(row["kafka_partition"])).set(0)
 
         # rows_in == rows_out + rows_rejected, by construction. Logged so the identity is
         # checkable from the logs rather than taken on trust.
@@ -393,6 +407,10 @@ def start(await_termination: bool = True) -> list[StreamingQuery]:
     config = get_config()
     spark = build_session("voltstream-speed-layer")
     spark.sparkContext.setLogLevel("WARN")
+    # All three queries read the topic; the gauge reports the slowest per partition.
+    spark.streams.addListener(
+        KafkaLagListener({q: _LAYER for q in (_ZONE_JOB, _HOUSEHOLD_JOB, _VALIDATION_JOB)})
+    )
 
     known_households = _known_household_ids(spark)
     # event_ts is simulated time; the plausible range is generous because the simulated
@@ -446,9 +464,9 @@ def start(await_termination: bool = True) -> list[StreamingQuery]:
     # neither of them ever sees a rejected record to dead-letter.
     validation_query = (
         read_meter_stream(spark)
-        .writeStream.queryName("speed_layer_validation")
+        .writeStream.queryName(_VALIDATION_JOB)
         .outputMode("append")
-        .option("checkpointLocation", checkpoint_path("speed_layer_validation"))
+        .option("checkpointLocation", checkpoint_path(_VALIDATION_JOB))
         .trigger(processingTime=trigger)
         .foreachBatch(
             lambda df, bid: _write_validation_batch(

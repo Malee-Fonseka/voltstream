@@ -1425,7 +1425,7 @@ at once — ingestion robustness (15), processing correctness (15), and observab
 
 **The reconciliation metric is the standout addition.** After each batch run, emit
 `abs(speed_estimate − batch_final)` per household as a Prometheus gauge and alert
-above a threshold. This is a system that **monitors its own Lambda divergence** — 
+above a threshold. This is a system that **monitors its own Lambda divergence** —
 roughly forty lines of code, and the thing an examiner will remember.
 
 **Exit criteria:**

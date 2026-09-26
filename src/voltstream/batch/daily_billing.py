@@ -40,7 +40,7 @@ from voltstream.config import get_config
 from voltstream.core.spark_expr import compute_bill_expr
 from voltstream.core.tariff import BlockBoundary
 from voltstream.logging_setup import get_logger
-from voltstream.metrics import batch_duration_seconds
+from voltstream.metrics import batch_duration_seconds, push_metrics
 from voltstream.storage.objectstore import archive_tariff_path, landing_tariff_path, raw_root
 from voltstream.streaming.session import build_session
 from voltstream.streaming.sinks import pg_connection_string, write_rejected
@@ -412,6 +412,10 @@ def run(sim_date: date) -> int:
 
         duration = time.monotonic() - started
         batch_duration_seconds.labels(job=_JOB).observe(duration)
+        # T116 / R07: this container exits in seconds, before any scrape, so the duration
+        # (and this run's batch-stage reject counts) are pushed. After finalise(): the bills
+        # are committed whether or not the push lands.
+        pushed = push_metrics(_JOB)
         log.info(
             "billing run complete",
             extra={
@@ -422,6 +426,7 @@ def run(sim_date: date) -> int:
                 "rows_out": written,
                 "rows_rejected": rejected,
                 "duration_seconds": round(duration, 2),
+                "metrics_pushed": pushed,
             },
         )
         return written
