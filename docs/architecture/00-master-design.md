@@ -840,6 +840,7 @@ voltstream-landing/                   ← daily drops (as received)
 
 voltstream-archive/                   ← processed reference, immutable
   tariff/  sim_date=2026-08-10/tariff.parquet
+  reports/ report_2026-08-10.md       ← daily report (T131); a restatement replaces it
 
 voltstream-checkpoints/               ← Spark checkpoints (see §8.5)
   speed_layer/

@@ -37,6 +37,7 @@ from pyspark.sql.types import DecimalType, StringType, StructField, StructType
 from pyspark.sql.window import Window
 
 from voltstream.config import get_config
+from voltstream.core.keys import DEDUP_COLUMNS
 from voltstream.core.spark_expr import compute_bill_expr
 from voltstream.core.tariff import BlockBoundary
 from voltstream.logging_setup import get_logger
@@ -144,7 +145,7 @@ def deduplicate(df: DataFrame) -> DataFrame:
     earliest `ingest_ts` wins, so the surviving row is the one that arrived first rather
     than an arbitrary one, which keeps the choice deterministic across reruns.
     """
-    ordering = Window.partitionBy("meter_id", "event_ts").orderBy(F.col("ingest_ts").asc())
+    ordering = Window.partitionBy(*DEDUP_COLUMNS).orderBy(F.col("ingest_ts").asc())
     return (
         df.withColumn("_rank", F.row_number().over(ordering))
         .filter(F.col("_rank") == 1)
@@ -392,9 +393,7 @@ def run(sim_date: date) -> int:
         # Duplicates are counted per household from the pre-dedup frame, so the column
         # reports what this day actually contained rather than a global figure.
         dupes = raw.groupBy("household_id").agg(
-            (F.count("*") - F.countDistinct("meter_id", "event_ts"))
-            .cast("int")
-            .alias("duplicates_removed")
+            (F.count("*") - F.countDistinct(*DEDUP_COLUMNS)).cast("int").alias("duplicates_removed")
         )
         totals = totals.join(dupes, on="household_id", how="left").fillna({"duplicates_removed": 0})
 

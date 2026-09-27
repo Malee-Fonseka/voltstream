@@ -164,6 +164,15 @@ async function refreshZones() {
     const newest = zones.map((z) => z.window_end).sort().pop();
     $("clock").textContent = `newest window ${newest ?? "—"} (simulated)`;
     $("zones").classList.remove("stale");
+    // Default the date box to the newest simulated day the speed layer has seen, so the
+    // page is useful without the operator knowing what "today" is in simulated time.
+    // Checked on every poll, not once at load: a page opened straight after `run` loads
+    // before the speed layer's first window exists, and a one-off attempt left the box
+    // empty for good, so the bill panel never asked for anything.
+    if (!$("day").value) {
+      const newestStart = zones.map((z) => z.window_start).sort().pop();
+      if (newestStart) $("day").value = newestStart.slice(0, 10);
+    }
   } catch (err) {
     // Keep the last good values on screen but mark them stale, rather than blanking the
     // page on one failed poll — a dashboard that clears itself on a blip is worse than
@@ -195,7 +204,16 @@ function paintBadge(source, provisional) {
 async function refreshBill() {
   const hh = $("hh").value.trim();
   const day = $("day").value;
-  if (!hh || !day) return;
+  if (!hh || !day) {
+    // Say why the panel is empty rather than leaving it blank.
+    paintBadge(null, undefined);
+    $("total").textContent = "—";
+    $("tariffNote").textContent = !hh
+      ? "enter a household id"
+      : "waiting for the speed layer's first window — or pick a date";
+    $("breakdown").innerHTML = "";
+    return;
+  }
   try {
     const bill = await getJSON(
       `/api/v1/households/${encodeURIComponent(hh)}/bill?date=${day}`);
@@ -225,16 +243,11 @@ async function refreshBill() {
   }
 }
 
-function tick() { refreshZones(); refreshBill(); }
+// Zones first: that poll is what fills an empty date box, and the bill needs the date.
+// refreshZones never throws, so the bill is refreshed even when the zone poll fails.
+async function tick() { await refreshZones(); refreshBill(); }
 
-// Default the date box to the newest simulated day the speed layer has seen, so the page
-// is useful on load without the operator knowing what "today" is in simulated time.
-(async function init() {
-  try {
-    const zones = await getJSON("/api/v1/zones/load");
-    const newest = zones.map((z) => z.window_start).sort().pop();
-    if (newest) $("day").value = newest.slice(0, 10);
-  } catch { /* leave the field empty; the user can pick a date */ }
+(function init() {
   tick();
   setInterval(tick, POLL_MS);
   $("hh").addEventListener("change", refreshBill);

@@ -34,6 +34,7 @@ if TYPE_CHECKING:  # pragma: no cover - import only for typing
 _RAW_PREFIX = "meter_readings"
 _TARIFF_PREFIX = "tariff"
 _WEATHER_PREFIX = "weather"
+_REPORT_PREFIX = "reports"
 
 
 # --------------------------------------------------------------------------------------
@@ -81,6 +82,11 @@ def archive_tariff_path(sim_date: date) -> str:
     return f"s3a://{get_config().minio.bucket_archive}/{_TARIFF_PREFIX}/sim_date={sim_date.isoformat()}"
 
 
+def report_key(sim_date: date) -> str:
+    """Key of the day's Markdown report within the archive bucket (T131, R08)."""
+    return f"{_REPORT_PREFIX}/report_{sim_date.isoformat()}.md"
+
+
 # --------------------------------------------------------------------------------------
 # Client
 # --------------------------------------------------------------------------------------
@@ -124,6 +130,11 @@ def get_object_bytes(bucket: str, key: str) -> bytes:
     has nothing sensible to do without it, and an empty result would read as "empty"."""
     body: bytes = get_client().get_object(Bucket=bucket, Key=key)["Body"].read()
     return body
+
+
+def put_object_bytes(bucket: str, key: str, data: bytes, content_type: str) -> None:
+    """Write one object, replacing any previous version of it."""
+    get_client().put_object(Bucket=bucket, Key=key, Body=data, ContentType=content_type)
 
 
 def object_exists(bucket: str, key: str) -> bool:

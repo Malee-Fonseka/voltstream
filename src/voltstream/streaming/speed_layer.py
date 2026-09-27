@@ -19,6 +19,10 @@ minutes is 6.25 real seconds at TIME_SCALE 288; the 10-**real**-second trigger i
 simulated minutes, which is the larger of the two. At this time compression the trigger,
 not the watermark, dominates what gets dropped — see D3 and `docs/assumptions.md`.
 
+Both queries read the stream through `deduplicated()`: one watermark, and the batch
+layer's dedup key, applied before any aggregation (R02). The provisional figures therefore
+count each reading once, and drop the stragglers the watermark rules out.
+
 The provisional bill is deliberately stale and deliberately labelled. It applies
 yesterday's tariff because today's does not exist until the day closes (§3.1), and every
 row records `tariff_source_date` so the staleness is visible rather than implied. The
@@ -40,6 +44,7 @@ from pyspark.sql.streaming import StreamingQuery
 from pyspark.sql.types import DecimalType
 
 from voltstream.config import get_config
+from voltstream.core.keys import DEDUP_COLUMNS
 from voltstream.core.spark_expr import compute_bill_expr
 from voltstream.core.tariff import BlockBoundary
 from voltstream.logging_setup import get_logger
@@ -101,15 +106,45 @@ def _window_sim_minutes() -> str:
 # --------------------------------------------------------------------------------------
 
 
+def deduplicated(valid_df: DataFrame) -> DataFrame:
+    """Watermark on `event_ts`, then drop repeated readings (R02). Both aggregations read
+    this, never the raw valid stream.
+
+    The watermark string is SIMULATED minutes: it is applied to `event_ts`, which advances
+    at TIME_SCALE relative to the wall clock.
+
+    The key is `core.keys.DEDUP_COLUMNS`, the batch layer's key, so the two layers agree on
+    what a duplicate is. Without this the speed layer summed the 2 % injected duplicates
+    that the batch layer removes, and every provisional figure ran about 2 % high.
+
+    Streaming dedup also drops records older than the watermark ("to avoid any possibility
+    of duplicates", in Spark's words). That is the speed layer's documented trade (§5.3,
+    "drop stragglers") applied before aggregation:
+
+    - Network reordering (under 30 simulated minutes, D3) is not dropped. The producer
+      sends a reordered record with its own tick, and a micro-batch's watermark is the
+      newest tick of the batch before it minus 30 simulated minutes, so it trails the
+      record's tick by at least the watermark (by 39.6 unless the tick straddles two
+      batches). That holds while delivery keeps up with the 2-real-second tick; a
+      producer stalled for longer can still lose some.
+    - Store-and-forward backfill is dropped once it is older than the watermark, so the
+      daily provisional totals now miss part of each meter's backlog. The batch layer
+      rescans a closed day and sees all of it. That gap is the `data_effect` D4 attributes
+      and T094 measures.
+    """
+    return valid_df.withWatermark("event_ts", _watermark_sim_minutes()).dropDuplicates(
+        list(DEDUP_COLUMNS)
+    )
+
+
 def zone_aggregation(valid_df: DataFrame) -> DataFrame:
     """Windowed per-zone load and renewable contribution.
 
-    The watermark and window strings are SIMULATED minutes: they are applied to
-    `event_ts`, which advances at TIME_SCALE relative to the wall clock.
+    Expects `deduplicated()` output: that is where the watermark is set. The window string
+    is SIMULATED minutes, like the watermark.
     """
     return (
-        valid_df.withWatermark("event_ts", _watermark_sim_minutes())
-        .groupBy(F.window(F.col("event_ts"), _window_sim_minutes()), F.col("grid_zone"))
+        valid_df.groupBy(F.window(F.col("event_ts"), _window_sim_minutes()), F.col("grid_zone"))
         .agg(
             F.sum("consumption_kwh").cast(_KWH).alias("total_consumption_kwh"),
             F.sum("solar_generation_kwh").cast(_KWH).alias("total_solar_kwh"),
@@ -209,10 +244,11 @@ def household_aggregation(valid_df: DataFrame) -> DataFrame:
     window carries an end, so the watermark can evict the previous day's keys shortly
     after simulated midnight. A derived date column has no end and its state would grow
     without bound for the life of the query.
+
+    Expects `deduplicated()` output: that is where the watermark is set.
     """
     return (
-        valid_df.withWatermark("event_ts", _watermark_sim_minutes())
-        .groupBy(F.window(F.col("event_ts"), "1 day"), F.col("household_id"))
+        valid_df.groupBy(F.window(F.col("event_ts"), "1 day"), F.col("household_id"))
         .agg(
             F.sum("consumption_kwh").cast(_KWH).alias("consumption_kwh"),
             F.sum("solar_generation_kwh").cast(_KWH).alias("solar_kwh"),
@@ -434,7 +470,9 @@ def start(await_termination: bool = True) -> list[StreamingQuery]:
             known_household_ids=known_households,
             event_ts_bounds=bounds,
         )
-        return valid
+        # Watermarked and deduplicated once here, so both aggregations see the same
+        # records the batch layer would bill (R02).
+        return deduplicated(valid)
 
     trigger = f"{config.speed_layer.trigger_interval_real_seconds} seconds"
     output_mode = config.speed_layer.output_mode

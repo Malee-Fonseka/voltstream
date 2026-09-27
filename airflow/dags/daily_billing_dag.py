@@ -271,9 +271,13 @@ with DAG(
     # the run ledger.
     # Generated rather than served on request: the brief's deliverable is a report that
     # exists, not an endpoint someone has to know to call.
+    #
+    # Published to voltstream-archive/reports/ (R08). This container is removed as soon as
+    # it exits, so a file on its own disk would vanish with it. On the app image, per D6:
+    # it needs Postgres and the S3 client, not Spark.
     generate_report = DockerOperator(
         task_id="generate_report",
-        image=os.environ.get("VOLTSTREAM_SPARK_IMAGE", "voltstream-spark:local"),
+        image=os.environ.get("VOLTSTREAM_APP_IMAGE", "voltstream-app:local"),
         docker_url="tcp://docker-socket-proxy:2375",
         network_mode=os.environ.get("VOLTSTREAM_NETWORK", "voltstream"),
         mount_tmp_dir=False,
@@ -290,10 +294,14 @@ with DAG(
             "VOLTSTREAM_ENV": "docker",
             "VOLTSTREAM_CONFIG_DIR": "/app/config",
             "VOLTSTREAM__POSTGRES__HOST": "postgres",
-            "VOLTSTREAM_REPORT_DIR": "/var/lib/voltstream/reports",
+            "VOLTSTREAM__SIMULATION__ANCHOR_REAL": os.environ.get("VOLTSTREAM_ANCHOR_REAL", ""),
+            "AWS_ENDPOINT_URL": "http://minio:9000",
+            "AWS_DEFAULT_REGION": "us-east-1",
         },
         private_environment={
             "VOLTSTREAM__POSTGRES__PASSWORD": os.environ.get("POSTGRES_PASSWORD", "voltstream"),
+            "AWS_ACCESS_KEY_ID": os.environ.get("MINIO_ROOT_USER", "voltstream"),
+            "AWS_SECRET_ACCESS_KEY": os.environ.get("MINIO_ROOT_PASSWORD", "voltstream-dev"),
         },
         retries=1,
     )

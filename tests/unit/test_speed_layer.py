@@ -22,6 +22,7 @@ from pyspark.sql.types import (
 )
 
 from voltstream.streaming.speed_layer import (
+    deduplicated,
     household_aggregation,
     with_provisional_bill,
     zone_aggregation,
@@ -232,3 +233,43 @@ def test_surplus_solar_saturates_the_ratio(spark) -> None:  # type: ignore[no-un
     assert row["renewable_ratio"] == Decimal("1.0000")
     # The surplus is still recoverable: both raw totals are kept on the same row.
     assert row["total_solar_kwh"] > row["total_consumption_kwh"]
+
+
+# ---------------------------------------------------------------------------
+# R02: the speed layer counts each reading once, on the batch layer's key.
+# ---------------------------------------------------------------------------
+
+
+def test_duplicates_collapse_on_the_batch_layers_key(spark) -> None:  # type: ignore[no-untyped-def]
+    """Same (meter_id, event_ts) is one reading, whatever else differs about the copy;
+    a different meter or a different instant is a different reading."""
+    later = _TS.replace(minute=10)
+    df = spark.createDataFrame(
+        [
+            _reading("ZONE-A", "HH-0001", "MTR-0001", "2.0000", "0.0000"),
+            _reading("ZONE-A", "HH-0001", "MTR-0001", "2.0000", "0.0000"),  # re-sent
+            _reading("ZONE-A", "HH-0002", "MTR-0002", "2.0000", "0.0000"),  # other meter
+            _reading("ZONE-A", "HH-0001", "MTR-0001", "2.0000", "0.0000", ts=later),
+        ],
+        schema=_READING_SCHEMA,
+    )
+    assert deduplicated(df).count() == 3
+
+
+def test_zone_and_household_totals_do_not_double_count_a_resent_reading(spark) -> None:  # type: ignore[no-untyped-def]
+    """Before R02 both views summed the injected duplicates the batch layer removes, so
+    every provisional figure ran about 2 % high."""
+    df = deduplicated(
+        spark.createDataFrame(
+            [
+                _reading("ZONE-B", "HH-0003", "MTR-0003", "1.5000", "0.5000"),
+                _reading("ZONE-B", "HH-0003", "MTR-0003", "1.5000", "0.5000"),  # re-sent
+            ],
+            schema=_READING_SCHEMA,
+        )
+    )
+    [zone] = zone_aggregation(df).collect()
+    [household] = household_aggregation(df).collect()
+    assert zone["total_consumption_kwh"] == Decimal("1.5000")
+    assert zone["total_solar_kwh"] == Decimal("0.5000")
+    assert household["consumption_kwh"] == Decimal("1.5000")

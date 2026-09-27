@@ -671,12 +671,14 @@ function Invoke-Check {
         Write-Check 'INFO' 'daily_billing runs' $counts
         if ($byState.ContainsKey('failed')) {
             foreach ($runId in $byState['failed']) {
-                if ($runId -eq "billing__$SeedDay") {
-                    Write-Check 'WARN' $runId 'failed as expected: the day-zero seed tariff has no readings (backlog R04)'
-                } else {
-                    Write-Check 'FAIL' $runId 'failed - open it in Airflow to see which task'
-                }
+                # Since R04 the watcher never offers a day without readings, so a failed
+                # run for the seed day is a regression, not an expected artefact.
+                $hint = if ($runId -eq "billing__$SeedDay") { ' (the seed day should never be billed - R04 regressed)' } else { '' }
+                Write-Check 'FAIL' $runId "failed - open it in Airflow to see which task$hint"
             }
+        }
+        if (-not ($runs.Rows -match "^billing__$SeedDay\|")) {
+            Write-Check 'PASS' 'Seed day' "no billing run for $SeedDay, the day-zero tariff with no readings (R04)"
         }
         $latestRun = ($runs.Rows[-1] -split '\|')[0]
         $tasks = Invoke-Sql "SELECT task_id, coalesce(state, 'none') FROM task_instance WHERE dag_id = 'daily_billing' AND run_id = '$latestRun' ORDER BY start_date NULLS LAST, task_id" 'airflow'
@@ -735,7 +737,7 @@ SELECT
     }
 
     # --- 9 ------------------------------------------------------------------------------
-    Write-Section "9. Reconciliation - speed vs batch for $day"
+    Write-Section "9. Reconciliation and daily report - $day"
     if ($reconciled -eq 0) {
         Write-Check 'WAIT' 'Reconciled rows' 'none yet - reconciliation runs after the rollup'
     } else {
@@ -744,6 +746,15 @@ SELECT
         if ($breaks -eq 0) { Write-Check 'PASS' 'D4 identity' 'tariff_effect + data_effect = speed - batch on every row' }
         else { Write-Check 'FAIL' 'D4 identity' "$breaks rows break it" }
         Write-Check 'INFO' 'Divergence' "mean tariff_effect $meanTariff, mean data_effect $meanData, mean pct $meanPct%  (record these for T140)"
+    }
+    # The DAG's last task. A failure shows in stage 7 as a failed run, so a missing
+    # report here only means that task has not finished yet.
+    $reportKey = "voltstream-archive/reports/report_$day.md"
+    $report = Get-BucketListing $reportKey
+    if (@($report.Lines | Where-Object { $_ -match "report_$day\.md$" }).Count -gt 0) {
+        Write-Check 'PASS' 'Daily report' $reportKey
+    } else {
+        Write-Check 'WAIT' 'Daily report' "not published yet - the DAG's last task, after reconciliation"
     }
 
     # --- 10 -----------------------------------------------------------------------------

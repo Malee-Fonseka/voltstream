@@ -247,11 +247,16 @@ Per task:
   `generator_defaults`. It must apply a **deterministic, documented day-over-day change** — e.g.
   `block_2_rate` steps by a fixed amount on alternate simulated days — so the stale-tariff
   divergence is non-zero and attributable in T140. Put the rule in the module docstring.
+  **As built (R01, 2026-09-27): the step is on `block_1_rate`, +0.50 on even date
+  ordinals.** Block 2 starts at 60 kWh and no simulated household uses more than about
+  22 kWh a day, so a block 2 step changed no bill and `tariff_effect` was 0.00 everywhere.
 - **T113 `daily_billing.py`:** joins all ten columns. Missing household → fail loudly (already
   specified).
 - **T162 `backfill.sh`:** the corruption step edits a monetary column in the day's CSV (e.g.
   `block_2_rate` `16.50 → 61.50`, large enough to be obvious in a screenshot), runs the DAG,
-  restores the file, backfills.
+  restores the file, backfills. **Corrupt a column every bill uses** — `block_1_rate` or
+  `fixed_charge` — not `block_2_rate`: for the reason in the T074 note above, a block 2 edit
+  leaves every bill unchanged and the demo shows nothing.
 - **T034 `03-data-contracts.md`:** the table above is the frozen tariff contract.
   **T182:** update Master Design §6.2's CSV sample and Appendix A's `tariff` block.
 - **Coupling to D4:** if D4 chooses option 1 (API recomputes the provisional bill), the API must
@@ -373,19 +378,19 @@ second survives measurement.
   watermark is dropped.
 - `T140`'s attribution — "the kWh gap is dropped backfill, nothing else" — is false as
   written and must be stated as measured instead. **A prediction for Phase 11, so it is
-  not rediscovered there:** `T140` splits divergence into `data_effect` (backfill dropped
-  past the watermark) and `tariff_effect` (yesterday's rates vs today's), and expects
-  `data_effect` to carry D3's ~1.7 %. It will not. `reconciliation_daily` compares a
-  household's *daily* speed bill against its batch bill, and the daily window loses
-  nothing — so `data_effect` should come out at or near **zero**, with essentially all
-  divergence in `tariff_effect`. `T140`'s stated acceptance ("the `data_effect` share is
-  inside T094's band") therefore cannot pass as written, for the same structural reason
-  T094's original framing could not: the band was measured on 15-minute windows, and
-  bills are daily.
-- The daily household totals are **unaffected**: they use a 1-day window, which tolerates
-  lateness far beyond anything the fault model injects, and measured 0.00 % missing in
-  every run. The speed-versus-batch divergence *on bills* therefore remains the stale
-  tariff alone, exactly as designed.
+  not rediscovered there** (*superseded by the R02 update below*): `T140` splits
+  divergence into `data_effect` (backfill dropped past the watermark) and `tariff_effect`
+  (yesterday's rates vs today's), and expects `data_effect` to carry D3's ~1.7 %. It will
+  not. `reconciliation_daily` compares a household's *daily* speed bill against its batch
+  bill, and the daily window loses nothing — so `data_effect` should come out at or near
+  **zero**, with essentially all divergence in `tariff_effect`. `T140`'s stated acceptance
+  ("the `data_effect` share is inside T094's band") therefore cannot pass as written, for
+  the same structural reason T094's original framing could not: the band was measured on
+  15-minute windows, and bills are daily.
+- *Superseded by the R02 update below.* The daily household totals are **unaffected**:
+  they use a 1-day window, which tolerates lateness far beyond anything the fault model
+  injects, and measured 0.00 % missing in every run. The speed-versus-batch divergence
+  *on bills* therefore remains the stale tariff alone, exactly as designed.
 
 **What would fix it, and why we did not.** Raising the watermark above one trigger — 60
 simulated minutes rather than 30 — is what this decision's own analysis implies if the
@@ -394,6 +399,38 @@ than applied: the measured finding is more useful than the tuned number, because
 demonstrates the time-compression limitation (§3.4) with data rather than asserting it.
 
 Full figures and method: `docs/assumptions.md` §2.
+
+#### Update (2026-09-27, R02): the daily totals now miss backfill
+
+The two statements above that the daily totals lose nothing, and that `data_effect` will
+sit near zero, described a speed layer that did not deduplicate. It summed the 2 %
+injected duplicates the batch layer removes, and T094's probe compared it against an
+archive that was validated but not deduplicated, so the 0.00 % was two omissions agreeing
+(backlog R02).
+
+The speed layer now deduplicates on the batch layer's key (`core.keys.DEDUP_COLUMNS`)
+before either aggregation, and Spark's streaming dedup drops every record older than the
+watermark, whichever window it would have fallen in. So:
+
+- **Backfill older than the watermark no longer reaches the daily totals.** The daily gap
+  is D3's original prediction again, ≈ 1.7 % of consumption and inside T094's 0.25–5 %
+  band, and `data_effect` carries it: the speed layer bills less energy than the batch
+  layer.
+- **Reordering is still not dropped at the daily grain.** A reordered record is sent with
+  its own tick, and a micro-batch's watermark is the newest tick of the batch before it
+  minus W, so it trails the record's tick by at least W. The probe's control run
+  (dropouts off) asserts a daily gap under 0.05 %, a few readings: the last idle run
+  before R02 measured 0.0162 % there, about one reading, and the cause is not pinned
+  down.
+- **The 15-minute view loses at least what it did.** The dedup tests the record's own
+  `event_ts` against the watermark, which is stricter than the window-end test, so backfill
+  that used to land in a still-open window is now dropped before it gets there.
+
+**Measured on the Gate 4 run (2026-09-27):** the daily gap was **0.523 %** on the first
+complete day (0.861 % on the partial first day), inside T094's band and below the modelled
+1.7 %. D4's "Measured attribution" gives the breakdown and the likely reasons. The probe
+(`tests/integration/test_watermark_behaviour.py`) has not been re-run, so the control,
+reordering alone, is still unmeasured since R02.
 
 Pinned values:
 
@@ -633,9 +670,9 @@ Reconciliation and Grafana also lose a stored speed figure.
 
 ### Measured attribution (T140)
 
-**Status: method implemented (T137); no measurement yet.** No simulated day has been
-reconciled on the running stack, so the table below is empty. Fill it from a real run —
-never from the expectations further down.
+**Status: measured 2026-09-27, on the Gate 4 run** (the first run with R01 and R02
+fixed; `assumptions.md` §7). Both days in the table below come from that one run. Add rows
+from later runs; never fill the table from the expectations further down.
 
 **Where the numbers come from.** `batch/reconciliation.py` logs every figure below in its
 `reconciliation complete` line: `mean_tariff_effect`, `mean_data_effect`,
@@ -669,30 +706,72 @@ the same household and would otherwise cancel.
 
 | sim_date | households | mean `tariff_effect` | mean `data_effect` | tariff share | mean pct | max pct | speed kWh shortfall |
 |---|---|---|---|---|---|---|---|
-| *pending a real run* | | | | | | | |
+| 2026-01-01 ¹ | 50 | +5.14 | −0.89 | 85.203 % | 1.570 % | 3.537 % | 0.861 % |
+| 2026-01-02 | 50 | −5.35 | −0.61 | 89.742 % | 1.878 % | 4.450 % | 0.523 % |
 
-**Expected result with the code as of 2026-09-26.** Written down before the run, so the
-run confirms or refutes it. Details and evidence are in `docs/debugging-backlog.md`.
+¹ Partial: the stack starts at the clock anchor, so the first simulated hours of day one
+have no readings (6,296 readings processed against 6,787 on day two). Quote day two.
 
-- **`tariff_effect` = 0.00 for every household** (backlog R01). The reference dropper's only
-  day-over-day change is `block_2_rate`. No simulated household uses 60 kWh in a day (the
-  measured maximum over a full simulated day is 21.8 kWh), so yesterday's and today's
-  tariffs price every speed-layer total identically. The stale tariff has nothing to change.
-- **`data_effect` positive for almost every household**, at roughly 2 % of the
-  energy-related charges (backlog R02). The speed layer sums the 2 % injected duplicates
-  and the batch layer removes them. `speed_kwh_shortfall_pct` should therefore come out
-  near **−2 %**: the speed layer sees *more* energy than the batch layer, not less.
-- **A small positive contribution on some days.** A meter that drops out in roughly the
-  last simulated hour before midnight flushes its backlog after the 1-day window's state
-  has been evicted, so those readings miss the provisional bill.
+Per row, on both days: `tariff_effect` non-zero for all 50 households; `data_effect`
+non-zero for 12 (day one) and 10 (day two) households, all of them negative; the D4
+identity holds on every row. Day two's `tariff_effect` ranged from −9.84 to −0.21, and
+its `data_effect` from −5.63 to 0.00.
 
-**Consequence for T140's acceptance check.** "The `data_effect` share is inside T094's
-band" cannot pass as written. D3's correction already gives the reason: T094's
-0.25 %–5 % band measured a *shortfall* on 15-minute windows, while bills are daily and
-currently show a *surplus* from duplicates. Once R01 and R02 are resolved, the expectation
-reverses to D3's corrected prediction: the stale tariff carries the divergence and
-`data_effect` sits near zero. Re-run and record at that point, and restate the acceptance
-check against the daily grain.
+**Expected result with the code as of 2026-09-27**, after R01 and R02. Written down before
+the run, so the run confirms or refutes it. It replaces the 2026-09-26 prediction
+(`tariff_effect` 0.00 everywhere, `data_effect` a ~2 % surplus from duplicates), which
+described those two defects rather than the design. Details and evidence are in
+`docs/debugging-backlog.md`.
+
+- **`tariff_effect` non-zero for every household, with a sign that alternates by day**
+  (R01). The dropper's day-over-day change is now `block_1_rate` ± 0.50, and every
+  simulated household's billable import falls in block 1. So `tariff_effect` ≈ 0.50 × the
+  household's billable kWh, less its subsidy share. It is negative when the billed day
+  has an even date ordinal (2026-01-02, 2026-01-04, …), because that day's tariff is dearer
+  than the one the speed layer used, and positive on odd days.
+- **`data_effect` zero for most households, and mostly negative for the rest** (R02). The
+  speed layer now deduplicates on the batch layer's key, so duplicates no longer appear
+  here. What remains is store-and-forward backfill older than the watermark, which the
+  speed layer drops and the batch layer bills. At 0.002 dropouts per meter tick, roughly
+  a quarter of meters drop out on a given day. A household with solar can come out
+  positive when the readings it lost were mostly generation.
+- **`speed_kwh_shortfall_pct` positive, near D3's modelled 1.7 %**, inside T094's
+  0.25 %–5 % band: the speed layer sees *less* energy than the batch layer.
+
+**Consequence for T140's acceptance check.** It can now pass as written. `data_effect` is
+the backfill the watermark dropped, which is what T094's band measures, and T094's probe
+asserts that band at the daily grain (`test_daily_totals_miss_backfill_past_the_watermark`).
+Check the band against `speed_kwh_shortfall_pct`, the kWh measure T094 uses, rather than
+`tariff_share_pct`: that is a split in money, and it depends on the size of the tariff
+step as much as on the data.
+
+**Result: the expectation held, and T140's acceptance check passes.**
+
+- **`tariff_effect`**: non-zero for every household, positive on the odd day (+5.14 mean)
+  and negative on the even day (−5.35), as predicted. HH-0001, which has no solar and no
+  subsidy, shows the rule exactly: 13.4363 kWh × −0.50 = −6.72 on day two.
+- **`data_effect`**: zero for most households and negative for the rest. On day two the
+  10 non-zero households match the 10 dropouts the producer injected that day.
+- **`speed_kwh_shortfall_pct`**: 0.523 % on day two (0.861 % on the partial day one).
+  That is inside T094's 0.25 %–5 % band, so the acceptance check passes.
+- **Share of divergence**: the tariff effect carries about 90 % of it in money terms. That
+  is the size of the 0.50 step, not a statement about the data.
+
+**Below D3's modelled 1.7 %, for two reasons, one of them measured.**
+
+- **Fewer dropouts than modelled** (measured). Day two had 10 dropouts, 126 backfilled
+  readings or 1.9 % of the day, against the ~14 the model's rate implies. That is Poisson
+  noise.
+- **A smaller share of each backlog dropped** (inferred). The speed layer missed about
+  3.8 kWh, roughly 35 readings or a quarter of the backlog, where D3's model has 57.5 %.
+  The micro-batches ran at the 10 s trigger throughout (median 10.0 s), so a starved
+  driver is not the cause. A likely one, not yet verified: since Spark 3.4, stateful
+  operators filter late rows against the *previous* batch's watermark, which gives a
+  backfilled row one more trigger (48 simulated minutes) of slack than D3's model allows.
+- **Also on day two**: the producer emitted 138 ticks, not 150, because stalled ticks are
+  never made up (backlog R37). That shrinks the day, not the ratio.
+
+The report should quote the measured figures and name the model as a model.
 
 ---
 

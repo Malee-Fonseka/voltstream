@@ -39,6 +39,12 @@ ENV PATH="/opt/venv/bin:${PATH}"
 COPY dashboard/ /app/dashboard/
 COPY config/ /app/config/
 
+# The report generator, launched by the billing DAG as its last task. A script rather than
+# package code: it is an entry point for the orchestrator, not something anything imports.
+# Here rather than in the Spark image because it reads Postgres and writes one object to
+# the archive bucket (R08) — the api and sim groups installed above are all it needs.
+COPY scripts/generate_report.py /app/scripts/
+
 WORKDIR /app
 USER voltstream
 

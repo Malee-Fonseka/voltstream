@@ -28,6 +28,10 @@ BUCKET = "voltstream-landing"
 PREFIX = "tariff/"
 AWS_CONN_ID = "minio_s3"
 
+# The master dataset, laid out by the raw archiver as meter_readings/sim_date=YYYY-MM-DD/.
+RAW_BUCKET = "voltstream-raw"
+RAW_PREFIX = "meter_readings"
+
 # tariff_2026-01-02.csv -> 2026-01-02
 _TARIFF_NAME = re.compile(r"tariff_(\d{4}-\d{2}-\d{2})\.csv$")
 
@@ -55,13 +59,32 @@ def list_pending_days() -> list[dict]:
     # simulated clock rather than a timer, so it stays correct if the stack is paused,
     # slow, or replayed.
     complete = days[:-1]
+
+    # **A day with no readings is not billed (R04).** The dropper seeds a tariff for the
+    # day before the first one (T075), so the speed layer can price day one against
+    # "yesterday's" tariff. No meter ever reported on that seed day, so billing it could
+    # only fail — every cold start used to leave a red run in the UI, and a watchdog on
+    # "tariff files without a successful billing run" would have alarmed forever. The same
+    # rule covers any day the producer never ran. A watchdog must apply it too.
+    hook = S3Hook(aws_conn_id=AWS_CONN_ID)
+    billable = [day for day in complete if _has_readings(hook, day)]
+    skipped = [day for day in complete if day not in billable]
+    if skipped:
+        print(f"not billing {skipped}: no readings for those days in {RAW_BUCKET}")
+
     return [
         {
             "trigger_run_id": f"billing__{day}",
             "conf": {"sim_date": day},
         }
-        for day in complete
+        for day in billable
     ]
+
+
+def _has_readings(hook: S3Hook, day: str) -> bool:
+    """Whether the master dataset holds anything for `day`. One key is enough to know."""
+    prefix = f"{RAW_PREFIX}/sim_date={day}/"
+    return bool(hook.list_keys(bucket_name=RAW_BUCKET, prefix=prefix, max_items=1))
 
 
 with DAG(

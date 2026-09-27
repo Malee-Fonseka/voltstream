@@ -3,7 +3,7 @@
 **Reviewed:** 2026-09-26, commit `0e58e3a` on `dev`, against Phases 0–10 of
 [`Implementation_Tasks.md`](Implementation_Tasks.md).
 **Purpose:** the work list for a debugging session once the remaining phases are
-implemented. Nothing here has been fixed yet.
+implemented. Fixed items are ticked, with the date and what changed.
 
 Line numbers are as of `0e58e3a` and will drift. Every item also names the function or
 section, so search for that if a line reference no longer lands.
@@ -50,6 +50,10 @@ R06 (lag), R07 (batch duration) and R21 (latency) were fixed on 2026-09-26, befo
 because Phase 12's dashboards and alerts read those metrics directly. Batch pushes only take
 effect once Phase 12 sets `observability.pushgateway_url`.
 
+R01, R02, R04, R05 and R08 were fixed on 2026-09-27, so the rows above for them no longer
+apply. After R02 the expected picture is D4's revised one: `tariff_effect` non-zero on every
+row with a sign that alternates by day, and `data_effect` carrying the dropped backfill.
+
 ---
 
 ## Summary
@@ -91,13 +95,25 @@ effect once Phase 12 sets `observability.pushgateway_url`.
 | R33 | Low | storage | Some repository functions return raw tuples | T101 |
 | R34 | Low | tests | Small inconsistencies in property test / T062 grep | T060, T062 |
 | R35 | Low | batch | A household with no valid readings gets no bill → row-count check fails | T113, T122 |
+| R36 | Medium | DAG / compose | DAG tasks always get the default Postgres and MinIO passwords | T121, D6 |
+| R37 | Low | simulators | A stalled producer tick is never made up: 138 readings per meter-day, not 150 | T072 |
 
 ---
 
 ## Blockers
 
 ### R01 — Stale-tariff divergence is always zero
-- [ ] Fixed
+- [x] Fixed 2026-09-27 (minimum fix): the dropper now steps `block_1_rate` by +0.50 on even
+  date ordinals, and `block_2_rate` is constant. `tests/unit/test_reference_dropper.py` runs
+  one simulated day through the real profiles and checks that yesterday's and today's
+  tariffs price all 50 households differently; it fails on the old rule. D2 records the change.
+  - **Still open, a design decision:** the block boundaries are unchanged, so no bill
+    reaches block 2 and the tier breakdown is still never exercised (the "Better" fix below).
+  - **Caveat for T162:** the backfill demo's example corruption (`block_2_rate`
+    `16.50 → 61.50`, in D2 and `Implementation_Tasks.md`) changes no bill. Corrupt
+    `block_1_rate` or `fixed_charge`. D2 now says so; the task text does not.
+  - **Verified live** (Gate 4 run, 2026-09-27): `tariff_effect` non-zero for all 50
+    households on both days, positive on 2026-01-01 and negative on 2026-01-02.
 
 **Where:** [`simulators/reference_dropper.py:75-77`](../src/voltstream/simulators/reference_dropper.py#L75-L77) `_block_2_rate_for`
 
@@ -155,7 +171,25 @@ boundaries are rescaled, at least some bills should have non-zero kWh in block 2
 ---
 
 ### R02 — Speed layer counts duplicates; batch removes them
-- [ ] Fixed
+- [x] Fixed 2026-09-27 (option 1): `speed_layer.deduplicated()` sets the watermark and
+  drops duplicates on `core.keys.DEDUP_COLUMNS`, the key the batch layer's window dedup now
+  uses too. Both aggregations read its output.
+  - `dropDuplicates` rather than `dropDuplicatesWithinWatermark`: the key contains the
+    watermarked `event_ts`, which is the documented pattern for plain `dropDuplicates`, and
+    each key's state is evicted once the watermark passes it. Both variants drop records
+    older than the watermark.
+  - Consequence, recorded in D3, D4 and `assumptions.md` §2: backfill older than the
+    watermark is now missing from the **daily** totals too, so `data_effect` carries D3's
+    ~1.7 % as originally designed. Reordering is still not dropped at the daily grain.
+  - T094's probe dedups the archive side. Its daily test asserts the 0.25–5 % band; the
+    control (dropouts off) asserts under 0.05 %.
+  - **Measured live** (Gate 4 run, 2026-09-27): daily gap 0.523 % on 2026-01-02, inside the
+    band and below the modelled 1.7 % (D4 "Measured attribution" explains why). Duplicates:
+    the batch layer removed 127 and the speed layer counted none.
+  - **The probe has not been re-run.** Run `pytest -m integration tests/integration/test_watermark_behaviour.py`
+    for the control (reordering alone) and record the figures.
+  - **Run `clean` before the next start.** The zone query gained a dedup operator, so its
+    old checkpoint cannot be restored.
 
 **Where:**
 
@@ -243,7 +277,12 @@ Consequences:
 ---
 
 ### R04 — Every cold start leaves a permanently failed billing run
-- [ ] Fixed
+- [x] Fixed 2026-09-27 (recommended fix): `list_pending_days()` only offers a day with at
+  least one object under `voltstream-raw/meter_readings/sim_date=<day>/`
+  (`S3Hook.list_keys(max_items=1)`), and logs the days it skips. Checked in the Airflow
+  image against the object store: the seed day was skipped and only the first real day
+  triggered. `voltstream.ps1 check` now reports a failed seed-day run as a regression.
+  **Verified live** (Gate 4 run): no run for 2025-12-31; both billing runs `success`.
 
 **Where:**
 
@@ -273,7 +312,11 @@ The alternative is to make an empty day a successful zero-row run and relax
 ---
 
 ### R05 — Trace-id dependency: null trace ids and a `ValueError` per request
-- [ ] Fixed
+- [x] Fixed 2026-09-27: `trace_id_provider` is `async`, with the same body.
+  `tests/unit/test_api_dependencies.py` checks the logged `trace_id` against the response
+  header for a sync and an async endpoint, with `TestClient` defaults. It fails on the old
+  code with the `ValueError`. `/health` and `/metrics` still don't declare the dependency
+  (the middleware option), which T104 doesn't require.
 
 **Where:** [`api/dependencies.py:32-46`](../src/voltstream/api/dependencies.py#L32-L46) `trace_id_provider`
 
@@ -364,7 +407,13 @@ Record the choice for the report.
 ---
 
 ### R08 — Daily report file is deleted with its container (T131)
-- [ ] Fixed
+- [x] Fixed 2026-09-27 (object-store option): `generate_report.py` publishes to
+  `voltstream-archive/reports/report_<date>.md` (`objectstore.report_key`) and still writes
+  a local file with `--out DIR`. The DAG task runs on the **app** image with object-store
+  credentials; the Spark image no longer copies `scripts/`. `voltstream.ps1 check` lists the
+  report in stage 9. Tests: `tests/unit/test_generate_report.py`. Needs `build` for both
+  images. **Verified live** (Gate 4 run): `report_2026-01-01.md` and `report_2026-01-02.md`
+  listed in the archive bucket, both FINAL.
 
 **Where:**
 
@@ -642,7 +691,10 @@ partition. Re-record the evidence.
 - It inserts into `rejected_records` **before** the bill transaction, with no idempotency
   key. Each DAG retry (`retries=2`) and each restatement adds another full set.
 - `get_rejected_for_day` counts speed and batch rows together, so report reject counts
-  are at least 2× reality.
+  are at least 2× reality. **Confirmed on the Gate 4 run:** `report_2026-01-01.md` lists
+  212 rejects. `rejected_records` holds 105 distinct rejected readings with
+  `stage='batch'` and the same 105 again with `stage='speed'`, plus 2 more speed rows for
+  injected duplicates of bad readings: the speed layer validates before it dedups.
 
 **Fix:**
 
@@ -747,6 +799,35 @@ wants for the Spark readers too.
 
 ---
 
+### R36 — DAG tasks always get the default Postgres and MinIO passwords
+- [ ] Fixed
+
+*Found 2026-09-27, while fixing R08.*
+
+**Where:**
+
+- [`airflow/dags/daily_billing_dag.py`](../airflow/dags/daily_billing_dag.py): every
+  `DockerOperator`'s `private_environment`
+- [`docker/docker-compose.yml`](../docker/docker-compose.yml): the `airflow` service's
+  `environment`
+
+**What's wrong:** each task passes `os.environ.get("POSTGRES_PASSWORD", "voltstream")`,
+`os.environ.get("MINIO_ROOT_USER", "voltstream")` and
+`os.environ.get("MINIO_ROOT_PASSWORD", "voltstream-dev")`. The airflow container has none of
+these variables: compose uses them only inside the two `AIRFLOW_CONN_*` URLs and the
+metadata-database URL. So the tasks always get the defaults. With the default `.env`
+nothing breaks. Change either password in `.env` and every billing, rollup,
+reconciliation and report task fails to authenticate, while the watcher's S3 hook, which
+reads the connection, keeps working.
+
+**Fix:** pass `POSTGRES_PASSWORD`, `MINIO_ROOT_USER` and `MINIO_ROOT_PASSWORD` to the
+`airflow` service's `environment` in compose, with the same defaults.
+
+**Done when:** with a non-default `POSTGRES_PASSWORD` in `.env`, a `daily_billing` run
+succeeds.
+
+---
+
 ## Low
 
 ### R28 — Dropper bypasses `objectstore.py` (T099)
@@ -842,11 +923,43 @@ the check should expect it.
 
 ---
 
+### R37 — A stalled producer tick is never made up
+- [ ] Fixed
+
+*Found 2026-09-27, on the Gate 4 run.*
+
+**Where:** [`simulators/meter_producer.py`](../src/voltstream/simulators/meter_producer.py) `main()`: `time.sleep(max(0.0, emit_interval_seconds - elapsed))`, and `_run_tick()`: `event_ts = simclock.sim_now()`.
+
+**What's wrong:** each tick sleeps for whatever is left of 2 s after its own work, and
+stamps its readings with the simulated time at which it happens to run. A tick that
+stalls (9 of 137 on 2026-01-02 took 3–4.8 s, the rest 2.0 s) pushes every later tick back
+and is never made up. The day then has 138 ticks rather than 150, readings are on average
+about 10.4 simulated minutes apart rather than 9.6, and each stall stretches one gap in
+every meter's series to 14–23 simulated minutes.
+
+It doesn't affect correctness: both layers see the same readings, and the reconciliation
+and the kWh gap are ratios. It does make figures quoted as "150 readings per meter per
+day" wrong, and daily energy about 8 % lower than the profiles imply.
+
+**Fix:** schedule ticks on a fixed grid (`next_tick += interval`; sleep until `next_tick`,
+and run at once when behind). Optionally derive `event_ts` from the tick index
+(`anchor + k × 9.6 sim min`) so every meter-day has exactly 150 readings however the host
+behaves.
+
+**Done when:** a complete simulated day has 150 ticks in the producer log, and
+`household_bill_daily.readings_count` is 150 minus that household's rejects.
+
+---
+
 ## Verify with the stack up
 
 These could not be checked without Docker:
 
 - [ ] `pytest -m integration` (19 tests) passes against a fresh `make clean && make up`.
+- [ ] R02: `test_watermark_behaviour.py` passes, and its figures are recorded in D3 and
+  `assumptions.md` §2.
+- [x] R08: after a billing run, `voltstream.ps1 check` shows `Daily report` PASS
+  (2026-09-27, Gate 4 run).
 - [ ] **Kafka persistence:** compose mounts `kafka_data` at `/var/lib/kafka/data` but
   doesn't set `KAFKA_LOG_DIRS`. Confirm the broker writes there:
   `docker exec voltstream-kafka grep log.dirs /opt/kafka/config/server.properties`.

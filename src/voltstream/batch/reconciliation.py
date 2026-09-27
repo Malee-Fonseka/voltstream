@@ -17,9 +17,10 @@ because `core/tariff.py` and `core/spark_expr.py` agree exactly
 (`tests/consistency/test_pure_vs_spark.py`). This module is `core/tariff.py`'s one
 production caller (D4).
 
-`data_effect` is whatever made the speed layer's kWh differ from the batch layer's: late
-readings the speed layer's watermark dropped, and duplicates it counted that the batch
-layer removed.
+`data_effect` is whatever made the speed layer's kWh differ from the batch layer's: in
+practice, late readings the speed layer's watermark dropped and the batch layer's rescan
+kept. Duplicates are not part of it, because both layers remove them on the same key
+(`core.keys.DEDUP_COLUMNS`, R02).
 
 **Plain Python, no SparkSession.** Fifty rows do not need a cluster, and this runs on the
 app image, which has no PySpark (D4, D6).

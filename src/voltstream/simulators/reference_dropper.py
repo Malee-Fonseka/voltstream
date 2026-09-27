@@ -7,11 +7,16 @@ money values there exist purely to let this module write a plausible daily file;
 else in the codebase may read them (`core/`, `streaming/`, `batch/`, `api/` all get their
 money from the tariff file this module writes, per household, per day).
 
-**Deterministic day-over-day change (D2/T074):** `block_2_rate` steps up by a fixed amount
-on alternate simulated days. Without a real day-to-day change somewhere in the tariff, the
-speed layer's stale-tariff divergence (§3.1) would be zero every day, which is a weak
-story for the Lambda-divergence demo (`T140`). The rule lives in this docstring and
-nowhere else — it is the whole rule.
+**Deterministic day-over-day change (D2/T074):** `block_1_rate` is 0.50 higher on even
+simulated days (by date ordinal) than on odd ones; every other column is the same every
+day. Without a real day-to-day change the speed layer's stale-tariff divergence (§3.1)
+would be zero, and there would be nothing for `tariff_effect` (D4, T140) to attribute.
+The rule lives in this docstring and nowhere else — it is the whole rule.
+
+It is block 1 because every household pays block 1. The rule used to step `block_2_rate`,
+which starts at 60 kWh, and no simulated household uses 60 kWh in a day (the measured
+maximum is about 22), so yesterday's and today's tariffs priced every bill identically
+and `tariff_effect` was 0.00 everywhere (R01).
 
 Each file is written to a temporary key and then copied to its final key (`copy_object` +
 delete), so the Airflow tariff-watcher sensor (T121) can never observe a partially-written
@@ -45,7 +50,7 @@ from voltstream.simulators.households import Household, household_roster
 
 PRODUCER_ID = "reference-dropper"
 
-_BLOCK_2_STEP = Decimal("0.50")  # D2/T074: alternate-day step, documented here in full.
+_BLOCK_1_STEP = Decimal("0.50")  # D2/T074: alternate-day step, documented here in full.
 _POLL_INTERVAL_REAL_SECONDS = 5
 
 _TARIFF_FIELDS = [
@@ -84,16 +89,16 @@ def _weather_key(sim_date: date) -> str:
     return f"weather/weather_{sim_date.isoformat()}.csv"
 
 
-def _block_2_rate_for(sim_date: date, generator_defaults: GeneratorDefaults) -> Decimal:
-    base = Decimal(str(generator_defaults.block_rates["block_2"]))
-    return base + (_BLOCK_2_STEP if sim_date.toordinal() % 2 == 0 else Decimal(0))
+def _block_1_rate_for(sim_date: date, generator_defaults: GeneratorDefaults) -> Decimal:
+    base = Decimal(str(generator_defaults.block_rates["block_1"]))
+    return base + (_BLOCK_1_STEP if sim_date.toordinal() % 2 == 0 else Decimal(0))
 
 
 def _tariff_rows(
     sim_date: date, households: list[Household], generator_defaults: GeneratorDefaults
 ) -> list[TariffRecord]:
-    block_1 = Decimal(str(generator_defaults.block_rates["block_1"]))
-    block_2 = _block_2_rate_for(sim_date, generator_defaults)
+    block_1 = _block_1_rate_for(sim_date, generator_defaults)
+    block_2 = Decimal(str(generator_defaults.block_rates["block_2"]))
     block_3 = Decimal(str(generator_defaults.block_rates["block_3"]))
     subsidy_pct = Decimal(str(generator_defaults.subsidy_pct))
     export_rate = Decimal(str(generator_defaults.export_rate))
