@@ -1,20 +1,3 @@
-"""Typed application configuration (decision T021).
-
-`get_config()` is the *only* sanctioned way to read configuration in this codebase — no
-other module may read YAML or `os.environ` directly. Load order:
-
-1. `config/base.yaml` — every tunable, with safe defaults.
-2. `config/<VOLTSTREAM_ENV>.yaml`, deep-merged over (1). Missing overlay is not an error.
-3. `.env` (if present) populates any environment variable not already exported by the
-   shell — via `python-dotenv` with `override=False`, so a real shell export always wins.
-4. `VOLTSTREAM__SECTION__KEY` environment variables (from the shell or from step 3)
-   override the merged mapping from (1)+(2), nested-key by nested-key.
-
-The result is validated against `VoltstreamConfig`, whose submodels all forbid unknown
-fields — a typo or a leftover key in `base.yaml` or an env var is a load-time error, not a
-silently ignored one.
-"""
-
 from __future__ import annotations
 
 import json
@@ -36,8 +19,6 @@ _ENV_VAR_PREFIX = "VOLTSTREAM__"
 
 
 class _StrictModel(BaseModel):
-    """Base for every config section: unknown keys are a load-time error."""
-
     model_config = ConfigDict(extra="forbid")
 
 
@@ -47,8 +28,6 @@ class TariffBlock(_StrictModel):
 
 
 class GeneratorDefaults(_StrictModel):
-    """Read ONLY by simulators/reference_dropper.py — see D2. Nothing else may use this."""
-
     block_rates: dict[str, float]
     fixed_charge_by_tier: dict[str, float]
     subsidy_pct: float
@@ -60,9 +39,6 @@ class TariffConfig(_StrictModel):
     generator_defaults: GeneratorDefaults
 
     def boundaries(self) -> list[BlockBoundary]:
-        """The block structure as `core/tariff.py` takes it: `Decimal` edges, `None` for
-        the unbounded top block. `core/` may not read config, so callers translate here —
-        one conversion, rather than one per layer that bills."""
         return [
             BlockBoundary(b.name, None if b.up_to_kwh is None else Decimal(b.up_to_kwh))
             for b in self.blocks
@@ -150,8 +126,6 @@ class ObservabilityConfig(_StrictModel):
 
 
 class VoltstreamConfig(_StrictModel):
-    """The root config object. Build only via `get_config()`."""
-
     simulation: SimulationConfig
     faults: FaultsConfig
     kafka: KafkaConfig
@@ -166,7 +140,6 @@ class VoltstreamConfig(_StrictModel):
 
 
 def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
-    """Recursively merge `overlay` over `base`. Neither argument is mutated."""
     merged = dict(base)
     for key, overlay_value in overlay.items():
         base_value = merged.get(key)
@@ -178,12 +151,6 @@ def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]
 
 
 def _coerce_env_value(raw: str) -> Any:
-    """Best-effort parse of an environment-variable string into a native YAML-ish value.
-
-    JSON covers everything base.yaml can express for a leaf value (numbers, booleans,
-    null, and `[1, 30]`-style lists for fields like `out_of_order_lateness_sim_minutes`).
-    A value that is not valid JSON (e.g. a bare hostname) is kept as the raw string.
-    """
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
@@ -191,7 +158,6 @@ def _coerce_env_value(raw: str) -> Any:
 
 
 def _apply_env_overrides(config: dict[str, Any]) -> dict[str, Any]:
-    """Apply every `VOLTSTREAM__SECTION__KEY[__SUBKEY...]` env var onto `config`."""
     result = dict(config)
     for env_key, env_value in os.environ.items():
         if not env_key.startswith(_ENV_VAR_PREFIX):
@@ -242,9 +208,4 @@ def _load_config() -> VoltstreamConfig:
 
 @lru_cache(maxsize=1)
 def get_config() -> VoltstreamConfig:
-    """Return the process-wide config, loaded and validated once then cached.
-
-    Call `get_config.cache_clear()` (tests only) to force a reload after mutating
-    `os.environ` or the config files — application code should never need to.
-    """
     return _load_config()

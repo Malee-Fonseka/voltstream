@@ -1,24 +1,3 @@
-"""The Prometheus registry (decision T027, §10.1) — exactly the eight metrics the
-observability chapter names, with their stated types and labels. No other module may
-define a `prometheus_client` metric; import the instances from here.
-
-Two usage patterns:
-
-- **Non-HTTP services** (the producer, the reference dropper, Spark driver processes)
-  call `start_metrics_server()` once at startup, which serves `/metrics` on
-  `observability.metrics_port` via `prometheus_client`'s built-in WSGI server.
-- **FastAPI** does not call `start_metrics_server()` — it mounts the shared
-  `REGISTRY` itself (via `prometheus-fastapi-instrumentator`) so `/metrics` is served on
-  the same port as the rest of the API.
-- **One-shot batch containers** exit before Prometheus could scrape them, so they call
-  `push_metrics()` once at the end of the run instead (T138).
-
-Histogram buckets are set explicitly throughout: `prometheus_client`'s defaults top out
-around 10 seconds, which is far too coarse for a latency target measured in single-digit
-seconds (`voltstream_e2e_latency_seconds`) and far too fine for a nightly job measured in
-minutes (`voltstream_batch_duration_seconds`).
-"""
-
 from __future__ import annotations
 
 from prometheus_client import (
@@ -126,28 +105,10 @@ lambda_divergence = Gauge(
 
 
 def start_metrics_server(port: int | None = None) -> None:
-    """Serve `REGISTRY` over HTTP for a process with no web server of its own.
-
-    `port` defaults to `observability.metrics_port`. FastAPI does not call this — it
-    exposes `/metrics` itself, on its own port, via `prometheus-fastapi-instrumentator`.
-    """
     start_http_server(port or get_config().observability.metrics_port, registry=REGISTRY)
 
 
 def push_metrics(job: str, *, timeout_seconds: float = 5.0) -> bool:
-    """Push `REGISTRY` to the Pushgateway, for a process that exits before a scrape.
-
-    Returns True once pushed. Returns False without pushing when
-    `observability.pushgateway_url` is not set, and False with a logged warning when the
-    Pushgateway cannot be reached — never raises for that. Every caller is a batch job that
-    pushes after its real output (bills, rollup, reconciliation) is committed, so a
-    monitoring outage must not turn a finished run into a failed DAG task. Anything other
-    than a network failure (`OSError`) is a bug and does propagate.
-
-    Only samples that exist are sent. Every labelled metric this process never touched
-    has no children and so no samples, which means a job pushes what it set and nothing
-    else — the reconciliation job pushes `voltstream_lambda_divergence` alone.
-    """
     url = get_config().observability.pushgateway_url
     if not url:
         return False

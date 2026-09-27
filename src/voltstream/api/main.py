@@ -1,18 +1,3 @@
-"""The serving API (T103, §5.8).
-
-The generated OpenAPI page is a graded demo artefact, so the title, description and
-version below are real rather than FastAPI's defaults — `/docs` is something a marker
-opens, not just a debugging aid.
-
-The Postgres pool is opened and closed by the lifespan rather than on first use. Opening
-lazily would make the first request after startup pay the connection cost and, worse,
-would let the container report healthy before it could serve anything.
-
-`/metrics` is mounted by the instrumentator onto this same port, using the shared registry
-from `voltstream.metrics`. The API does not call `start_metrics_server()` — that is for
-processes with no HTTP server of their own.
-"""
-
 from __future__ import annotations
 
 import os
