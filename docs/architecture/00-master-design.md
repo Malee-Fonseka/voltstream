@@ -1,27 +1,8 @@
-# voltstream — Master Design Document
+# Voltstream — Master Design Document
 
 **Smart Grid Energy Monitoring & Billing Platform**
 Applied Big Data Engineering — Mini Project (EC8203, 2026)
 Architecture: **Lambda** | Use Case: **3 — Smart Grid Energy Monitoring & Billing**
-
----
-
-## Document purpose
-
-This is the single source of truth for the project. Every other written artefact is
-derived from it:
-
-| Derived artefact | Sections used |
-|---|---|
-| `README.md` | 7, 8, 9 |
-| Report chapter: architecture decision | 2, 4 |
-| Report chapter: tech stack | 5 |
-| Report chapter: observability | 10.1 |
-| Report chapter: limitations | 10.2 |
-| Viva preparation | 10.3 |
-
-Written before implementation begins, and updated as decisions change. If the code
-and this document disagree, one of them is a bug.
 
 ---
 
@@ -44,86 +25,32 @@ and this document disagree, one of them is a bug.
 
 ### 1.1 What this system is
 
-`voltstream` is an end-to-end data platform for a utility company operating a smart
-electricity grid with distributed rooftop solar. It ingests two sources — a
-continuous stream of smart-meter readings and a once-daily tariff/weather reference
-file — and serves two consumers whose requirements are in direct opposition:
+`Voltstream` is an end-to-end data platform for a utility company which is operating a smart
+electricity grid with distributed rooftop solar. It ingests two sources - a
+continuous stream of smart meter readings and a once daily tariff/weather reference
+file. It serves two consumers whose requirements are different from one another
 
-- **Grid operations** need approximate load and renewable-mix figures per zone
-  within seconds, to make ramping and load-shedding decisions.
-- **Billing** needs exact, auditable, restatable per-household bills, and can wait
+- **Grid operations** need an approximate load and renewable mix figures per zone
+  within seconds, to make ramping and load shedding decisions.
+- **Billing** needs exact, auditable, restatable per household bills, and can wait
   until the day closes.
 
-The system is built on a **Lambda architecture**: a speed layer serving provisional
-real-time estimates, a batch layer producing authoritative finalised results from an
-immutable master dataset, and a serving layer that merges the two.
-
-### 1.2 Why this use case was chosen
-
-Three use cases were offered. Use Case 3 was selected because it produces the
-sharpest architecture argument, which is where the marks concentrate.
-
-| Criterion | UC1 Ride-hailing | UC2 Hospital vitals | UC3 Smart grid |
-|---|---|---|---|
-| Latency requirement split | Muddy — both paths want real-time | Hard real-time + soft daily | **Crisp: seconds for ops, daily for money** |
-| Replay requirement | Weak | Moderate (clinical audit) | **Strong (tariff corrections, meter backfill, disputes)** |
-| Correctness requirement | Moderate | Fuzzy — risk scores are heuristic | **Absolute — billing is money, must be auditable** |
-| Simulator complexity | High (geospatial, routing, trip state) | Low | **Low (deterministic curves + noise)** |
-| Transformation depth | Sum of costs | Clinical scoring | **Tiered tariff + solar netting** |
-
-**Rejected — UC1 (ride-hailing).** Realistic GPS simulation (route generation, zone
-polygons, trip state machines) consumes days of a two-week budget and earns marks in
-none of the rubric rows. The architecture argument is also weak: nothing in the use
-case genuinely *demands* a batch layer.
-
-**Rejected — UC2 (hospital vitals).** The strongest runner-up, and notably it has the
-better *Kappa* story: vitals are natively an event log, labs are just a slower
-stream, and in a clinical-safety context a dual codebase is an actual hazard — a
-patient flagged by the speed layer but not the batch layer is a real risk. It was
-rejected because "patient risk score" has no ground truth, making the
-15-mark *correctness of transformation logic* criterion much harder to evidence.
-
-**The decisive advantage of UC3:** the architecture becomes a **user-facing feature**.
-A household's bill shows a provisional speed-layer estimate during the day and a
-finalised batch-layer figure after day close, with the delta between them visible.
-That is literally `query = merge(batch_view, realtime_view)` rendered as product
-behaviour, not just described in prose.
-
-### 1.3 The mark allocation shapes the design
-
-| Criterion | Marks | Design consequence |
-|---|---|---|
-| Architecture decision & justification | 20 | Written on day 1, *before* code. Section 4 is the deliverable. |
-| Data ingestion implementation | 15 | Graded on *robustness* — hence deliberate fault injection. |
-| Processing layer implementation | 15 | Shared pure transformation module + consistency test. |
-| Report | 15 | Assembled from this document; written continuously, not at the end. |
-| Technology stack justification | 10 | Every choice names a rejected alternative and a use-case constraint. |
-| Storage & serving layer | 10 | The merge function is the centrepiece. |
-| Observability | 10 | Alerts must be *demonstrated firing*, not merely configured. |
-| Code quality & documentation | 5 | `src/` layout, typed config, CI, `make demo`. |
-
-**30 of 100 marks are for reasoning, not code.** A technically flawless pipeline with
-a weak architecture chapter scores worse than a modest pipeline with a rigorous one.
-
-The brief also states that every member must "explain and defend every architectural
-decision and every line of core pipeline logic in a viva/demo." The deliverable is
-therefore **a defended argument, evidenced by working code** — not code with an
-argument attached afterwards.
-
----
+The system is built on a **Lambda architecture**. A speed layer serving provisional
+real time estimates, a batch layer producing authoritative finalised results from an
+immutable master dataset. Finally a serving layer that merges the speed layer and the batch layer.
 
 ## 2. Problem statement
 
 ### 2.1 The domain problem
 
-Electricity has a property that makes it unlike almost any other commodity: it cannot
-be meaningfully stored at grid scale. **Supply must match demand continuously.** If
+Electricity has a property that makes it unlike almost any other commodity. It cannot
+be meaningfully stored at grid scale (?). **Supply must match demand continuously.** If
 demand exceeds supply, grid frequency falls, and the operator must either ramp
 generation or shed load.
 
 Distributed rooftop solar makes this harder rather than easier. Solar is generation
-the utility does not control and cannot dispatch, and its output swings fast — a
-cloud bank crossing a zone can cut solar contribution substantially within a minute.
+the utility does not control and cannot dispatch. Solar output swings fast. (Ex: A
+cloud bank crossing a zone can cut solar contribution substantially within a minute. - Not sure whether its true.)
 The grid must instantly absorb that shortfall from thermal or hydro plant that takes
 minutes to ramp. So *"renewable contribution by zone, right now"* is not a
 decorative dashboard metric. It is an operational alarm that triggers a physical
@@ -154,37 +81,12 @@ One input stream. Two consumers with **opposite requirements**:
 | Auditability | None | Full lineage to source readings |
 
 **This table is the architecture decision.** One workload wants low latency and
-tolerates approximation; the other wants exactness, reproducibility and unbounded
+tolerates approximation while the other wants exactness, reproducibility and unbounded
 replay. No single processing path optimises both. Everything downstream — Lambda over
-Kappa, the master dataset, two views, the merge function — is a consequence of these
+Kappa, the master dataset(?), two views, the merge function — is a consequence of these
 two columns not fitting in one system.
 
-### 2.3 The generalisable pattern
-
-The brief's requirement of "one streaming source plus one daily file" is not an
-artificial constraint. It is the most common shape in production data engineering:
-
-> **Fast facts joined to slow dimensions.**
-
-Telemetry, clicks, transactions, sensor readings — continuous. Reference data —
-customer records, price lists, regulatory rates, partner extracts — arrives on a
-*business* cadence, typically as a file dropped overnight by someone else's ETL.
-Almost every pipeline you will build is a version of this join. The assignment
-teaches that pattern wearing a smart-grid costume.
-
-### 2.4 What the business questions actually demand
-
-| Business question | Serving requirement |
-|---|---|
-| "What is current grid load and renewable contribution by zone?" | Sub-minute, approximate, per-zone aggregate, continuously refreshed |
-| "What will each household's bill be once daily tariff data is applied?" | Exact, per-household, available after day close, restatable |
-
-Note the second question's phrasing: *"once daily tariff data is applied."* The
-question itself encodes a dependency on data that does not exist until the day ends.
-No amount of streaming cleverness removes that dependency — it is a property of the
-business process, not of the technology.
-
-### 2.5 Non-functional requirements
+### 2.3 Non-functional requirements
 
 | Requirement | Target | Rationale |
 |---|---|---|
@@ -209,7 +111,7 @@ updated in place. This is the ground truth from which the batch layer recomputes
 it is what makes replay possible after Kafka's retention window expires.
 
 **Speed view (approximate, low latency).**
-15-simulated-minute event-time tumbling windows per `grid_zone`: total consumption,
+15 simulated minute event time tumbling windows per `grid_zone`: total consumption,
 total solar generation, renewable ratio, active meter count. Plus a running
 per-household kWh total costed against *yesterday's* tariff — deliberately stale,
 deliberately labelled provisional. Written to Postgres via `foreachBatch` upsert.
