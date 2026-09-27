@@ -11,6 +11,18 @@
 
 name: voltstream
 
+# The object store image, defined once for the server and the bucket-creating init job.
+#
+# MinIO Inc. stopped publishing community images in October 2025, archived the repository
+# in February 2026 and deleted its Docker Hub repositories in September 2026, so
+# quay.io/minio/* and minio/* no longer pull on a clean machine (D8). pgsty/silo is a
+# community-maintained fork (formerly pgsty/minio): same S3 API, same MINIO_* variables,
+# same /minio/health/live endpoint, with `mc` in the same image. Pinned to a release tag,
+# never `latest` — a single-maintainer fork must not change underneath a graded demo. Not
+# the `-distroless` variant: the healthcheck needs curl, and minio-init needs a shell.
+# Planned replacement: SeaweedFS (D8).
+x-object-store-image: &object-store-image pgsty/silo:RELEASE.2026-09-16T00-00-00Z
+
 services:
   # ============================================================================
   # Tier 1 — infrastructure
@@ -65,10 +77,9 @@ services:
       retries: 20
       start_period: 5s
 
+  # The service keeps the name `minio`: `minio:9000` is the S3 endpoint every client uses.
   minio:
-    # minio/minio on Docker Hub started refusing anonymous pulls in 2024; quay.io is the
-    # unauthenticated mirror MinIO itself documents as the replacement.
-    image: quay.io/minio/minio:latest
+    image: *object-store-image
     container_name: voltstream-minio
     restart: unless-stopped
     command: server /data --console-address ":9001"
@@ -133,7 +144,8 @@ services:
     entrypoint: ["/bin/bash", "/scripts/create_topics.sh"]
 
   minio-init:
-    image: quay.io/minio/mc:latest
+    # The server image carries `mc`, so the separate client image is no longer needed.
+    image: *object-store-image
     container_name: voltstream-minio-init
     depends_on:
       minio:

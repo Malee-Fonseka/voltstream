@@ -18,6 +18,7 @@ Task references (`Txxx`) point into [`Implementation_Tasks.md`](../Implementatio
 | D5 | Subsidy and final-bill arithmetic | T006 | ✅ decided 2026-09-19 | T029, T055, T057, T058, T062, T063, T078, T113, T141, T172 |
 | D6 | Airflow → Spark submission, and the sensor | T007 | ✅ decided 2026-09-19 | T039, T119, T120, T121, T122, T123, T125, T139, T162 |
 | D7 | Package and repository name spelling | T008 | ✅ decided 2026-09-19 | T015, T043, T109, T183 |
+| D8 | Object store image after MinIO's withdrawal | — | ✅ decided 2026-09-26 | T043, T047, T050, T182 |
 
 Legend: ⬜ open · ✅ decided · 🔁 superseded
 
@@ -1148,6 +1149,98 @@ it is called.
 - **Guard for the future:** `grep -rni "volstream" src/ docker/ config/ airflow/ scripts/
   tests/` must return nothing — the misspelling is allowed only in the README's note and in
   URLs. Add it to T016's lint target so it runs with `make lint`.
+
+---
+
+## D8 — Object store image after MinIO's withdrawal
+
+**Status:** ✅ decided 2026-09-26 · **Resolved in:** infrastructure change outside the task list
+
+### Context
+
+§5.4 chose MinIO as the object store, because it serves the S3 API from a container. Between
+October 2025 and September 2026, MinIO Inc. withdrew its community distribution:
+
+- **October 2025:** it stopped publishing images.
+- **December 2025:** the repository went into maintenance mode.
+- **February 2026:** the repository was archived.
+- **11 September 2026:** its Docker Hub repositories were deleted.
+
+On 2026-09-26 both images the stack used failed on a clean machine.
+`quay.io/minio/minio` and `quay.io/minio/mc` returned *401 Unauthorized*; `minio/minio` and
+`minio/mc` on Docker Hub reported that the repository does not exist. A fresh clone could no
+longer start the stack, which breaks the graded reproducibility requirement (§2.5, Gate 5).
+
+The architecture is unaffected. Every reader and writer speaks the S3 API against a
+configurable endpoint: `s3a://` in Spark, boto3 in Python, and the S3 hook and sensor in
+Airflow. §5.4 anticipated this: moving store is "a change of endpoint and credentials —
+nothing structural".
+
+Sources: [lobehub#9845](https://github.com/lobehub/lobehub/issues/9845),
+[StableBuild](https://www.stablebuild.com/blog/minio-images-disappeared-from-docker-hub),
+[VONNG: MinIO Is Dead, Long Live MinIO](https://blog.vonng.com/en/db/minio-resurrect/),
+[VONNG: Silo](https://vonng.com/en/db/silo-is-coming/).
+
+### Options
+
+| # | Option | For | Against |
+|---|---|---|---|
+| 1 | **`pgsty/silo`**, a community fork of MinIO (named `pgsty/minio` until August 2026) | Drop-in: same S3 API, same `MINIO_*` variables, same `/minio/health/live`, `mc` in the same image. No code change. Multi-arch. | One maintainer; already renamed once, over the trademark |
+| 2 | SeaweedFS (Apache-2.0) | Established, multi-maintainer, S3 gateway | New healthcheck, bucket creation and credential config; no `mc`, no MinIO console; Spark S3A to be verified |
+| 3 | Garage (AGPL-3.0) | Lightweight, maintained | Cluster layout and key setup through its CLI: more bootstrap |
+| 4 | Build MinIO from the archived source | The original code | Unmaintained; security fixes missing; adds a build step |
+| 5 | Local volume instead of object storage (§9.2, cut 5) | No external dependency | Gives up the object-store semantics the report claims |
+
+### Decision
+
+**Option 1 now, pinned: `pgsty/silo:RELEASE.2026-09-16T00-00-00Z`. Option 2 (SeaweedFS) is
+the planned long-term replacement.**
+
+The tag is pinned rather than `latest`, so a single-maintainer project cannot change
+underneath a graded demo. The `-distroless` variant is excluded: it has no `curl` for the
+healthcheck and no shell for `minio-init`.
+
+Verified on 2026-09-26 before adopting, against this repository's own configuration:
+
+- The image pulls, for both amd64 and arm64.
+- It starts with the compose file's `server /data --console-address ":9001"` and `MINIO_*`
+  variables.
+- The existing healthcheck (`curl -f …/minio/health/live`) returns 200.
+- `minio-init`'s unmodified `create_buckets.sh` creates all three buckets, and exits 0 when
+  run a second time.
+- boto3 1.43, with its default request checksums, completes every call the pipeline makes:
+  `head_bucket`, the reference dropper's put, copy and delete, `list_objects_v2`,
+  `head_object`, `get_object`, and a multipart upload (the path Spark's S3A takes for larger
+  files).
+
+Spark S3A itself has not yet run against it. It is the same server code as MinIO, but T082
+and T083 should confirm it on the next full run.
+
+### Consequence
+
+- **`docker-compose.yml`:** the image is defined once (`x-object-store-image`) and used by
+  both `minio` and `minio-init`; the separate `mc` image is gone. The service keeps the name
+  `minio`, because `minio:9000` is the endpoint every client is configured with.
+- **`scripts/smoke_test.sh` and `scripts/voltstream.ps1`:** bucket listings run `mc` inside
+  the `voltstream-minio` container with `docker exec`, so neither script names an image.
+- **T182 / report:** §5.4 and the tech-stack chapter name MinIO. Keep the S3-compatible
+  store as the choice, note the fork, and add to the limitations that the store is a
+  single-maintainer fork. The episode is also evidence for the viva: the vendor withdrew its
+  images, and because the pipeline only speaks S3, the swap was two image lines and no code.
+- **The SeaweedFS migration** should need no Python or Spark code changes, because the
+  endpoint is configuration. What would change, to be verified at the time:
+  - The image, and an S3 gateway command.
+  - Credentials, set through SeaweedFS's S3 identity configuration instead of
+    `MINIO_ROOT_*`.
+  - The healthcheck.
+  - Bucket creation through the S3 API (boto3 from the app image, or the AWS CLI) instead
+    of `mc`.
+  - The scripts' listings, for the same reason.
+  - The MinIO console link, which would go.
+
+  Also re-check Spark S3A (multipart upload, rename as copy plus delete, `ListObjectsV2`)
+  and boto3's default checksums. If the store rejects those checksums, set
+  `AWS_REQUEST_CHECKSUM_CALCULATION=when_required`.
 
 ---
 

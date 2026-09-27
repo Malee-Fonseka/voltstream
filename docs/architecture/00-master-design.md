@@ -609,6 +609,14 @@ reads as less considered.
 **Rejected — HDFS.** NameNode operational overhead is unjustified at this scale, and
 it reintroduces the compute/storage coupling that object storage removes.
 
+> **Update (2026-09-26, decision D8):** MinIO Inc. withdrew its community distribution
+> between October 2025 and September 2026. It stopped publishing images, archived the
+> repository, and deleted its Docker Hub repositories, so `quay.io/minio/*` and `minio/*`
+> no longer pull. The stack now runs `pgsty/silo`, a community-maintained fork of MinIO with
+> the same S3 API, pinned to a release tag. SeaweedFS is the planned long-term replacement.
+> The swap changed two image lines and no code: this section's argument that moving store is
+> "a change of endpoint and credentials", tested for real.
+
 Two caveats worth a paragraph in the report, because they demonstrate genuine
 understanding:
 

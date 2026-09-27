@@ -217,6 +217,10 @@ asserting the latter would be asserting something the file sink does not provide
   PostgreSQL instance. No replication, no failover.
 - **Secrets live in `.env`**, not in a secret manager. Every credential in the repository
   is a non-secret local default.
+- **The object store is a community fork of MinIO** (`pgsty/silo`, pinned to a release tag),
+  because MinIO Inc. withdrew its community images in 2025–26 (D8). The fork is maintained
+  by one person; SeaweedFS is the planned replacement. The pipeline speaks only the S3 API,
+  so the swap is configuration, not code.
 - **The raw archiver performs no validation or filtering.** This is deliberate: filtering
   at the archiver would destroy the bug-recovery property that justifies the master
   dataset's existence. Validation happens in the layers that read it.

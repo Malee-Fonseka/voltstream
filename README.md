@@ -77,7 +77,7 @@ into the future. Bringing the stack up with raw `docker compose` skips that — 
 |---|---|---|
 | `kafka` | 29092 | Event log; 3 partitions, ~7 day retention |
 | `postgres` | 5432 | Serving layer — speed and batch views |
-| `minio` | 9000 / 9001 | Master dataset and the daily landing zone |
+| `minio` | 9000 / 9001 | Master dataset and the daily landing zone. Runs `pgsty/silo`, a MinIO-compatible fork, since MinIO stopped publishing images (decision D8) |
 | `meter-producer` | — | 50 meters, one reading each per 2 real seconds, with injected faults |
 | `reference-dropper` | — | One tariff and weather file per simulated day |
 | `raw-archiver` | 8011 | Kafka → Parquet, no transformation whatsoever |

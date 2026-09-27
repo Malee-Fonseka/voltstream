@@ -99,8 +99,10 @@ for t in "meter.readings" "meter.readings.dlq"; do
 done
 
 echo "-- checking MinIO buckets --"
-BUCKETS="$(MSYS_NO_PATHCONV=1 docker run --rm --network voltstream --entrypoint /bin/sh quay.io/minio/mc:latest -c \
-    "mc alias set local http://minio:9000 voltstream voltstream-dev >/dev/null 2>&1 && mc ls local/" 2>/dev/null)"
+# `mc` ships inside the object-store image (D8), so it runs in the server container itself
+# rather than in a separate client image. MC_HOST_<alias> supplies endpoint and credentials.
+BUCKETS="$(docker exec -e MC_HOST_local=http://voltstream:voltstream-dev@localhost:9000 \
+    voltstream-minio mc ls local/ 2>/dev/null)"
 for b in "voltstream-raw" "voltstream-landing" "voltstream-archive"; do
     if echo "${BUCKETS}" | grep -q "${b}/"; then
         pass "bucket ${b} present"
