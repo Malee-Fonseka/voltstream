@@ -175,12 +175,19 @@ say "difference is late data archived after the original run, now included."
 section "Run ledger for ${DAY} (pipeline_runs)"
 LEDGER="$(psql_value "SELECT status, orchestrator_run_id, to_char(finished_at, 'HH24:MI:SS') FROM pipeline_runs WHERE sim_date = '${DAY}' AND layer = 'batch_billing' ORDER BY started_at")"
 echo "${LEDGER}" | awk -F'|' '{ printf "  %-11s %-32s finished %s\n", $1, $2, $3 }'
-LAST3_STATUS="$(echo "${LEDGER}" | tail -n 3 | cut -d'|' -f1 | tr '\n' ' ')"
-LAST3_RUNS="$(echo "${LEDGER}" | tail -n 3 | cut -d'|' -f2 | sort -u | wc -l | tr -d ' ')"
+# A `failed` row is an attempt Airflow retried within the same run (each attempt records
+# its own row), not a restatement, so the check reads the completed ones.
+COMPLETED="$(echo "${LEDGER}" | grep -v '^failed|')"
+LAST3_STATUS="$(echo "${COMPLETED}" | tail -n 3 | cut -d'|' -f1 | tr '\n' ' ')"
+LAST3_RUNS="$(echo "${COMPLETED}" | tail -n 3 | cut -d'|' -f2 | sort -u | wc -l | tr -d ' ')"
+RETRIED="$(echo "${LEDGER}" | grep -c '^failed|')"
 if [ "${LAST3_STATUS}" = "superseded superseded success " ] && [ "${LAST3_RUNS}" = "3" ]; then
     pass "superseded -> superseded -> success, from three distinct orchestrator runs"
 else
     fail "ledger ends '${LAST3_STATUS}' with ${LAST3_RUNS} distinct runs"
+fi
+if [ "${RETRIED}" -gt 0 ]; then
+    say "  ${RETRIED} failed attempt(s) above were retried by Airflow within their run; see its log"
 fi
 
 say "the Airflow UI shows all three runs for ${DAY}: http://localhost:$(env_value AIRFLOW_HOST_PORT 8080)/"

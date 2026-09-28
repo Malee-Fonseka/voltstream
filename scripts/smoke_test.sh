@@ -78,8 +78,13 @@ if [ "${1:-}" = "kill-speed-layer" ]; then
     else
         fail "the speed layer had not caught up 300 s after the restart"
     fi
-    PEAK_LAG="$(prom_value 'max(max_over_time(voltstream_consumer_lag{layer="speed"}[5m]))' | cut -d. -f1)"
-    say "  the backlog it worked through from the checkpoint: up to ${PEAK_LAG} records of lag"
+    # Its consumed counter restarted at 0 with the process, so it now counts everything read
+    # since the restart: the backlog from the checkpoint, then the live stream. (The lag
+    # gauge cannot show the backlog: it is set after each micro-batch, and the first one
+    # after a restart reads the whole backlog.)
+    READ_SINCE="$(prom_int 'sum(voltstream_events_consumed_total{layer="speed"})')"
+    say "  it has read ${READ_SINCE:-?} records since the restart, starting from its checkpoint: the"
+    say "  ${OUTAGE_SECONDS} s it missed (about $((OUTAGE_SECONDS * 25)) readings at 25/s), then the live stream"
 
     AFTER="$(bill_total "${FINAL_DAY}")"
     if [ "${AFTER}" = "${BEFORE}" ]; then

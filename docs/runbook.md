@@ -79,6 +79,10 @@ already has data, then:
    speed layer dropped). The two add up to the delta exactly.
 5. Opens the dashboard. Its badge makes the same flip, Provisional → Final.
 
+Measured 2026-09-28 on a warm stack: 6¼ minutes. HH-0001 on 2026-01-02 went from speed
+(provisional, 01-01 tariff) to batch (final, 237.38 on the 01-02 tariff); delta −6.90, all
+of it tariff effect, 2.907 %.
+
 *Say while it waits:* the same URL answers from whichever layer can. While the day is open,
 the only answer is the speed layer's estimate, labelled as such. Once the batch layer has
 billed the closed day from the master dataset, its answer replaces the estimate. That is the
@@ -139,6 +143,12 @@ prints the original, wrong and corrected bills side by side, then the run ledger
 (`billing__<date>`, `…__r1`, `…__r2`). It takes about 6–8 minutes, because each run waits
 out the 90-second late-data grace behind a freshly written tariff file.
 
+Measured 2026-09-28 on 2026-01-02: the corrupted run took 139 s and made all 50 bills wrong
+(the day's total went from 18,737.41 to 44,876.57); the corrected run put all 50 back to the
+cent. The ledger ended `superseded → superseded → success` from three distinct runs. The
+corrected run's first attempt failed on a memory-starved host and Airflow's retry succeeded
+(5.7 minutes in all); the script reports such retried attempts rather than counting them.
+
 *Say while it runs:* the batch layer never patches a bill. It recomputes the day from the
 immutable master dataset and the corrected reference data, and the earlier result is marked
 superseded, not erased from the ledger. (The bills table keeps only the current version;
@@ -158,6 +168,11 @@ then restarts the speed layer and shows it resume from its checkpoint and catch 
 shows the bills are unaffected: a finalised day's bill is served identically before, during
 and after the kill, and the day of the kill is billed in full once it closes. About 7–10
 minutes.
+
+Measured 2026-09-28: during a 60-second SIGKILL outage the live view went 56 s stale while
+the raw archiver took in 1,526 readings. The speed layer caught up 22 s after restarting,
+the finalised bill for the previous day stayed 237.38 throughout, and the day of the kill
+was billed in full: 50 bills, HH-0001 with 148 readings against 144 the day before.
 
 *Say:* billing reads the master dataset, not the speed view. The speed layer is a fast,
 disposable approximation, and losing it costs freshness, never correctness.
