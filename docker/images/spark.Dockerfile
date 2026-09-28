@@ -61,15 +61,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /extra-jars
+# Retry every failure, not just HTTP 5xx: a cold build once died on one dropped TLS handshake
+# (curl exit 35) on a slow link, after the jar before it had taken two minutes (T175).
 RUN set -eux; \
     base=https://repo1.maven.org/maven2; \
-    curl -fsSL -O "$base/org/apache/spark/spark-sql-kafka-0-10_2.12/${SPARK_KAFKA_CONNECTOR_VERSION}/spark-sql-kafka-0-10_2.12-${SPARK_KAFKA_CONNECTOR_VERSION}.jar"; \
-    curl -fsSL -O "$base/org/apache/spark/spark-token-provider-kafka-0-10_2.12/${SPARK_KAFKA_CONNECTOR_VERSION}/spark-token-provider-kafka-0-10_2.12-${SPARK_KAFKA_CONNECTOR_VERSION}.jar"; \
-    curl -fsSL -O "$base/org/apache/kafka/kafka-clients/${KAFKA_CLIENTS_VERSION}/kafka-clients-${KAFKA_CLIENTS_VERSION}.jar"; \
-    curl -fsSL -O "$base/org/apache/commons/commons-pool2/${COMMONS_POOL2_VERSION}/commons-pool2-${COMMONS_POOL2_VERSION}.jar"; \
-    curl -fsSL -O "$base/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar"; \
-    curl -fsSL -O "$base/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_BUNDLE_VERSION}/aws-java-sdk-bundle-${AWS_SDK_BUNDLE_VERSION}.jar"; \
-    curl -fsSL -O "$base/org/postgresql/postgresql/${POSTGRESQL_JDBC_VERSION}/postgresql-${POSTGRESQL_JDBC_VERSION}.jar"
+    fetch() { curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 -O "$base/$1"; }; \
+    fetch "org/apache/spark/spark-sql-kafka-0-10_2.12/${SPARK_KAFKA_CONNECTOR_VERSION}/spark-sql-kafka-0-10_2.12-${SPARK_KAFKA_CONNECTOR_VERSION}.jar"; \
+    fetch "org/apache/spark/spark-token-provider-kafka-0-10_2.12/${SPARK_KAFKA_CONNECTOR_VERSION}/spark-token-provider-kafka-0-10_2.12-${SPARK_KAFKA_CONNECTOR_VERSION}.jar"; \
+    fetch "org/apache/kafka/kafka-clients/${KAFKA_CLIENTS_VERSION}/kafka-clients-${KAFKA_CLIENTS_VERSION}.jar"; \
+    fetch "org/apache/commons/commons-pool2/${COMMONS_POOL2_VERSION}/commons-pool2-${COMMONS_POOL2_VERSION}.jar"; \
+    fetch "org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar"; \
+    fetch "com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_BUNDLE_VERSION}/aws-java-sdk-bundle-${AWS_SDK_BUNDLE_VERSION}.jar"; \
+    fetch "org/postgresql/postgresql/${POSTGRESQL_JDBC_VERSION}/postgresql-${POSTGRESQL_JDBC_VERSION}.jar"
 
 # ---------------------------------------------------------------------------
 # Final stage

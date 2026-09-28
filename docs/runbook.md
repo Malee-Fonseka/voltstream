@@ -13,10 +13,32 @@ Commands are shown for PowerShell (`.\scripts\voltstream.ps1 …`). The same ste
 
 | You need | Check |
 |---|---|
-| Docker Desktop, running, 8 GB of memory allotted | `docker info` answers |
+| Docker Desktop, running, with **8 GB of memory at least, 10 GB recommended**, and 4+ CPUs | `docker info --format '{{.MemTotal}} {{.NCPU}}'` |
 | Git for Windows (for Git Bash; the fault, backfill and demo scripts are bash) | `C:\Program Files\Git\bin\bash.exe` exists |
 | Free ports 3000, 5432, 8000, 8011, 8012, 8080, 9000, 9001, 9090, 9091, 9093, 29092 | nothing else listening on them |
 | PowerShell allowed to run the script | if refused: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` |
+
+**Memory, measured (T176).** Sampled every 5 s over 6.5 minutes including a billing run,
+2026-09-28, on the demo laptop (16 CPUs and 7.46 GiB for Docker, out of 15.4 GB of RAM):
+
+| | Container memory | CPU | Docker VM memory free | Swap |
+|---|---|---|---|---|
+| Steady | 5.3–6.1 GiB | up to 9.5 cores | at least 1.0 GiB | full (2 GiB) |
+| During a billing run | up to 6.4 GiB | up to 11.7 cores | down to 465 MiB | full |
+
+So the stack needs about 8.5–9 GB to run without swapping. With less it still runs, but
+while a billing run's Spark container is up the VM swaps hard enough to stall Docker's DNS
+for up to two minutes, and a batch attempt can fail and be retried (backlog R38). On
+Windows, Docker Desktop gets half the machine's RAM unless told otherwise. To give it
+10 GB, create `C:\Users\<you>\.wslconfig` containing
+
+```ini
+[wsl2]
+memory=10GB
+```
+
+then run `wsl --shutdown` and start Docker Desktop again. On a 16 GB laptop that leaves
+about 6 GB for Windows, so close other heavy apps before a demo.
 
 **Time.** One simulated day is 5 real minutes (288× compression). Everything below is in
 real time unless it says *simulated*.
@@ -115,7 +137,7 @@ docker logs -f voltstream-api 2>&1 | Select-String '"stage": "alert"'
 | `rejects` (T158) | Restart the producer with 15 % null fields (normally 1 %) | **HighRejectRate**, warning | Fires after about 2 minutes, at a ratio of about 11 % |
 | `sla` (T159) | Pause the `daily_billing` DAG | **BatchSLAMiss**, critical | Fires 15 minutes after the last successful billing run; clears once the unpaused DAG catches up |
 | `renewable` (T160) | None needed: the simulated night | **LowRenewableContribution**, warning | Clears after dawn (~10:00 simulated), fires after dusk (~19:00–20:00 simulated) |
-| `divergence` (T161) | Restart the producer sending 60 % of readings 3–5 simulated hours late | **LambdaDivergenceHigh**, warning | *filled in below after the run* |
+| `divergence` (T161) | Restart the producer sending 60 % of readings 3–5 simulated hours late | **LambdaDivergenceHigh**, warning | Not demonstrated live: the first faulted day is reconciled 10–15 minutes in, and on this laptop that run stalled on memory. The rule itself was shown firing by lowering its threshold to 1 %: it fired at the next evaluation on the observed 1.68 % (T148). Leave this scenario out of the live demo |
 
 Two notes for the viva:
 

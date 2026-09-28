@@ -17,7 +17,7 @@ PY := .venv/bin/python
 endif
 
 
-.PHONY: help up demo down clean test test-all lint check-alerts logs faults backfill kill-test anchor
+.PHONY: help up demo down clean test test-all coverage lint check-alerts logs faults backfill kill-test cold-starts cold-start anchor
 
 help:
 	@echo "voltstream targets:"
@@ -27,12 +27,15 @@ help:
 	@echo "  make clean       stop the stack and DESTROY volumes"
 	@echo "  make test        unit, property and consistency tests"
 	@echo "  make test-all    everything, including integration (needs the stack up)"
+	@echo "  make coverage    the CI gate: core/ coverage must stay at 100 %"
 	@echo "  make lint        ruff and mypy"
 	@echo "  make check-alerts  validate the alert rules and Alertmanager config, run the rule tests"
 	@echo "  make logs s=api  follow one service's logs"
 	@echo "  make faults      break the pipeline and assert each alert fires   [s=stale|rejects|sla|renewable|divergence]"
 	@echo "  make backfill d=2026-01-02   restate one simulated day"
 	@echo "  make kill-test   kill the speed layer mid-day, show recovery and unaffected bills"
+	@echo "  make cold-starts [n=5]  wipe and start from nothing n times; no crash-loops (DESTROYS data)"
+	@echo "  make cold-start  Gate 5: fresh clone, no-cache build, demo (DESTROYS data)"
 
 # Stamp a fresh clock anchor into .env. Every start goes through this: the anchor is a
 # real instant that simulated time is measured from, scaled by 288, so one left over from
@@ -78,6 +81,10 @@ test:
 test-all:
 	$(PY) -m pytest
 
+# The CI coverage gate (T170), locally: core/ must stay fully covered.
+coverage:
+	$(PY) -m pytest -m "not integration" --cov=voltstream.core --cov-branch --cov-fail-under=100 --cov-report=term-missing
+
 lint:
 	$(PY) -m ruff check src tests
 	$(PY) -m ruff format --check src tests
@@ -116,3 +123,11 @@ backfill:
 
 kill-test:
 	bash scripts/smoke_test.sh kill-speed-layer
+
+# T177 and T175. Both DESTROY the stack's data. cold-start clones the committed repository
+# into a new directory and rebuilds from scratch: the Gate 5 check.
+cold-starts:
+	bash scripts/smoke_test.sh cold-starts $(or $(n),5)
+
+cold-start:
+	bash scripts/smoke_test.sh cold-start

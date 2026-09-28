@@ -1,8 +1,7 @@
 # 04 — Observability
 
-**Status:** built in Phase 12 (T142–T156), 2026-09-27. The alert rules' *measured* firing
-conditions are filled in by Phase 13 (T157–T161); until then the last table in this document
-records what has been observed so far.
+**Status:** built in Phase 12 (T142–T156), 2026-09-27. The alert rules' firing conditions
+were measured in Phase 13 (T157–T161), 2026-09-28: section 10.
 
 The rubric asks for "logging, metrics and tracing across pipeline stages to detect and
 diagnose pipeline failures" (§10.1). This document is the source for the report's
@@ -285,9 +284,9 @@ scripted `all` run from 09:50 UTC.
 |---|---|---|---|---|
 | `MeterDataStale` (T157) | Producer stopped | 173 s and 195 s after the stop, all 5 zones in one critical notification | 41 s and 46 s after the restart | With the stop at simulated night, all 5 zones' LowRenewableContribution alerts were `suppressed` by the inhibition, and the API's `/alerts/status` listed only MeterDataStale |
 | `HighRejectRate` (T158) | Producer restarted with `null_field_rate` 0.15 | 119 s after the restart, at a 5-minute ratio of 11.6 % (normal running: about 2 %) | Within about 5 minutes of restoring the producer, as the 5-minute ratio decays | The ratio crossed 5 % about 30 s in; the rest is the rule's 1-minute `for:` |
-| `BatchSLAMiss` (T159) | `daily_billing` paused | 10:04:35, 21 s after its due time (last success + 900 s) | *filled in below* | Once, after the laptop slept for 3.5 hours with billing paused, it fired as soon as the stack woke |
+| `BatchSLAMiss` (T159) | `daily_billing` paused | 10:04:35, 21 s after its due time (last success + 900 s) | 10:08:45, 6 s after the first billing run to succeed after unpausing (10:08:39); the DAG took about 3 minutes to catch up | Once, after the laptop slept for 3.5 hours with billing paused, it fired as soon as the stack woke |
 | `LowRenewableContribution` (T160) | None: the simulated night | Simulated 19:40 on 2026-02-24 (dusk), all 5 zones | Simulated 10:00 (mid-morning) | Fires every simulated night by design (section 6) |
-| `LambdaDivergenceHigh` (T161) | *filled in below* | | | T148's check: with the threshold lowered to 1 %, it fired at the next evaluation on the latest reconciled day's 1.68 % and reached the webhook on the warning route |
+| `LambdaDivergenceHigh` (T161) | Producer sending 60 % of readings 3–5 simulated hours late | Not reached: stopped after 19 minutes, before a day under the fault was reconciled, on a memory-starved host | — | **Deviation:** demonstrated through T148's check instead. T148's check: with the threshold lowered to 1 %, it fired at the next evaluation on the latest reconciled day's 1.68 % and reached the webhook on the warning route |
 
 Earlier, in Phase 12 (2026-09-27): a synthetic `MeterDataStale{grid_zone="ZONE-A"}` posted
 with `amtool` silenced only ZONE-A's LowRenewableContribution while the other four zones

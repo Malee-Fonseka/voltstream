@@ -202,6 +202,9 @@ markers = [
 # --- coverage ----------------------------------------------------------------
 # The CI gate (T170) is `--cov=voltstream.core --cov-fail-under=<N>`: core/ is
 # where the correctness marks live; gating the whole package rewards testing glue.
+# The coverage *gate* is on core/ only and lives in CI (.github/workflows/ci.yml, T170) and
+# `make coverage`: `--cov=voltstream.core --cov-fail-under=100`. It is not a fail_under
+# here, because that would apply to every coverage run, including whole-package ones.
 [tool.coverage.run]
 source = ["voltstream"]
 branch = true

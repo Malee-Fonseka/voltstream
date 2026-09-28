@@ -1,5 +1,7 @@
 # voltstream
 
+[![ci](https://github.com/Malee-Fonseka/voltstream/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Malee-Fonseka/voltstream/actions/workflows/ci.yml)
+
 A Lambda-architecture data platform for smart-grid monitoring and billing, built for
 EC8203 Applied Big Data Engineering (Use Case 3).
 
@@ -36,7 +38,13 @@ report.)_
 
 ## Prerequisites
 
-- Docker Desktop, with roughly 6 GB available to the engine
+- Docker Desktop with **at least 8 GB of memory, 10 GB recommended**, and 4+ CPUs (8
+  recommended). Measured on 2026-09-28 (T176): 15 long-running containers use 5.3–6.1 GiB,
+  and up to 6.4 GiB while a billing run's Spark container is up, with CPU peaks of about
+  12 cores. At 8 GB the stack runs but swaps during billing runs, which can briefly stall
+  Docker's DNS. On Windows, Docker gets half the machine's RAM by default; to give it
+  10 GB, put `[wsl2]` and `memory=10GB` in `%UserProfile%\.wslconfig`, run
+  `wsl --shutdown` and restart Docker Desktop (see `docs/runbook.md`).
 - Python 3.11 (`.python-version` pins 3.11.9 — PySpark 3.5 does not support 3.12+)
 - `make`. On Windows use Git Bash with `choco install make`, or WSL.
 
@@ -109,6 +117,20 @@ into the future. Bringing the stack up with raw `docker compose` skips that — 
 | Serving layer | [storage/repositories.py](src/voltstream/storage/repositories.py), [api/](src/voltstream/api/) |
 | Observability | [metrics.py](src/voltstream/metrics.py), [logging_setup.py](src/voltstream/logging_setup.py) |
 | Measured limitations, honestly | [docs/assumptions.md](docs/assumptions.md) |
+
+## Tests
+
+| Command | What runs | Needs |
+|---|---|---|
+| `make test` | Unit, property and consistency tests, including the pure-Python vs Spark billing check | Python and Java; no Docker |
+| `make coverage` | The same, with CI's gate: `core/` must stay at 100 % coverage | as above |
+| `make check-alerts` | promtool on the alert rules and their unit tests, amtool on the routing | Docker |
+| `make test-all` | Everything, including the integration tests: producer to Kafka, the batch job end to end on committed fixtures with hand-computed bills, the merge function, archiver restart | the stack up |
+| `make cold-starts` | Five starts from nothing, asserting no container crash-loops | Docker; destroys the stack's data |
+| `make cold-start` | Gate 5: a fresh clone, images rebuilt with no cache, the demo run with no manual steps | Docker; destroys the stack's data |
+
+CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs the first three on every
+push and pull request.
 
 ## What is deliberately simplified
 

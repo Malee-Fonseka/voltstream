@@ -355,3 +355,12 @@ def test_the_documented_metric_table_matches_metrics_py() -> None:
             defined.add((name, value._type, tuple(sorted(value._labelnames))))
 
     assert documented == defined
+
+
+def test_ci_checks_alerting_with_the_images_compose_runs() -> None:
+    """The CI alerting job must validate with the server's own version (T169)."""
+    workflow = (_REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    services = _compose()["services"]
+    for service in ("prometheus", "alertmanager"):
+        image = services[service]["image"]
+        assert image in workflow, f"ci.yml does not use {image}"
