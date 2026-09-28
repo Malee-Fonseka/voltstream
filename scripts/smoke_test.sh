@@ -8,7 +8,107 @@
 # tables present, 50 seeded households across exactly 5 zones.
 #
 # Usage: bash scripts/smoke_test.sh   (run from anywhere inside the repository)
+#
+# Second mode, T167: `bash scripts/smoke_test.sh kill-speed-layer` answers §10.3's viva
+# question "what happens if the speed layer dies mid-day?" on the running stack. It kills
+# the speed layer (SIGKILL, no clean shutdown), shows the live view going stale while the
+# raw archiver keeps consuming, restarts it, shows it resume from its checkpoint, and shows
+# that bills are unaffected: a finalised day's bill is served identically before, during
+# and after the kill, and the day of the kill is billed in full, because billing reads the
+# master dataset, not the speed view.
 set -uo pipefail
+
+if [ "${1:-}" = "kill-speed-layer" ]; then
+    # shellcheck source=lib/common.sh
+    source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+    HOUSEHOLD="${2:-HH-0001}"
+    OUTAGE_SECONDS=60
+    require_stack
+
+    bill_total() {
+        curl -s --max-time 10 "${API}/api/v1/households/${HOUSEHOLD}/bill?date=$1" \
+            | sed -n 's/.*"total":"\{0,1\}\([^",}]*\).*/\1/p'
+    }
+    readings_of() {
+        psql_value "SELECT readings_count FROM household_bill_daily WHERE household_id = '${HOUSEHOLD}' AND sim_date = '$1'"
+    }
+
+    section "T167 — kill the speed layer mid-day"
+    KILL_DAY="$(sim_today)"
+    FINAL_DAY="$(psql_value "SELECT max(sim_date) FROM pipeline_runs WHERE layer = 'batch_billing' AND status = 'success'")"
+    [ -n "${FINAL_DAY}" ] || { echo "no billed day yet; run this once the first day is billed" >&2; exit 2; }
+    BEFORE="$(bill_total "${FINAL_DAY}")"
+    ARCHIVED_BEFORE="$(prom_value 'sum(voltstream_events_consumed_total{layer="archiver"})' | cut -d. -f1)"
+    say "simulated $(sim_now_text); killing the speed layer during ${KILL_DAY}"
+    say "${HOUSEHOLD}'s final bill for ${FINAL_DAY} before the kill: ${BEFORE}"
+
+    docker kill voltstream-speed-layer >/dev/null
+    on_exit_undo "docker start voltstream-speed-layer >/dev/null"
+    say "speed layer killed (SIGKILL); down for ${OUTAGE_SECONDS} s"
+    sleep "${OUTAGE_SECONDS}"
+
+    DURING="$(bill_total "${FINAL_DAY}")"
+    AGE="$(prom_value 'max(voltstream_pg_zone_data_age_seconds)' | cut -d. -f1)"
+    ARCHIVED_DURING="$(prom_value 'sum(voltstream_events_consumed_total{layer="archiver"})' | cut -d. -f1)"
+    say "during the outage: the live zone view is ${AGE} s old (the dashboard gap), while the"
+    say "raw archiver consumed $((ARCHIVED_DURING - ARCHIVED_BEFORE)) more readings into the master dataset"
+    if [ "${ARCHIVED_DURING}" -gt "${ARCHIVED_BEFORE}" ]; then
+        pass "the batch layer's input kept flowing while the speed layer was down"
+    else
+        fail "the raw archiver stopped consuming too"
+    fi
+    if [ -n "${DURING}" ] && [ "${DURING}" = "${BEFORE}" ]; then
+        pass "the final bill for ${FINAL_DAY} is still served, unchanged (${DURING}), with the speed layer down"
+    else
+        fail "the final bill for ${FINAL_DAY} changed or vanished during the outage ('${DURING}')"
+    fi
+
+    docker start voltstream-speed-layer >/dev/null
+    forget_undo "docker start voltstream-speed-layer >/dev/null"
+    T0="$(date +%s)"
+    say "speed layer started; it resumes from its checkpoint, not from the head of the topic"
+    caught_up() {
+        local age lag
+        age="$(prom_value 'max(voltstream_pg_zone_data_age_seconds)' | cut -d. -f1)"
+        lag="$(prom_value 'max(voltstream_consumer_lag{layer="speed"})' | cut -d. -f1)"
+        [ -n "${age}" ] && [ "${age}" -lt 30 ] && [ "${lag:-1}" = "0" ]
+    }
+    if wait_until 300 "the speed layer to catch up" caught_up; then
+        pass "caught up $(($(date +%s) - T0)) s after the restart: live view fresh, consumer lag 0"
+    else
+        fail "the speed layer had not caught up 300 s after the restart"
+    fi
+    PEAK_LAG="$(prom_value 'max(max_over_time(voltstream_consumer_lag{layer="speed"}[5m]))' | cut -d. -f1)"
+    say "  the backlog it worked through from the checkpoint: up to ${PEAK_LAG} records of lag"
+
+    AFTER="$(bill_total "${FINAL_DAY}")"
+    if [ "${AFTER}" = "${BEFORE}" ]; then
+        pass "the final bill for ${FINAL_DAY} is identical before, during and after the kill (${AFTER})"
+    else
+        fail "the final bill for ${FINAL_DAY} changed: ${BEFORE} before, ${AFTER} after"
+    fi
+
+    section "The day of the kill, once billed"
+    billed() { [ "$(psql_value "SELECT count(*) FROM pipeline_runs WHERE sim_date = '${KILL_DAY}' AND layer = 'batch_billing' AND status = 'success'")" = "1" ]; }
+    say "${KILL_DAY} closes in about $(real_seconds_to_sim_midnight) s; billing follows within two minutes"
+    if wait_until $(($(real_seconds_to_sim_midnight) + 420)) "${KILL_DAY} to be billed" billed; then
+        BILLS="$(psql_value "SELECT count(*) FROM household_bill_daily WHERE sim_date = '${KILL_DAY}'")"
+        R_KILL="$(readings_of "${KILL_DAY}")"
+        R_PREV="$(readings_of "$(date -u -d "${KILL_DAY} - 1 day" +%Y-%m-%d)")"
+        say "${HOUSEHOLD}: ${R_KILL} readings billed for ${KILL_DAY}, ${R_PREV} for the day before"
+        if [ "${BILLS}" = "50" ] && [ -n "${R_KILL}" ] && [ -n "${R_PREV}" ] \
+            && [ $((R_KILL * 100)) -ge $((R_PREV * 95)) ]; then
+            pass "${KILL_DAY} billed in full: 50 bills, and no readings lost to the outage"
+        else
+            fail "${KILL_DAY}: ${BILLS} bills, ${R_KILL} readings against ${R_PREV} the day before"
+        fi
+        say "${HOUSEHOLD}'s final bill for ${KILL_DAY}: $(bill_total "${KILL_DAY}")"
+    else
+        fail "${KILL_DAY} was not billed"
+    fi
+    summary || exit 1
+    exit 0
+fi
 
 # Git Bash on Windows (this project's primary dev shell, §T009) rewrites bare
 # absolute-looking arguments like `/opt/kafka/bin/...` or `/bin/sh` into Windows paths

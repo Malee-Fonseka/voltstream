@@ -1,0 +1,44 @@
+# voltstream — the Postgres-derived gauges (T144, T147). Named `voltstream_pg_*` so they
+# are never mistaken for the eight application metrics in metrics.py.
+
+collector_name: voltstream_alert_inputs
+
+metrics:
+  # MeterDataStale (T144). The speed layer rewrites a zone's newest window on every
+  # trigger while that zone's readings arrive, and `updated_at` is set to now() on each
+  # write (streaming/sinks.py upsert_batch). When readings stop, nothing is written and
+  # this age grows. It grows too if the speed layer itself is down: either way, no reading
+  # from the zone is reaching the live view.
+  #
+  # The newest window rather than max(updated_at) over all windows: a backfill arriving
+  # after an outage rewrites old windows, which would reset the age while the zone is
+  # still silent. A zone with no rows at all has no series and cannot fire; that only
+  # happens before the speed layer's first write.
+  - metric_name: voltstream_pg_zone_data_age_seconds
+    type: gauge
+    help: "Real seconds since the speed layer last wrote the zone's newest window."
+    key_labels: [grid_zone]
+    values: [age_seconds]
+    query: |
+      SELECT grid_zone,
+             EXTRACT(EPOCH FROM now() - updated_at)::double precision AS age_seconds
+      FROM (
+          SELECT DISTINCT ON (grid_zone) grid_zone, updated_at
+          FROM zone_metrics_rt
+          ORDER BY grid_zone, window_start DESC
+      ) AS newest
+
+  # BatchSLAMiss (T147). When the newest successful billing run finished, as Unix time.
+  # `superseded` counts: a restated day was billed successfully first. Before any run has
+  # succeeded it is the moment the stack was first created (households are seeded then),
+  # so a DAG that never runs still ages past the SLA instead of producing no series.
+  - metric_name: voltstream_pg_billing_last_success_timestamp_seconds
+    type: gauge
+    help: "Unix time the newest successful billing run finished; stack creation if none has."
+    values: [last_success]
+    query: |
+      SELECT EXTRACT(EPOCH FROM coalesce(
+          (SELECT max(finished_at) FROM pipeline_runs
+           WHERE layer = 'batch_billing' AND status IN ('success', 'superseded')),
+          (SELECT min(created_at) FROM households)
+      ))::double precision AS last_success

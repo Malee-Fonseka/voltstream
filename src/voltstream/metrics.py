@@ -145,8 +145,11 @@ def push_metrics(job: str, *, timeout_seconds: float = 5.0) -> bool:
     than a network failure (`OSError`) is a bug and does propagate.
 
     Only samples that exist are sent. Every labelled metric this process never touched
-    has no children and so no samples, which means a job pushes what it set and nothing
-    else — the reconciliation job pushes `voltstream_lambda_divergence` alone.
+    has no children and so no samples, so a job pushes the labelled metrics it set. The
+    exception is `voltstream_lambda_divergence`, the one unlabelled metric: an unlabelled
+    gauge always has a value, so every process exports it, and every push carries it, at
+    0 until set. Only reconciliation sets it, which is why the alert rule and the
+    dashboards read it with `job="reconciliation"`.
     """
     url = get_config().observability.pushgateway_url
     if not url:

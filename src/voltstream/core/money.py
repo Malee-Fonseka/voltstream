@@ -22,6 +22,7 @@ DIVERGENCE_PCT = (6, 3)
 
 _MONEY_QUANT = Decimal(1).scaleb(-MONEY[1])  # Decimal("0.01")
 _KWH_QUANT = Decimal(1).scaleb(-KWH[1])  # Decimal("0.0001")
+_DIVERGENCE_QUANT = Decimal(1).scaleb(-DIVERGENCE_PCT[1])  # Decimal("0.001")
 
 
 def round_money(value: Decimal) -> Decimal:
@@ -35,3 +36,25 @@ def quantize_kwh(value: Decimal) -> Decimal:
     """Quantize to kWh precision (4 dp) for storage/display uniformity. Readings already
     arrive with <= 4 dp (D5); this never rounds away meaningful precision in practice."""
     return value.quantize(_KWH_QUANT, rounding=ROUND_HALF_UP)
+
+
+def pct_divergence(
+    abs_divergence: Decimal, batch_energy_charge: Decimal, batch_fixed_charge: Decimal
+) -> Decimal:
+    """`100 * abs_divergence / (energy_charge + fixed_charge)`, 0 when that base is 0 (D5).
+
+    The one definition of speed-vs-batch divergence as a percentage, shared by the
+    reconciliation job (reconciliation_daily.pct_divergence) and the API's /bill/delta, so
+    the two can never report different figures for the same household and day.
+
+    The base is the batch bill's gross charges, never `final_bill`: a net exporter's final
+    bill is negative or near zero, and dividing by it would make the percentage explode.
+    Rounded half-up to the column's three places. The base is reachable at zero only with
+    a zero fixed charge and zero consumption.
+    """
+    base = batch_energy_charge + batch_fixed_charge
+    if base == 0:
+        return Decimal(0).quantize(_DIVERGENCE_QUANT)
+    return (Decimal(100) * abs_divergence / base).quantize(
+        _DIVERGENCE_QUANT, rounding=ROUND_HALF_UP
+    )

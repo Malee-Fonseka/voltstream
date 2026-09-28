@@ -21,6 +21,12 @@
       check    Verify every stage end to end (takes about 30 seconds).
       bill     Show one household's bill for a day, and which layer served it.
       logs     Follow one service's logs.
+      demo     The demo: provisional bill, the day closes, final bill and the delta.
+      faults   Break the pipeline on purpose and assert each alert fires (Phase 13).
+      backfill Restate one billed day through a corrupted, then corrected, tariff.
+      killtest Kill the speed layer mid-day; show it recover and bills unaffected.
+      capture  Screenshot Grafana, the dashboard, API docs, Alertmanager, Prometheus alerts.
+    demo, faults, backfill and killtest run the bash scripts in scripts\ through Git Bash.
 
 .EXAMPLE
     .\scripts\voltstream.ps1 run
@@ -30,6 +36,10 @@
     .\scripts\voltstream.ps1 bill -Household HH-0007 -Date 2026-01-02
 .EXAMPLE
     .\scripts\voltstream.ps1 logs -Service speed-layer
+.EXAMPLE
+    .\scripts\voltstream.ps1 faults -Scenario stale
+.EXAMPLE
+    .\scripts\voltstream.ps1 backfill -Date 2026-01-03
 
 .NOTES
     If Windows refuses to run the script, either run it as
@@ -40,7 +50,8 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('help', 'build', 'start', 'run', 'stop', 'clean', 'status', 'check', 'bill', 'logs')]
+    [ValidateSet('help', 'build', 'start', 'run', 'stop', 'clean', 'status', 'check', 'bill', 'logs',
+                 'demo', 'faults', 'backfill', 'killtest', 'capture')]
     [string]$Command = 'help',
 
     # Simulated date (yyyy-MM-dd). check: defaults to the latest billed day.
@@ -52,6 +63,15 @@ param(
 
     # Compose service for 'logs', e.g. speed-layer, raw-archiver, meter-producer, api.
     [string]$Service,
+
+    # Fault scenario for 'faults'. 'all' runs every one, about 30 minutes.
+    [ValidateSet('all', 'stale', 'rejects', 'sla', 'renewable', 'divergence')]
+    [string]$Scenario = 'all',
+
+    # 'capture': prefix for the screenshot files, naming the moment they show.
+    # 'faults': with -Capture, each firing alert is held and screenshotted automatically.
+    [string]$Label,
+    [switch]$Capture,
 
     # Skip the confirmation before 'clean' or 'run' delete data.
     [switch]$Force
@@ -134,6 +154,10 @@ function Initialize-Settings {
     $script:ConsolePort = Get-EnvValue 'MINIO_CONSOLE_HOST_PORT' '9001'
     $script:ArchiverPort = Get-EnvValue 'ARCHIVER_METRICS_PORT' '8011'
     $script:SpeedPort   = Get-EnvValue 'SPEED_LAYER_METRICS_PORT' '8012'
+    $script:GrafanaPort = Get-EnvValue 'GRAFANA_HOST_PORT' '3000'
+    $script:PromPort    = Get-EnvValue 'PROMETHEUS_HOST_PORT' '9090'
+    $script:AlertPort   = Get-EnvValue 'ALERTMANAGER_HOST_PORT' '9093'
+    $script:PushPort    = Get-EnvValue 'PUSHGATEWAY_HOST_PORT' '9091'
     $script:ImageTag    = Get-EnvValue 'VOLTSTREAM_IMAGE_TAG' 'local'
 }
 
@@ -399,6 +423,9 @@ function Show-Urls {
     Write-Host "  Airflow          http://localhost:$($script:AirflowPort)/   (login: see 'status')"
     Write-Host "  MinIO console    http://localhost:$($script:ConsolePort)/   ($($script:MinioUser) / $($script:MinioPass))"
     Write-Host "  Spark metrics    http://localhost:$($script:ArchiverPort)/metrics (archiver), http://localhost:$($script:SpeedPort)/metrics (speed layer)"
+    Write-Host "  Grafana          http://localhost:$($script:GrafanaPort)/   (no login needed; three dashboards)"
+    Write-Host "  Prometheus       http://localhost:$($script:PromPort)/   (targets: /targets, alerts: /alerts)"
+    Write-Host "  Alertmanager     http://localhost:$($script:AlertPort)/"
 }
 
 function Invoke-Build {
@@ -449,7 +476,7 @@ function Invoke-Stop {
 function Invoke-Clean {
     Assert-Docker
     if (-not $Force -and (Test-StackHasData)) {
-        $answer = Read-Host "This deletes ALL data: Kafka, Postgres, MinIO and the Spark checkpoints. Type 'yes' to continue"
+        $answer = Read-Host "This deletes ALL data: Kafka, Postgres, MinIO, the Spark checkpoints and the monitoring history. Type 'yes' to continue"
         if ($answer -ne 'yes') { Write-Host 'Cancelled.'; exit 0 }
     }
     Write-Section 'Removing containers and volumes'
@@ -700,7 +727,9 @@ function Invoke-Check {
     Write-Section ("8. Batch layer - authoritative bills (Spark, via Airflow){0}" -f $(if ($day) { " for $day" } else { '' }))
     if (-not $day) {
         Write-Check 'WAIT' 'Billed day' 'no day billed yet - the first billing finishes ~5-7 min after the anchor, the first complete day ~10-13 min'
+        Invoke-ObservabilityCheck
         Write-Summary
+        if ($script:Tally.FAIL -gt 0) { exit 1 }
         exit 0
     }
     $r = Invoke-Sql "SELECT status, count(*) FROM pipeline_runs WHERE sim_date = '$day' AND layer = 'batch_billing' GROUP BY status ORDER BY status"
@@ -776,8 +805,65 @@ SELECT
         }
     }
 
+    Invoke-ObservabilityCheck
     Write-Summary
     if ($script:Tally.FAIL -gt 0) { exit 1 }
+}
+
+# Stage 11, run on both of Invoke-Check's exits: monitoring is checkable before any day is
+# billed, and is most useful exactly then.
+function Invoke-ObservabilityCheck {
+    Write-Section '11. Observability - Prometheus, Alertmanager, Grafana'
+    $prom = "http://localhost:$($script:PromPort)"
+    # 10 s, not the 5 used elsewhere: during a billing run the Spark containers can starve
+    # the host long enough for a healthy service to miss a 5-second deadline.
+    try {
+        $targets = @((Invoke-RestMethod -UseBasicParsing -TimeoutSec 10 -Uri "$prom/api/v1/targets").data.activeTargets)
+        $down = @($targets | Where-Object { $_.health -ne 'up' })
+        if ($targets.Count -eq 0) { Write-Check 'FAIL' 'Scrape targets' 'Prometheus has no targets' }
+        elseif ($down.Count -eq 0) { Write-Check 'PASS' 'Scrape targets' "$($targets.Count) of $($targets.Count) up" }
+        else { Write-Check 'FAIL' 'Scrape targets' ('down: ' + (($down | ForEach-Object { $_.labels.job }) -join ', ')) }
+
+        $rules = @((Invoke-RestMethod -UseBasicParsing -TimeoutSec 10 -Uri "$prom/api/v1/rules").data.groups | ForEach-Object { $_.rules })
+        $broken = @($rules | Where-Object { $_.health -eq 'err' })
+        if ($broken.Count -gt 0) { Write-Check 'FAIL' 'Alert rules' ('failing to evaluate: ' + (($broken | ForEach-Object { $_.name }) -join ', ')) }
+        elseif ($rules.Count -eq 5) { Write-Check 'PASS' 'Alert rules' '5 loaded and evaluating' }
+        else { Write-Check 'FAIL' 'Alert rules' "$($rules.Count) loaded, expected 5" }
+
+        $managers = @((Invoke-RestMethod -UseBasicParsing -TimeoutSec 10 -Uri "$prom/api/v1/alertmanagers").data.activeAlertmanagers)
+        if ($managers.Count -gt 0) { Write-Check 'PASS' 'Alertmanager' 'discovered by Prometheus' }
+        else { Write-Check 'FAIL' 'Alertmanager' 'Prometheus has not discovered it' }
+
+        $firing = @((Invoke-RestMethod -UseBasicParsing -TimeoutSec 10 -Uri "$prom/api/v1/alerts").data.alerts | Where-Object { $_.state -eq 'firing' })
+        if ($firing.Count -eq 0) { Write-Check 'INFO' 'Alerts firing' 'none' }
+        else {
+            $names = $firing | Group-Object { $_.labels.alertname } | ForEach-Object { "$($_.Name) x$($_.Count)" }
+            Write-Check 'INFO' 'Alerts firing' (($names -join ', ') + '  (LowRenewableContribution every simulated night is expected)')
+        }
+    } catch {
+        Write-Check 'FAIL' 'Prometheus' "no answer on $prom within 10 s ($($_.Exception.Message))"
+    }
+
+    try {
+        # Windows PowerShell returns a JSON array as a single object: assign first, then count.
+        $groups = @((Invoke-RestMethod -UseBasicParsing -TimeoutSec 10 -Uri "http://localhost:$($script:PushPort)/api/v1/metrics").data)
+        $jobs = @($groups | ForEach-Object { $_.labels.job })
+        $missing = @('daily_billing', 'daily_zone_rollup', 'reconciliation' | Where-Object { $jobs -notcontains $_ })
+        if ($missing.Count -eq 0) { Write-Check 'PASS' 'Batch pushes' 'daily_billing, daily_zone_rollup and reconciliation have pushed' }
+        else { Write-Check 'WAIT' 'Batch pushes' ('not yet: ' + ($missing -join ', ') + ' - each pushes when its first run finishes') }
+    } catch {
+        Write-Check 'FAIL' 'Pushgateway' "no answer on http://localhost:$($script:PushPort) within 10 s"
+    }
+
+    try {
+        $health = Invoke-RestMethod -UseBasicParsing -TimeoutSec 10 -Uri "http://localhost:$($script:GrafanaPort)/api/health"
+        $boards = Invoke-RestMethod -UseBasicParsing -TimeoutSec 10 -Uri "http://localhost:$($script:GrafanaPort)/api/search?type=dash-db&tag=voltstream"
+        $boardCount = @($boards).Count
+        if ($health.database -eq 'ok' -and $boardCount -eq 3) { Write-Check 'PASS' 'Grafana' "3 dashboards provisioned, open to anonymous viewers (http://localhost:$($script:GrafanaPort)/)" }
+        else { Write-Check 'FAIL' 'Grafana' "database: $($health.database), dashboards visible anonymously: $boardCount of 3" }
+    } catch {
+        Write-Check 'FAIL' 'Grafana' "no answer on http://localhost:$($script:GrafanaPort) within 10 s"
+    }
 }
 
 function Invoke-Bill {
@@ -818,6 +904,81 @@ function Invoke-Logs {
     Invoke-Compose logs -f --tail 100 $Service
 }
 
+# T164: screenshots of the pages the report's evidence list names, taken with a headless
+# browser so they are the same size and complete every time. Each file is named after what
+# it shows, prefixed with -Label (the moment: e.g. 'stale' while MeterDataStale fires).
+function Invoke-Capture {
+    $browser = @(
+        (Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe'),
+        (Join-Path $env:ProgramFiles 'Microsoft\Edge\Application\msedge.exe'),
+        (Join-Path $env:ProgramFiles 'Google\Chrome\Application\chrome.exe')
+    ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+    if (-not $browser) { Stop-WithError 'No Edge or Chrome found for headless screenshots.' }
+
+    $dir = Join-Path $Root 'docs\report\screenshots'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $prefix = if ($Label) { "$Label-" } else { '' }
+    # A throwaway profile, so the capture never touches the user's own browser session.
+    $profileDir = Join-Path $env:TEMP 'voltstream-capture-profile'
+    $grafana = "http://localhost:$($script:GrafanaPort)"
+    $pages = [ordered]@{
+        'grafana-pipeline-health'   = @("$grafana/d/voltstream-pipeline-health?orgId=1&kiosk", 1800)
+        'grafana-grid-operations'   = @("$grafana/d/voltstream-grid-operations?orgId=1&kiosk", 1300)
+        'grafana-lambda-divergence' = @("$grafana/d/voltstream-lambda-divergence?orgId=1&kiosk", 2100)
+        'dashboard'                 = @("http://localhost:$($script:ApiPort)/", 1100)
+        'openapi-docs'              = @("http://localhost:$($script:ApiPort)/docs", 1500)
+        'alertmanager'              = @("http://localhost:$($script:AlertPort)/", 1100)
+        'prometheus-alerts'         = @("http://localhost:$($script:PromPort)/alerts", 1500)
+    }
+    Write-Section "Capturing $($pages.Count) pages into docs\report\screenshots"
+    foreach ($name in $pages.Keys) {
+        $url, $height = $pages[$name]
+        $file = Join-Path $dir "$prefix$name.png"
+        Remove-Item -Force -ErrorAction SilentlyContinue $file
+        # Start-Process -Wait: the browser is a GUI program, which PowerShell's call operator
+        # does not wait for, and a second instance on the same profile would collide with it.
+        $browserArgs = @('--headless=new', '--disable-gpu', '--hide-scrollbars', "--window-size=1600,$height",
+            '--virtual-time-budget=20000', "--user-data-dir=`"$profileDir`"", "--screenshot=`"$file`"", "`"$url`"")
+        Start-Process -FilePath $browser -ArgumentList $browserArgs -Wait -WindowStyle Hidden
+        if (Test-Path $file) { Write-Check 'PASS' $name (Split-Path $file -Leaf) }
+        else { Write-Check 'FAIL' $name "no screenshot from $url" }
+    }
+    Write-Host ''
+    Write-Host 'Not captured here: the Airflow DAG graph (needs a login) and CI. Take those by hand.' -ForegroundColor DarkGray
+}
+
+# Git for Windows' bash, never WSL's: C:\Windows\System32\bash.exe would run the scripts
+# inside a Linux distribution that has no Docker CLI and no access to these paths.
+function Find-GitBash {
+    $candidates = @(
+        (Join-Path $env:ProgramFiles 'Git\bin\bash.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Git\bin\bash.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Programs\Git\bin\bash.exe')
+    )
+    foreach ($candidate in $candidates) {
+        if ($candidate -and (Test-Path $candidate)) { return $candidate }
+    }
+    $onPath = Get-Command bash -ErrorAction SilentlyContinue |
+        Where-Object { $_.Source -notmatch '\\System32\\' } | Select-Object -First 1
+    if ($onPath) { return $onPath.Source }
+    Stop-WithError 'This command runs a bash script and needs Git for Windows (Git Bash). Install it from https://git-scm.com/download/win'
+}
+
+# The Phase 13 scripts are bash (the Makefile targets run the same files); this runs them
+# from the repository root and passes their exit code through.
+function Invoke-BashScript([string]$Script, [string[]]$Arguments = @()) {
+    Assert-Docker
+    $bash = Find-GitBash
+    Push-Location $Root
+    try {
+        & $bash $Script @Arguments
+        $code = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+    exit $code
+}
+
 function Show-Help {
     Write-Host @'
 
@@ -833,6 +994,15 @@ voltstream - build, run and check the stack (Windows, no make needed)
   .\scripts\voltstream.ps1 bill      One household's bill and its source
                                      [-Household HH-0001] [-Date yyyy-MM-dd]
   .\scripts\voltstream.ps1 logs      Follow a service's logs          -Service speed-layer
+
+  .\scripts\voltstream.ps1 demo      Provisional bill -> day closes -> final bill and delta
+                                     [-Household HH-0001]
+  .\scripts\voltstream.ps1 faults    Break it on purpose, assert each alert  [-Scenario all|
+                                     stale|rejects|sla|renewable|divergence]
+  .\scripts\voltstream.ps1 backfill  Restate a billed day (corrupt, fix)  -Date yyyy-MM-dd
+  .\scripts\voltstream.ps1 killtest  Kill the speed layer mid-day and watch it recover
+  .\scripts\voltstream.ps1 capture   Screenshot the evidence pages     [-Label stale]
+  .\scripts\voltstream.ps1 faults -Capture   Hold each alert and screenshot it while it fires
 
 Typical session:
   run  ->  status (now and then)  ->  check (after ~13 minutes)  ->  stop or clean
@@ -863,4 +1033,17 @@ switch ($Command) {
     'check'  { Invoke-Check }
     'bill'   { Invoke-Bill }
     'logs'   { Invoke-Logs }
+    'demo'   { Invoke-BashScript 'scripts/demo.sh' @($Household) }
+    'faults' {
+        # -Capture: inject_faults.sh holds each alert for a minute and calls back into this
+        # script to screenshot it while it fires (FAULT_CAPTURE, FAULT_HOLD_SECONDS).
+        if ($Capture) { $env:FAULT_CAPTURE = '1'; $env:FAULT_HOLD_SECONDS = '60' }
+        Invoke-BashScript 'scripts/inject_faults.sh' @($Scenario)
+    }
+    'capture' { Invoke-Capture }
+    'backfill' {
+        if (-not $Date) { Stop-WithError 'Pass -Date yyyy-MM-dd: a day that was billed at least two simulated days ago.' }
+        Invoke-BashScript 'scripts/backfill.sh' @($Date)
+    }
+    'killtest' { Invoke-BashScript 'scripts/smoke_test.sh' @('kill-speed-layer', $Household) }
 }

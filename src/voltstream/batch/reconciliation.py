@@ -46,7 +46,7 @@ from pydantic import ValidationError
 
 from voltstream.config import get_config
 from voltstream.contracts.reference import TariffRecord
-from voltstream.core.money import DIVERGENCE_PCT, round_money
+from voltstream.core.money import DIVERGENCE_PCT, pct_divergence, round_money
 from voltstream.core.netting import net
 from voltstream.core.tariff import BlockBoundary, TariffRates, compute_bill
 from voltstream.logging_setup import get_logger
@@ -157,20 +157,6 @@ def _rates(record: TariffRecord) -> TariffRates:
 # --------------------------------------------------------------------------------------
 # The arithmetic (D4, D5)
 # --------------------------------------------------------------------------------------
-
-
-def pct_divergence(
-    abs_divergence: Decimal, batch_energy_charge: Decimal, batch_fixed_charge: Decimal
-) -> Decimal:
-    """`100 * abs_divergence / (energy_charge + fixed_charge)`, 0 when that base is 0 (D5).
-
-    Rounded half-up to the column's three places. The base is reachable at zero only with
-    a zero fixed charge and zero consumption.
-    """
-    base = batch_energy_charge + batch_fixed_charge
-    if base == 0:
-        return Decimal(0).quantize(_PCT_QUANT)
-    return (_HUNDRED * abs_divergence / base).quantize(_PCT_QUANT, rounding=ROUND_HALF_UP)
 
 
 def reconcile_household(

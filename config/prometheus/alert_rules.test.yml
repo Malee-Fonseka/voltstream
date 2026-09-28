@@ -1,0 +1,160 @@
+# voltstream — unit tests for alert_rules.yml, run by promtool (`make check-alerts`).
+#
+# Each rule against synthetic series: when it must fire, and the cases the rule text says
+# it must not (a fresh zone, a single low window, an idle pipeline, a normal day).
+# Series values use promtool's expanding notation: 'a+bxn' is a, a+b, ... n+1 samples,
+# one per `interval`.
+
+rule_files:
+  - alert_rules.yml
+
+evaluation_interval: 15s
+
+tests:
+  # T144 — ZONE-A goes silent (its age grows 15 s per scrape); ZONE-B keeps writing.
+  - interval: 15s
+    input_series:
+      - series: 'voltstream_pg_zone_data_age_seconds{grid_zone="ZONE-A"}'
+        values: '10+15x20'
+      - series: 'voltstream_pg_zone_data_age_seconds{grid_zone="ZONE-B"}'
+        values: '5x20'
+    alert_rule_test:
+      # 115 s: under the threshold.
+      - eval_time: 1m45s
+        alertname: MeterDataStale
+        exp_alerts: []
+      # 130 s: over it, but only pending until `for: 30s` has passed.
+      - eval_time: 2m
+        alertname: MeterDataStale
+        exp_alerts: []
+      - eval_time: 2m30s
+        alertname: MeterDataStale
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              grid_zone: ZONE-A
+            exp_annotations:
+              summary: "No readings from ZONE-A for 2m 40s"
+              description: >-
+                The speed layer has not written ZONE-A's newest window for longer than
+                alerts.stale_data_minutes (2 real minutes). Either the meters stopped
+                sending (check meter-producer) or the speed layer stopped processing
+                (check speed-layer).
+
+  # T145 — ZONE-A at night (low from the third sample on); ZONE-B dips for one sample.
+  - interval: 15s
+    input_series:
+      - series: 'voltstream_zone_renewable_ratio{grid_zone="ZONE-A"}'
+        values: '0.40 0.30 0.10 0.05 0 0 0'
+      - series: 'voltstream_zone_renewable_ratio{grid_zone="ZONE-B"}'
+        values: '0.40 0.30 0.10 0.30 0.40 0.40 0.40'
+    alert_rule_test:
+      # First low evaluation: pending for both zones.
+      - eval_time: 30s
+        alertname: LowRenewableContribution
+        exp_alerts: []
+      # Second consecutive low evaluation: ZONE-A fires; ZONE-B recovered and does not.
+      - eval_time: 45s
+        alertname: LowRenewableContribution
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              grid_zone: ZONE-A
+            exp_annotations:
+              summary: "ZONE-A renewable ratio 5%, below 15%"
+              description: >-
+                Solar generation in ZONE-A has covered less than
+                alerts.low_renewable_threshold (15%) of consumption for at least three
+                consecutive 15-minute windows.
+
+  # T146 — 100 records/s consumed throughout. Rejects at 2/s (the default fault mix) for
+  # 10 minutes, then 10/s (10%). Then everything stops, as an idle pipeline would.
+  - interval: 15s
+    input_series:
+      - series: 'voltstream_events_consumed_total{layer="speed"}'
+        values: '0+1500x80 120000x40'
+      - series: 'voltstream_records_rejected_total{layer="speed",reason="null_field"}'
+        values: '0+30x40 1200+150x40 7200x40'
+    alert_rule_test:
+      # 2 %: under the threshold.
+      - eval_time: 9m
+        alertname: HighRejectRate
+        exp_alerts: []
+      # 5 minutes into the 10 % spike the 5-minute rate is 10 %, and has been over 5 %
+      # for well over the 1-minute `for:`.
+      - eval_time: 15m
+        alertname: HighRejectRate
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "10% of consumed records rejected over 5 minutes"
+              description: >-
+                The speed layer rejected more than alerts.reject_rate_threshold (5%) of
+                the records it consumed over the last 5 minutes. The reasons are on the
+                pipeline health dashboard and in rejected_records; the records are in
+                meter.readings.dlq.
+      # Idle for over 5 minutes: 0 / 0, and the guard keeps it quiet.
+      - eval_time: 29m
+        alertname: HighRejectRate
+        exp_alerts: []
+
+  # T147 — billing last succeeded at t = 0, and never again (the DAG is paused).
+  - interval: 15s
+    input_series:
+      - series: 'voltstream_pg_billing_last_success_timestamp_seconds'
+        values: '0x80'
+    alert_rule_test:
+      # 15 minutes exactly: not yet over 900 s.
+      - eval_time: 15m
+        alertname: BatchSLAMiss
+        exp_alerts: []
+      - eval_time: 15m15s
+        alertname: BatchSLAMiss
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "No successful billing run for 15m 15s"
+              description: >-
+                A simulated day closed more than alerts.batch_sla_minutes (10 real
+                minutes) ago and has not been billed. Check the daily_billing DAG in
+                Airflow: paused, failing, or not triggered by tariff_watcher.
+
+  # T147 — billing succeeding every 5 minutes, as it does when healthy.
+  - interval: 5m
+    input_series:
+      - series: 'voltstream_pg_billing_last_success_timestamp_seconds'
+        values: '0+300x12'
+    alert_rule_test:
+      - eval_time: 58m
+        alertname: BatchSLAMiss
+        exp_alerts: []
+
+  # T148 — the day measured on the Gate 4 run (1.878 %), then a day at 6.4 %. Every other
+  # process exports the unlabelled gauge at 0 (see the rule); those series must not count.
+  - interval: 5m
+    input_series:
+      - series: 'voltstream_lambda_divergence{job="reconciliation"}'
+        values: '1.878 6.4'
+      - series: 'voltstream_lambda_divergence{job="daily_billing"}'
+        values: '0 0'
+      - series: 'voltstream_lambda_divergence{job="api",instance="api:8000"}'
+        values: '0 0'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: LambdaDivergenceHigh
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LambdaDivergenceHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: reconciliation
+            exp_annotations:
+              summary: "Speed and batch disagree by 6.40% on the latest reconciled day"
+              description: >-
+                The mean divergence between the speed layer's provisional bills and the
+                batch layer's final ones exceeds alerts.lambda_divergence_threshold_pct
+                (5%). The split between the stale tariff and dropped data is on the Lambda
+                divergence dashboard (reconciliation_daily).

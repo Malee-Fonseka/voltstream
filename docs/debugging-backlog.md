@@ -47,8 +47,8 @@ outputs look wrong in predictable ways. Don't debug the symptom in the new code:
 | `LowRenewableContribution` cannot be forced via cloud cover (T160) | R16 |
 
 R06 (lag), R07 (batch duration) and R21 (latency) were fixed on 2026-09-26, before Phase 12,
-because Phase 12's dashboards and alerts read those metrics directly. Batch pushes only take
-effect once Phase 12 sets `observability.pushgateway_url`.
+because Phase 12's dashboards and alerts read those metrics directly. Batch pushes took
+effect in Phase 12 (2026-09-27): the DAG now points the three batch jobs at the Pushgateway.
 
 R01, R02, R04, R05 and R08 were fixed on 2026-09-27, so the rows above for them no longer
 apply. After R02 the expected picture is D4's revised one: `tariff_effect` non-zero on every
@@ -97,6 +97,7 @@ row with a sign that alternates by day, and `data_effect` carrying the dropped b
 | R35 | Low | batch | A household with no valid readings gets no bill → row-count check fails | T113, T122 |
 | R36 | Medium | DAG / compose | DAG tasks always get the default Postgres and MinIO passwords | T121, D6 |
 | R37 | Low | simulators | A stalled producer tick is never made up: 138 readings per meter-day, not 150 | T072 |
+| R38 | High | batch / DAG | A transient DNS or connection failure fails a batch job outright; the rollup never retries, and a killed job leaves a `running` row forever | T113, T124, T122 |
 
 ---
 
@@ -383,6 +384,7 @@ stays flat, and the lag falls back after restart.
 
 ### R07 — Batch duration never reaches a backend (T116)
 - [x] Fixed 2026-09-26 — Pushgateway chosen. `daily_billing` and `daily_zone_rollup` call `metrics.push_metrics()` after committing; a push failure is a logged warning, never a failed run. Pushes are no-ops until `observability.pushgateway_url` is set in Phase 12.
+  **Live since Phase 12 (2026-09-27):** the DAG sets `VOLTSTREAM__OBSERVABILITY__PUSHGATEWAY_URL` for billing, the rollup and reconciliation. Verified: the first run pushed 16.5 s (billing) and 12.8 s (rollup), shown on the pipeline health dashboard.
 
 **Where:**
 
@@ -437,7 +439,13 @@ reconciliation) to the app image.
 ---
 
 ### R09 — `/bill/delta` contradicts D4/D5 (T129)
-- [ ] Fixed
+- [x] Fixed 2026-09-28, for T163's demo, which shows the delta. `delta = speed_estimate −
+  batch_final` (D4), so `delta == tariff_effect + data_effect` once reconciled.
+  `delta_pct` goes through `pct_divergence`, moved from `batch/reconciliation.py` to
+  `core/money.py` so the API and the reconciliation job share one definition (D5's gross
+  charges base). `BillDelta`'s field descriptions are updated.
+  `tests/unit/test_api_bill_delta.py` covers the sign, the identity, the net exporter and the
+  open day; two of its tests fail on the old code.
 
 **Where:** [`api/routers/households.py:165-176`](../src/voltstream/api/routers/households.py#L165-L176) `get_bill_delta`
 
@@ -511,6 +519,48 @@ lines, to match `make lint`.
 
 ---
 
+### R38 — Transient infrastructure failures are fatal to a day's batch run
+- [ ] Fixed
+
+*Found 2026-09-28, by the Phase 13 fault drills, on a saturated laptop (the SLA-pause backlog
+catching up, the divergence fault running, and an image build at the same time).*
+
+**What happened, from the Airflow logs:**
+
+- `billing__2026-02-22`: `run_zone_rollup` failed with
+  `failed to resolve host 'postgres': [Errno -3] Temporary failure in name resolution`, a
+  transient Docker DNS timeout. It has `retries=0`, so `run_reconciliation` and
+  `generate_report` never ran for that day: no reconciliation row, no report.
+- `billing__2026-02-24`: `run_daily_billing` failed the same way; its retry succeeded. The
+  failed attempt left its `pipeline_runs` row at `running` for good, since it could not
+  reach Postgres to mark itself `failed`.
+- `billing__2026-02-23`: a first billing attempt died in Spark (`An error occurred while
+  calling o65.count`, a block write failing under memory pressure); the retry succeeded.
+
+**What's wrong:**
+
+- The batch jobs open connections with bare `psycopg.connect` (`daily_billing.py`,
+  `daily_zone_rollup.py`, `storage/postgres.py`), so one failed DNS lookup ends the job.
+- The rollup's `retries=0` is deliberate: a failed cross-check is a data verdict, and
+  retrying it only fails again more slowly. But it makes every transient failure before
+  the cross-check fatal too, and everything downstream of the rollup is lost for the day.
+- An attempt killed before it can write `failed` leaves an orphan `running` row. Nothing
+  reads `running` rows for decisions, so bills are unaffected, but the ledger shows a run
+  that never ended.
+
+**Fix:**
+
+- Retry connection *establishment* only, a few times with backoff, on
+  `psycopg.OperationalError`, in one shared helper used by the batch jobs. A cross-check
+  verdict is still never retried.
+- Or give the rollup `retries=1` and accept one slow repeat of a genuine cross-check
+  failure.
+- On start, mark the day's stale `running` rows from earlier attempts `failed`.
+- Meanwhile, recover a lost day by clearing the failed task in Airflow (Graph →
+  `run_zone_rollup` → Clear), which reruns it and everything downstream.
+
+---
+
 ## Medium
 
 ### R14 — D2's config validation is missing
@@ -550,7 +600,11 @@ built "reading everything from config". Violations:
 ---
 
 ### R16 — Weather has no effect on solar (T066)
-- [ ] Fixed
+- [x] Decided 2026-09-28: **not fixed.** Data-generation accuracy is out of scope; the focus
+  is the pipeline and its orchestration. T160 demonstrates LowRenewableContribution through
+  the simulated night instead (`inject_faults.sh renewable`), which needs no data change.
+  Even fixed, 100 % cloud leaves 20 % of solar (`_SOLAR_CLOUD_ATTENUATION`), not reliably
+  under 15 % at midday.
 
 [`simulators/meter_producer.py:47`](../src/voltstream/simulators/meter_producer.py#L47)
 calls `solar_kwh(...)` without `cloud_cover_pct`, so it is always 0. T066 requires

@@ -197,6 +197,8 @@ observability:
   # Default root log level for logging_setup.py; overridden by VOLTSTREAM_LOG_LEVEL (.env).
   log_level: "INFO"
   # Pushgateway for one-shot batch containers, which exit before Prometheus could scrape
-  # them (T116, T138). null = do not push. The Pushgateway arrives with Prometheus in
-  # Phase 12 (T142/T143); point this at it then, e.g. "http://pushgateway:9091".
+  # them (T116, T138). null = do not push. Left null here on purpose: the Pushgateway only
+  # exists on the Compose network, so the billing DAG sets it for the batch containers it
+  # launches (VOLTSTREAM__OBSERVABILITY__PUSHGATEWAY_URL, daily_billing_dag.py), and a
+  # local run or a test never tries to reach it.
   pushgateway_url: null

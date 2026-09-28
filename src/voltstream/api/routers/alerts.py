@@ -11,8 +11,11 @@ because a sidecar died.
 So the failure is reported *in the payload*, where a dashboard can show "alerts
 unavailable" while continuing to display everything else.
 
-Alertmanager itself arrives in Phase 12; until then this degrades exactly as it would if
-the service were down, which is the behaviour worth having tested early.
+The same router is Alertmanager's receiver (T149): `POST /webhook` writes each notification
+as a structured log line, `stage: alert`, so an alert lands in the one JSON log stream the
+rest of the pipeline already writes to and can be found with the same grep. It is the only
+write-shaped endpoint in the API and it writes nothing but that log line; the database
+stays read-only from here.
 """
 
 from __future__ import annotations
@@ -24,7 +27,12 @@ import urllib.request
 from fastapi import APIRouter
 
 from voltstream.api.dependencies import TraceIdDep
-from voltstream.api.models import AlertsResponse, AlertStatus
+from voltstream.api.models import (
+    AlertmanagerNotification,
+    AlertsResponse,
+    AlertStatus,
+    WebhookAck,
+)
 from voltstream.logging_setup import get_logger
 
 router = APIRouter(prefix="/api/v1/alerts", tags=["alerts"])
@@ -87,3 +95,36 @@ def alert_status(trace_id: TraceIdDep) -> AlertsResponse:
             available=False,
             warning=f"Alertmanager unreachable at {url}; alert state is unknown, not empty.",
         )
+
+
+@router.post(
+    "/webhook",
+    response_model=WebhookAck,
+    summary="Alertmanager webhook receiver",
+)
+def alertmanager_webhook(
+    notification: AlertmanagerNotification, trace_id: TraceIdDep
+) -> WebhookAck:
+    """Log each alert in an Alertmanager notification as one structured line.
+
+    Firing alerts at WARNING, resolutions at INFO, so a level filter shows what is wrong
+    now. The line carries the receiver, which is the route the alert took
+    (config/alertmanager/alertmanager.yml), and the zone when the alert has one.
+    """
+    for alert in notification.alerts:
+        extra = {
+            "stage": "alert",
+            "receiver": notification.receiver,
+            "alert_status": alert.status,
+            "alertname": alert.labels.get("alertname", "unknown"),
+            "severity": alert.labels.get("severity", "unknown"),
+            "summary": alert.annotations.get("summary", ""),
+            "starts_at": alert.startsAt.isoformat() if alert.startsAt else None,
+        }
+        if "grid_zone" in alert.labels:
+            extra["grid_zone"] = alert.labels["grid_zone"]
+        if alert.status == "firing":
+            log.warning("alert firing", extra=extra)
+        else:
+            log.info("alert resolved", extra=extra)
+    return WebhookAck(received=len(notification.alerts))

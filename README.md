@@ -56,9 +56,20 @@ Then:
 - **API and docs** — <http://localhost:8000/docs>
 - **MinIO console** — <http://localhost:9001> (`voltstream` / `voltstream-dev`)
 - **Live zone load** — `curl http://localhost:8000/api/v1/zones/load`
+- **Grafana** — <http://localhost:3000> (no login): pipeline health, grid operations and
+  Lambda divergence dashboards
+- **Prometheus** — <http://localhost:9090> (targets, alert rules) and **Alertmanager** —
+  <http://localhost:9093>
 
 Other targets: `make up`, `make down`, `make clean` (destroys volumes), `make test`,
-`make test-all`, `make lint`, `make logs s=speed-layer`.
+`make test-all`, `make lint`, `make check-alerts`, `make logs s=speed-layer`.
+Observability is described in [`docs/architecture/04-observability.md`](docs/architecture/04-observability.md).
+
+To break it on purpose and prove the alerts notice: `make faults` (or one scenario:
+`make faults s=stale`), `make backfill d=<date>` for the restatement demo, and
+`make kill-test` for a speed-layer crash. On Windows without `make`, the same commands are
+`.\scripts\voltstream.ps1 faults | backfill -Date <date> | killtest | demo`. The demo, the
+fault drills and what to say during them are in [`docs/runbook.md`](docs/runbook.md).
 
 ## Simulated time
 

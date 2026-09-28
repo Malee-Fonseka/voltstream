@@ -1181,16 +1181,16 @@ purpose of the master dataset, expressed operationally.
 
 ### 8.2 What `docker compose up` starts
 
-Eleven containers in four dependency tiers. Compose starts services roughly in
-parallel, so `depends_on` with **health conditions** is mandatory — otherwise
-application containers crash-loop against a Kafka that is not yet listening.
+Eighteen containers in four dependency tiers, three of them one-shot. Compose starts
+services roughly in parallel, so `depends_on` with **health conditions** is mandatory —
+otherwise application containers crash-loop against a Kafka that is not yet listening.
 
 | Tier | Containers | Ready when |
 |---|---|---|
 | **1 — Infrastructure** | `kafka`, `postgres`, `minio` | Kafka accepts connections; Postgres accepts queries; MinIO API responds |
 | **2 — Bootstrap** *(run once, then exit 0)* | `kafka-init`, `postgres-init`, `minio-init` | Exit code 0 |
 | **3 — Long-running apps** | `meter-producer`, `reference-dropper`, `speed-layer`, `raw-archiver`, `api` | Own `/health` endpoints pass |
-| **4 — Orchestration & observability** | `airflow`, `prometheus`, `grafana`, `alertmanager` | Scheduler heartbeat; scrape targets up |
+| **4 — Orchestration & observability** | `airflow`, `docker-socket-proxy`, `prometheus`, `alertmanager`, `pushgateway`, `sql-exporter`, `grafana` | Scheduler heartbeat; scrape targets up (see `04-observability.md`) |
 
 **Tier 2 is the one people forget.** These are short-lived jobs, not services: they
 create topics, apply `01_schema.sql`, create buckets, then exit. Without them, tier-3
@@ -1688,7 +1688,10 @@ count. Furthermore, end-to-end latency is dominated by two numbers we configured
 | API read | ~20–50 ms |
 
 Postgres contributes on the order of 1%. We measure this with
-`voltstream_e2e_latency_seconds` rather than asserting it. Writes go through
+`voltstream_e2e_latency_seconds` rather than asserting it. *(Measured 2026-09-28: speed path
+p50 5.1 s, p95 14.3 s, none over 60 s; the watermark adds nothing in update mode, so the
+"~30 s" row above is wrong and the trigger alone dominates. Table and method:
+`04-observability.md` §11, T168.)* Writes go through
 `foreachBatch` as bulk upserts — one write of ~500 rows per micro-batch, not 500
 round-trips — and a Postgres outage stalls offset advancement rather than losing
 data, because Kafka absorbs it.

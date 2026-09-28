@@ -1,0 +1,135 @@
+# voltstream — alert rules (T144-T148, §9 Phase 4). Four required, one bonus.
+#
+# Thresholds are the values of the `alerts:` block in config/base.yaml, written out here
+# because Prometheus cannot read that file. tests/unit/test_observability_config.py fails
+# if the two disagree, and alert_rules.test.yml (`make check-alerts`) exercises each rule
+# against synthetic series with promtool.
+#
+# Time here is REAL time. One simulated day is 1440 / 288 = 5 real minutes, and one
+# 15-simulated-minute window is 3.125 real seconds.
+#
+# Severity drives routing in config/alertmanager/alertmanager.yml: `critical` means data
+# is missing or late (a bill will be wrong or late), `warning` means the data is flowing
+# but says something worth a look.
+
+groups:
+  - name: voltstream
+    rules:
+      # T144. alerts.stale_data_minutes: 2 -> 120 s.
+      #
+      # The gauge is already a duration (sql_exporter, D9), so the threshold is the
+      # "for more than 2 minutes". `for: 30s` is two more evaluations on top, so one
+      # scrape landing mid-write cannot fire it: pending after 2 minutes of silence,
+      # firing after 2.5.
+      - alert: MeterDataStale
+        expr: voltstream_pg_zone_data_age_seconds > 120
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "No readings from {{ $labels.grid_zone }} for {{ $value | humanizeDuration }}"
+          description: >-
+            The speed layer has not written {{ $labels.grid_zone }}'s newest window for
+            longer than alerts.stale_data_minutes (2 real minutes). Either the meters
+            stopped sending (check meter-producer) or the speed layer stopped processing
+            (check speed-layer).
+
+      # T145. alerts.low_renewable_threshold: 0.15, for 3 consecutive windows.
+      #
+      # 3 windows = 45 simulated minutes = 9.4 real seconds, rounded up to `for: 10s`.
+      # That is below what Prometheus can resolve here: the speed layer sets the gauge
+      # once per 10-second trigger (48 simulated minutes, about 3.2 windows), from the
+      # newest window in the batch, and it is scraped every 15 s. So at the 15-second
+      # evaluation interval `for: 10s` means two consecutive evaluations below the
+      # threshold, 72 simulated minutes apart: never fewer than 3 windows, and a single
+      # low window between two normal ones cannot fire it.
+      #
+      # Expected to fire every simulated night and clear every midday: solar output is 0
+      # from 18:00 to 06:00 (profiles.py) and T068 asserts the ratio crosses 0.15 both
+      # ways, so about half of each 5-minute simulated day is spent firing. That is the
+      # rule working, and MeterDataStale inhibits it for a zone whose data has stopped.
+      - alert: LowRenewableContribution
+        expr: voltstream_zone_renewable_ratio < 0.15
+        for: 10s
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.grid_zone }} renewable ratio {{ $value | humanizePercentage }}, below 15%"
+          description: >-
+            Solar generation in {{ $labels.grid_zone }} has covered less than
+            alerts.low_renewable_threshold (15%) of consumption for at least three
+            consecutive 15-minute windows.
+
+      # T146. alerts.reject_rate_threshold: 0.05, over 5 minutes.
+      #
+      # The speed layer's own ratio: it counts every record its validation query consumes
+      # and every one it rejects. Batch rejects are excluded on purpose: they arrive
+      # through the Pushgateway, where each run replaces the last, so rate() over them
+      # is meaningless.
+      #
+      # The `and` clause is the zero guard. An idle pipeline gives 0 / 0; that already
+      # evaluates to NaN, which compares false, but the guard states the intent instead
+      # of relying on float semantics.
+      - alert: HighRejectRate
+        expr: |
+          (
+              sum(rate(voltstream_records_rejected_total{layer="speed"}[5m]))
+            /
+              sum(rate(voltstream_events_consumed_total{layer="speed"}[5m]))
+          ) > 0.05
+          and
+          sum(rate(voltstream_events_consumed_total{layer="speed"}[5m])) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of consumed records rejected over 5 minutes"
+          description: >-
+            The speed layer rejected more than alerts.reject_rate_threshold (5%) of the
+            records it consumed over the last 5 minutes. The reasons are on the pipeline
+            health dashboard and in rejected_records; the records are in
+            meter.readings.dlq.
+
+      # T147. alerts.batch_sla_minutes: 10 after simulated day close.
+      #
+      # Measured as the age of the newest successful billing run (sql_exporter, D9).
+      # Billing runs once per simulated day, so under normal running that age never
+      # exceeds one day plus the billing latency. The rule fires when it exceeds one day
+      # plus the SLA: (5 + 10) * 60 = 900 s. Day D closes 5 minutes after day D-1 did,
+      # and D-1 was billed about a minute after it closed, so this fires about a minute
+      # after D's exact 10-minute deadline. No `for:`: the age only grows while the miss
+      # lasts, so there is nothing to debounce.
+      - alert: BatchSLAMiss
+        expr: time() - voltstream_pg_billing_last_success_timestamp_seconds > 900
+        labels:
+          severity: critical
+        annotations:
+          summary: "No successful billing run for {{ $value | humanizeDuration }}"
+          description: >-
+            A simulated day closed more than alerts.batch_sla_minutes (10 real minutes)
+            ago and has not been billed. Check the daily_billing DAG in Airflow: paused,
+            failing, or not triggered by tariff_watcher.
+
+      # T148, the bonus rule. alerts.lambda_divergence_threshold_pct: 5.0.
+      #
+      # The gauge is already a mean: reconciliation pushes the day's mean percent
+      # divergence between the speed estimate and the batch bill, once per reconciled
+      # day. The Pushgateway holds the latest value, so this reports on the most recently
+      # reconciled day until the next one replaces it. No `for:` for the same reason:
+      # the value changes once per simulated day.
+      #
+      # job="reconciliation" is required, not decoration. This is metrics.py's only
+      # unlabelled metric, and prometheus_client exports an unlabelled gauge from every
+      # process that imports it, set or not: the API, the producer, both Spark drivers and
+      # the other batch jobs' pushes all carry a 0. Only reconciliation sets it.
+      - alert: LambdaDivergenceHigh
+        expr: voltstream_lambda_divergence{job="reconciliation"} > 5
+        labels:
+          severity: warning
+        annotations:
+          summary: "Speed and batch disagree by {{ $value | printf \"%.2f\" }}% on the latest reconciled day"
+          description: >-
+            The mean divergence between the speed layer's provisional bills and the batch
+            layer's final ones exceeds alerts.lambda_divergence_threshold_pct (5%). The
+            split between the stale tariff and dropped data is on the Lambda divergence
+            dashboard (reconciliation_daily).

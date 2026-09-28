@@ -19,6 +19,7 @@ Task references (`Txxx`) point into [`Implementation_Tasks.md`](../Implementatio
 | D6 | Airflow → Spark submission, and the sensor | T007 | ✅ decided 2026-09-19 | T039, T119, T120, T121, T122, T123, T125, T139, T162 |
 | D7 | Package and repository name spelling | T008 | ✅ decided 2026-09-19 | T015, T043, T109, T183 |
 | D8 | Object store image after MinIO's withdrawal | — | ✅ decided 2026-09-26 | T043, T047, T050, T182 |
+| D9 | Where two alerts get facts no application metric carries | T147 | ✅ decided 2026-09-27 | T144, T147, T156 |
 
 Legend: ⬜ open · ✅ decided · 🔁 superseded
 
@@ -1293,7 +1294,9 @@ Verified on 2026-09-26 before adopting, against this repository's own configurat
   files).
 
 Spark S3A itself has not yet run against it. It is the same server code as MinIO, but T082
-and T083 should confirm it on the next full run.
+and T083 should confirm it on the next full run. **Confirmed on the Gate 4 run
+(2026-09-27):** the raw archiver wrote the master dataset, and the batch jobs read it and
+archived the tariff Parquet, all through S3A against this image.
 
 ### Consequence
 
@@ -1320,6 +1323,67 @@ and T083 should confirm it on the next full run.
   Also re-check Spark S3A (multipart upload, rename as copy plus delete, `ListObjectsV2`)
   and boto3's default checksums. If the store rejects those checksums, set
   `AWS_REQUEST_CHECKSUM_CALCULATION=when_required`.
+
+---
+
+## D9 — Where two alerts get facts no application metric carries
+
+**Status:** ✅ decided 2026-09-27 · **Resolved in:** T147 (also serves T144)
+
+### Context
+
+Two of the five alert rules need a fact that none of the eight metrics in `metrics.py`
+carries:
+
+- **MeterDataStale (T144)** needs to know when each zone last received a reading. The
+  obvious candidate, `voltstream_zone_renewable_ratio{grid_zone}`, cannot answer it: the
+  ratio is a constant 0 all night, so an unchanged value is indistinguishable from a dead
+  feed. Prometheus cannot see that a gauge was *set*, only its value.
+- **BatchSLAMiss (T147)** needs to know when billing last succeeded. T147 names the gap
+  itself ("a 'last successful run' gauge, which does not exist yet") and asks for either
+  the Pushgateway or a Postgres exporter.
+
+Both facts are already in Postgres, written by the pipeline: `zone_metrics_rt.updated_at`
+is set to `now()` on every speed-layer write, and `pipeline_runs.finished_at` records every
+billing run.
+
+### Options
+
+| # | Option | For | Against |
+|---|---|---|---|
+| 1 | **`sql_exporter`**: gauges from our own SQL | Reads facts the pipeline already writes; nothing new to keep in sync; metric names and types chosen freely; maintained for exactly this purpose | One more container; if it or Postgres is down, both alerts go quiet |
+| 2 | `postgres_exporter` with custom queries | The tool T147 names | Its custom-query flag (`--extend.query-path`) is marked **deprecated** in the current release (v0.20.1) |
+| 3 | BatchSLAMiss from the Pushgateway's `push_time_seconds{job="daily_billing"}` | No new service for that alert | Lost on a Pushgateway restart; absent until the first run, so a DAG that never runs never alerts; and it does nothing for MeterDataStale |
+| 4 | New or relabelled application metrics (e.g. `grid_zone` on `events_consumed_total`) | No exporter | Changes the eight-metric contract (§10.1, T027); a dead speed layer removes the series instead of firing |
+
+### Decision
+
+**Option 1: `burningalchemist/sql_exporter:0.24.8`, pinned, with two gauges and nothing else.**
+
+- `voltstream_pg_zone_data_age_seconds{grid_zone}`: `now() − updated_at` of the zone's
+  newest window. It is the newest window rather than the latest write anywhere, because a
+  backfill after an outage rewrites old windows while the zone is still silent. It also
+  grows when the speed layer is down, which is correct: no reading is reaching the live view.
+- `voltstream_pg_billing_last_success_timestamp_seconds`: `max(finished_at)` of successful
+  billing runs; the stack's creation time before the first, so a DAG that never runs still
+  ages past the SLA.
+
+The `voltstream_pg_` prefix keeps them apart from the application metrics; a unit test
+fails if the exporter ever defines a name `metrics.py` owns.
+
+### Consequence
+
+- **A read-only database role**, `voltstream_reader` (`docker/init/postgres/04_observability.sql`):
+  `SELECT` only, read-only transactions and a 5-second statement timeout. Grafana uses it
+  too, since anonymous viewers can open its dashboards.
+- **BatchSLAMiss measures the age of the last success, not each day's deadline.** It fires
+  when the age exceeds one simulated day plus the SLA (900 s), about a minute after the exact
+  deadline (04-observability.md §6).
+- **One more silent-failure mode**, stated in 04-observability.md §9: if the exporter stops,
+  both alerts lose their input. Its scrape target shows as down on the pipeline health
+  dashboard.
+- **T182 / report:** §10.1's metric table is unchanged. The two gauges are a separate table
+  in 04-observability.md §3.3.
 
 ---
 

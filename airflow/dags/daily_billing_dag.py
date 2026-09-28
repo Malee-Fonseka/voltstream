@@ -50,6 +50,12 @@ def _config() -> dict:
 _CFG = _config()
 _GRACE_SECONDS = int(_CFG["batch"]["late_data_grace_real_seconds"])
 _SLA_MINUTES = int(_CFG["alerts"]["batch_sla_minutes"])
+
+# Where the batch containers push their metrics as they exit (T116, T142): billing and the
+# rollup push voltstream_batch_duration_seconds, reconciliation pushes
+# voltstream_lambda_divergence. Set here rather than in base.yaml so a local run or a test
+# never tries to reach a Pushgateway that only exists on the Compose network.
+_PUSHGATEWAY_URL = "http://pushgateway:9091"
 _HOUSEHOLDS = int(_CFG["simulation"]["households"])
 
 
@@ -140,6 +146,7 @@ with DAG(
             "VOLTSTREAM__SIMULATION__ANCHOR_REAL": os.environ.get("VOLTSTREAM_ANCHOR_REAL", ""),
             "AWS_ENDPOINT_URL": "http://minio:9000",
             "AWS_DEFAULT_REGION": "us-east-1",
+            "VOLTSTREAM__OBSERVABILITY__PUSHGATEWAY_URL": _PUSHGATEWAY_URL,
             # Lineage: the job records this against pipeline_runs.orchestrator_run_id, so
             # a restated day shows which DAG run produced each of its two ledger rows.
             "VOLTSTREAM_ORCHESTRATOR_RUN_ID": "{{ run_id }}",
@@ -223,6 +230,7 @@ with DAG(
             "VOLTSTREAM__SIMULATION__ANCHOR_REAL": os.environ.get("VOLTSTREAM_ANCHOR_REAL", ""),
             "AWS_ENDPOINT_URL": "http://minio:9000",
             "AWS_DEFAULT_REGION": "us-east-1",
+            "VOLTSTREAM__OBSERVABILITY__PUSHGATEWAY_URL": _PUSHGATEWAY_URL,
             "VOLTSTREAM_ORCHESTRATOR_RUN_ID": "{{ run_id }}",
         },
         private_environment={
@@ -255,6 +263,7 @@ with DAG(
             "VOLTSTREAM__SIMULATION__ANCHOR_REAL": os.environ.get("VOLTSTREAM_ANCHOR_REAL", ""),
             "AWS_ENDPOINT_URL": "http://minio:9000",
             "AWS_DEFAULT_REGION": "us-east-1",
+            "VOLTSTREAM__OBSERVABILITY__PUSHGATEWAY_URL": _PUSHGATEWAY_URL,
         },
         private_environment={
             "VOLTSTREAM__POSTGRES__PASSWORD": os.environ.get("POSTGRES_PASSWORD", "voltstream"),
