@@ -9,15 +9,24 @@ otherwise hold a pooled connection open indefinitely, and after a few stalls the
 have no connections left to serve requests with. A dashboard going dark because a batch
 job is wedged is exactly the coupling the serving layer exists to avoid.
 
-The streaming path lives in `streaming/sinks.py` and uses `psycopg.connect` directly. This
-module is the API's side.
+The streaming path lives in `streaming/sinks.py` and opens its short-lived connections with
+`connect()` below. The pool is the API's side.
+
+**`connect()` is the one way to open a connection outside the pool** (R38). It retries
+*establishing* a connection, never a query, so nothing half-executed is ever repeated.
+One failed DNS lookup of `postgres` on a busy Docker host used to end whatever was
+connecting: a speed-layer query (and with it the container, 15 restarts in one session) or
+a day's rollup (and with it that day's reconciliation and report).
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
+
+import psycopg
 
 from voltstream.config import get_config
 from voltstream.logging_setup import get_logger
@@ -49,6 +58,48 @@ def connection_string() -> str:
     """libpq connection string from config. The password is env-only (T018)."""
     pg = get_config().postgres
     return f"host={pg.host} port={pg.port} dbname={pg.db} user={pg.user} password={pg.password}"
+
+
+# Seconds to wait before each retry: five attempts over about 15 s. Long enough to ride out
+# a DNS timeout or a Postgres restart, short enough that a real outage still fails the
+# micro-batch or the task promptly, where Airflow and the container restart policy take
+# over.
+_CONNECT_BACKOFF_SECONDS = (1.0, 2.0, 4.0, 8.0)
+
+
+def connect(
+    conninfo: str | None = None, *, sleep: Callable[[float], None] = time.sleep
+) -> psycopg.Connection[Any]:
+    """Open a connection, retrying transient failures to establish it (R38).
+
+    Only `psycopg.OperationalError` raised while connecting is retried: DNS failures,
+    refused connections, timeouts. Every other exception propagates at once, and so does
+    the last failure once the attempts are spent, with its own message. A wrong password
+    is an OperationalError too; it simply fails about 15 s later, which is harmless.
+
+    Use it exactly as `psycopg.connect`: `with connect() as conn, conn.cursor() as cur:`.
+    """
+    info = conninfo or connection_string()
+    attempts = len(_CONNECT_BACKOFF_SECONDS) + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            return psycopg.connect(info)
+        except psycopg.OperationalError as exc:
+            if attempt == attempts:
+                raise
+            delay = _CONNECT_BACKOFF_SECONDS[attempt - 1]
+            log.warning(
+                "postgres connection failed, retrying",
+                extra={
+                    "stage": "postgres",
+                    "attempt": attempt,
+                    "attempts": attempts,
+                    "retry_in_s": delay,
+                    "detail": str(exc)[:200],
+                },
+            )
+            sleep(delay)
+    raise AssertionError("unreachable")  # pragma: no cover - the loop returns or raises
 
 
 def open_pool() -> ConnectionPool:
@@ -102,9 +153,7 @@ def transaction() -> Iterator[Any]:
             with _pool.connection() as conn, conn.cursor() as cur:
                 yield cur
         else:
-            import psycopg
-
-            with psycopg.connect(connection_string()) as conn, conn.cursor() as cur:
+            with connect() as conn, conn.cursor() as cur:
                 yield cur
     except DatabaseUnavailable:
         raise

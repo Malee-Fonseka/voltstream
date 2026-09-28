@@ -30,7 +30,6 @@ import uuid
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
-import psycopg
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import DecimalType, StringType, StructField, StructType
@@ -43,6 +42,7 @@ from voltstream.core.tariff import BlockBoundary
 from voltstream.logging_setup import get_logger
 from voltstream.metrics import batch_duration_seconds, push_metrics
 from voltstream.storage.objectstore import archive_tariff_path, landing_tariff_path, raw_root
+from voltstream.storage.postgres import connect
 from voltstream.streaming.session import build_session
 from voltstream.streaming.sinks import pg_connection_string, write_rejected
 from voltstream.streaming.sources import split_valid_invalid
@@ -302,7 +302,22 @@ def _orchestrator_run_id() -> str | None:
 
 
 def _start_run(run_id: uuid.UUID, sim_date: date) -> None:
-    with psycopg.connect(pg_connection_string()) as conn, conn.cursor() as cur:
+    """Open this run's ledger row, closing any the day's earlier attempts left open.
+
+    An attempt killed before it can record its own failure (it lost Postgres, or its
+    container was killed) leaves its row at `running` for good (R38). The DAG runs one
+    billing run at a time (`max_active_runs=1`), so when an attempt starts, any `running`
+    row for the same day belongs to one that died, and it is marked `failed` in the same
+    transaction. Should a run outside Airflow overlap after all, nothing is lost:
+    `finalise` sets its row to `success` by run_id, whatever the row says by then.
+    """
+    with connect(pg_connection_string()) as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE pipeline_runs SET status = 'failed', finished_at = now() "
+            "WHERE sim_date = %s AND layer = 'batch_billing' AND status = 'running'",
+            (sim_date,),
+        )
+        abandoned = cur.rowcount
         cur.execute(
             "INSERT INTO pipeline_runs "
             "(run_id, sim_date, layer, status, started_at, orchestrator_run_id) "
@@ -310,10 +325,15 @@ def _start_run(run_id: uuid.UUID, sim_date: date) -> None:
             (run_id, sim_date, _orchestrator_run_id()),
         )
         conn.commit()
+    if abandoned:
+        log.warning(
+            "closed abandoned billing runs",
+            extra={"stage": "billing", "sim_date": sim_date.isoformat(), "abandoned": abandoned},
+        )
 
 
 def _fail_run(run_id: uuid.UUID, rows_in: int) -> None:
-    with psycopg.connect(pg_connection_string()) as conn, conn.cursor() as cur:
+    with connect(pg_connection_string()) as conn, conn.cursor() as cur:
         cur.execute(
             "UPDATE pipeline_runs SET status = 'failed', finished_at = now(), rows_in = %s "
             "WHERE run_id = %s",
@@ -341,7 +361,7 @@ def finalise(
         f"{c} = EXCLUDED.{c}" for c in columns if c not in ("household_id", "sim_date")
     )
 
-    with psycopg.connect(pg_connection_string()) as conn, conn.cursor() as cur:
+    with connect(pg_connection_string()) as conn, conn.cursor() as cur:
         cur.execute(
             "UPDATE pipeline_runs SET status = 'superseded' "
             "WHERE sim_date = %s AND layer = 'batch_billing' AND status = 'success'",

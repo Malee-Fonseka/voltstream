@@ -520,7 +520,21 @@ lines, to match `make lint`.
 ---
 
 ### R38 — Transient infrastructure failures are fatal to a day's batch run
-- [ ] Fixed
+- [x] Fixed 2026-09-28:
+  - `storage.postgres.connect()` is now the one way to open a short-lived connection. It
+    retries *establishing* one on `psycopg.OperationalError`, five attempts over about
+    15 s, and never retries a query. The speed layer's sinks, the billing and rollup jobs
+    and the repositories' no-pool fallback all use it. A unit test fails if any module
+    calls `psycopg.connect` directly again.
+  - `daily_billing._start_run` marks the day's leftover `running` rows `failed` in the
+    same transaction that opens its own (safe with `max_active_runs=1`).
+  - The rollup keeps `retries=0`: its cross-check verdict is still never retried, and its
+    connection is.
+  - Tests: `tests/unit/test_postgres_connect.py`, and the abandoned-run test in
+    `test_daily_billing.py`.
+  - The sinks are the speed layer's path to Postgres, and the one that killed a streaming
+    query on a single failed lookup and restarted the container 15 times. Spark's own S3A
+    and Kafka clients already retry on their own, so they were left as they are.
 
 *Found 2026-09-28, by the Phase 13 fault drills, on a saturated laptop (the SLA-pause backlog
 catching up, the divergence fault running, and an image build at the same time).*

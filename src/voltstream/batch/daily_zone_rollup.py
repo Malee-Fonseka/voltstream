@@ -23,7 +23,6 @@ import uuid
 from datetime import date
 from decimal import Decimal
 
-import psycopg
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql.types import DecimalType
@@ -37,6 +36,7 @@ from voltstream.batch.daily_billing import (
 from voltstream.core.spark_expr import netting_expr
 from voltstream.logging_setup import get_logger
 from voltstream.metrics import batch_duration_seconds, push_metrics
+from voltstream.storage.postgres import connect
 from voltstream.streaming.session import build_session
 from voltstream.streaming.sinks import pg_connection_string
 from voltstream.streaming.sources import split_valid_invalid
@@ -158,7 +158,7 @@ def _household_total_kwh(sim_date: date) -> Decimal:
     compares it against a non-zero zone total, so an unbilled day fails loudly rather than
     matching a zone total of zero against nothing.
     """
-    with psycopg.connect(pg_connection_string()) as conn, conn.cursor() as cur:
+    with connect(pg_connection_string()) as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT COALESCE(SUM(consumption_kwh), 0) FROM household_bill_daily "
             "WHERE sim_date = %s",
@@ -173,7 +173,7 @@ def _write(rows: list[tuple], columns: list[str]) -> int:
     updates = ", ".join(
         f"{c} = EXCLUDED.{c}" for c in columns if c not in ("grid_zone", "sim_date")
     )
-    with psycopg.connect(pg_connection_string()) as conn, conn.cursor() as cur:
+    with connect(pg_connection_string()) as conn, conn.cursor() as cur:
         cur.executemany(
             f"INSERT INTO zone_metrics_daily ({', '.join(columns)}) VALUES ({placeholders}) "
             f"ON CONFLICT (grid_zone, sim_date) DO UPDATE SET {updates}, computed_at = now()",

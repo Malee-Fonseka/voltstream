@@ -204,6 +204,8 @@ Prometheus' alerts page into `docs/report/screenshots/`, each named `<moment>-<p
 | `check` shows a FAIL like "no answer" during a billing run | The Spark batch containers starve the laptop for a minute | Re-run `check` a minute later |
 | The speed layer restarts in a loop after a code change | Its checkpoint no longer matches the query (state schema or operators changed) | `clean`, then `run`. Checkpoints only survive restarts of the same query |
 | Right after the laptop wakes from sleep, BatchSLAMiss fires and simulated time has jumped | The clock is real time × 288, so hours asleep are weeks simulated, with no billing in between | Expected. It clears after the next successful billing run. For a tidy demo, `clean` and `run` |
+| After a sleep, or under heavy load, logs show `failed to resolve host 'postgres'` | Docker Desktop's internal DNS stalls for a moment | Connections are retried for about 15 s (R38), so it passes. If the speed layer still restarts repeatedly, restart Docker Desktop, then `start` |
+| An image build fails on `files.pythonhosted.org`: *Temporary failure in name resolution* | The same DNS stall, during `pip install` | Restart Docker Desktop and build again. Don't build while fault drills are running |
 | The dashboard's bill panel stays empty | An old dashboard page whose date box never filled | Reload the page. Fixed since Phase 12: the box now fills itself |
 | Alertmanager's page lacks an alert Grafana shows | The alert is silenced by an inhibition; the page hides those by default | Tick "Inhibited" in Alertmanager |
 | LowRenewableContribution fires every few minutes | Every simulated night is low-renewable | Expected (T145) |

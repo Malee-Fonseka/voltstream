@@ -239,7 +239,9 @@ with DAG(
             "AWS_SECRET_ACCESS_KEY": os.environ.get("MINIO_ROOT_PASSWORD", "voltstream-dev"),
         },
         # No retries. The cross-check failing is a data-consistency verdict, not a
-        # transient fault, and retrying it would just fail again more slowly.
+        # transient fault, and retrying it would just fail again more slowly. Transient
+        # faults are handled inside the job instead: storage.postgres.connect() retries a
+        # failed connection (R38), which is what lost a day's rollup to one DNS timeout.
         retries=0,
     )
 

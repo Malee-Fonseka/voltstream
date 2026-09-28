@@ -20,13 +20,13 @@ from __future__ import annotations
 
 from collections import Counter
 
-import psycopg
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
 from voltstream.config import get_config
 from voltstream.logging_setup import get_logger
 from voltstream.metrics import e2e_latency_seconds, records_rejected_total
+from voltstream.storage.postgres import connect
 
 log = get_logger("sinks")
 
@@ -88,7 +88,7 @@ def upsert_batch(
 
     # psycopg 3 has no execute_values (that was psycopg2); executemany is pipelined and
     # sends the whole batch in one round trip, which is what the design note is after.
-    with psycopg.connect(pg_connection_string()) as conn, conn.cursor() as cur:
+    with connect(pg_connection_string()) as conn, conn.cursor() as cur:
         cur.executemany(statement, rows)
         conn.commit()
 
@@ -147,7 +147,7 @@ def write_rejected(df: DataFrame, stage: str) -> int:
     if not rows:
         return 0
 
-    with psycopg.connect(pg_connection_string()) as conn, conn.cursor() as cur:
+    with connect(pg_connection_string()) as conn, conn.cursor() as cur:
         cur.executemany(
             "INSERT INTO rejected_records (stage, reason, trace_id, raw_payload) "
             "VALUES (%s, %s, %s, %s)",

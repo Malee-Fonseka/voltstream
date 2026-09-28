@@ -176,3 +176,64 @@ def test_effective_dated_rule_picks_the_latest_applicable_row(spark) -> None:  #
 
     assert len(out) == 1
     assert out[0]["fixed_charge"] == Decimal("120.00"), "the 2026-01-02 row, not the future one"
+
+
+# ---------------------------------------------------------------------------------------
+# R38: a new attempt closes the ledger rows earlier attempts left at `running`.
+# ---------------------------------------------------------------------------------------
+
+
+class _RecordingCursor:
+    def __init__(self, rowcounts: list[int]) -> None:
+        self.statements: list[str] = []
+        self._rowcounts = rowcounts
+        self.rowcount = 0
+
+    def execute(self, sql: str, params: object = None) -> None:
+        self.statements.append(" ".join(sql.split()))
+        self.rowcount = self._rowcounts.pop(0) if self._rowcounts else 1
+
+    def __enter__(self) -> _RecordingCursor:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+class _RecordingConnection:
+    def __init__(self, cursor: _RecordingCursor) -> None:
+        self._cursor = cursor
+        self.committed = False
+
+    def cursor(self) -> _RecordingCursor:
+        return self._cursor
+
+    def commit(self) -> None:
+        self.committed = True
+
+    def __enter__(self) -> _RecordingConnection:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+def test_starting_a_run_closes_the_days_abandoned_running_rows(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import uuid
+
+    from voltstream.batch import daily_billing
+
+    cursor = _RecordingCursor(rowcounts=[1, 1])  # one abandoned row, then the insert
+    conn = _RecordingConnection(cursor)
+    monkeypatch.setattr(daily_billing, "connect", lambda *a, **k: conn)
+
+    daily_billing._start_run(uuid.uuid4(), date(2026, 2, 24))
+
+    close, open_ = cursor.statements
+    assert close.startswith("UPDATE pipeline_runs SET status = 'failed'")
+    assert "status = 'running'" in close and "layer = 'batch_billing'" in close
+    assert open_.startswith("INSERT INTO pipeline_runs")
+    assert conn.committed, "both statements must land in one transaction"
+    assert "closed abandoned billing runs" in capsys.readouterr().out
