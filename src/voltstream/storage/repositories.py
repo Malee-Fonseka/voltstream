@@ -136,6 +136,48 @@ def get_zone_metrics_range(
         return [_zone_metric(r) for r in cur.fetchall()]
 
 
+def get_all_zone_metrics_range(window_from: datetime, window_to: datetime) -> list[ZoneMetric]:
+    """Every zone's windows over an interval, by zone then oldest first.
+
+    One query for the dashboard's trend charts, which show all zones at once; a call per
+    zone would be five round trips on every poll.
+    """
+    with transaction() as cur:
+        cur.execute(
+            f"SELECT {_ZONE_COLUMNS} FROM zone_metrics_rt "
+            "WHERE window_start >= %s AND window_start < %s "
+            "ORDER BY grid_zone, window_start",
+            (window_from, window_to),
+        )
+        return [_zone_metric(r) for r in cur.fetchall()]
+
+
+# --------------------------------------------------------------------------------------
+# Household dimension
+# --------------------------------------------------------------------------------------
+
+
+class Household(NamedTuple):
+    """A row of `households` — the seeded dimension, not pipeline output."""
+
+    household_id: str
+    meter_id: str
+    grid_zone: str
+    billing_tier: str
+    subsidy_flag: bool
+    has_solar: bool
+
+
+def list_households() -> list[Household]:
+    """Every known household, by id — what the dashboard's household picker offers."""
+    with transaction() as cur:
+        cur.execute(
+            "SELECT household_id, meter_id, grid_zone, billing_tier, subsidy_flag, has_solar "
+            "FROM households ORDER BY household_id"
+        )
+        return [Household(*r) for r in cur.fetchall()]
+
+
 # --------------------------------------------------------------------------------------
 # Bill and run queries (T101)
 # --------------------------------------------------------------------------------------

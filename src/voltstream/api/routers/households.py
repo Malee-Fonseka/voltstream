@@ -24,7 +24,7 @@ from typing import Annotated
 from fastapi import APIRouter, HTTPException, Query, status
 
 from voltstream.api.dependencies import TraceIdDep
-from voltstream.api.models import BillDelta, BillResponse
+from voltstream.api.models import BillDelta, BillResponse, HouseholdInfo
 from voltstream.core.money import pct_divergence
 from voltstream.logging_setup import get_logger
 from voltstream.storage import repositories
@@ -91,6 +91,18 @@ def _from_speed(row) -> BillResponse:  # type: ignore[no-untyped-def]
         pipeline_run_id=None,
         computed_at=None,
     )
+
+
+@router.get("", response_model=list[HouseholdInfo], summary="Every known household")
+def list_households(trace_id: TraceIdDep) -> list[HouseholdInfo]:
+    """The seeded household dimension: zone, billing tier, subsidy and solar.
+
+    Read from the `households` table rather than generated from the seed rule, so a
+    client never holds a second copy of that rule that could disagree with the database.
+    """
+    rows = repositories.list_households()
+    log.info("households listed", extra={"stage": "api", "households": len(rows)})
+    return [HouseholdInfo(**row._asdict()) for row in rows]
 
 
 @router.get(
