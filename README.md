@@ -1,18 +1,9 @@
-# voltstream
+# Voltstream
 
 [![ci](https://github.com/Malee-Fonseka/voltstream/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Malee-Fonseka/voltstream/actions/workflows/ci.yml)
 
 A Lambda-architecture data platform for smart-grid monitoring and billing, built for
-EC8203 Applied Big Data Engineering (Use Case 3).
-
-> The repository is `volstream`; the Python package, Compose project and all runtime names
-> are `voltstream`. The missing "t" in the repository slug is a typo we chose to live with
-> rather than break existing clone URLs. Everything inside the repository is spelled
-> correctly, and a lint rule enforces it (decision D7).
-
-**This README is a step-by-step guide.** Follow sections 2 and 3 to get the whole system
-running, then use section 5 to recreate any scenario: a bill turning final, each alert
-firing, a crash, a restatement. Every step says what you should see and how long to wait.
+EC8203 Applied Big Data Engineering.
 
 ## Contents
 
