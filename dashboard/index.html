@@ -3,256 +3,555 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>voltstream</title>
+<title>Voltstream · grid operations</title>
+<meta name="description" content="Live grid load, household bills and the Lambda merge function for the voltstream smart-grid pipeline.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b8cff'/%3E%3Cpath d='M18 5 8 18h7l-2 9 11-14h-7z' fill='white'/%3E%3C/svg%3E">
 <!--
-  Single file, no build step (§7.2). Plain HTML, CSS and fetch - no framework, no bundler,
-  no node_modules. A dashboard that needs a build step is a dashboard that does not open
-  on the marker's machine.
+  No build step (§7.2). Plain HTML, CSS and ES modules - no framework, no bundler, no
+  node_modules. A dashboard that needs a build step is a dashboard that does not open on
+  the marker's machine. The page is split across css/ and js/ only so each part stays
+  readable; the browser loads them as they are.
 
   Served by FastAPI from the same origin as the API (T135), so there is no CORS to debug
-  during a demo.
+  during a demo. Charts are hand-drawn SVG (js/charts.js) rather than a library: nothing is
+  fetched from a CDN, so the page works on a machine with no internet connection.
 
-  The badge (T134) is the point of this page. §1.2 claims the architecture becomes a
+  The badge (T134) is still the point of this page. §1.2 claims the architecture becomes a
   user-facing feature; the badge is that claim in one screenshot, flipping from
   "Provisional (speed)" to "Final (batch)" when the batch layer closes the day.
 -->
-<style>
-  :root {
-    --bg: #0f1419;
-    --panel: #18202a;
-    --line: #253040;
-    --text: #e6edf3;
-    --muted: #8b98a8;
-    --speed: #d97706;
-    --batch: #16a34a;
-    --accent: #3b82f6;
-  }
-  @media (prefers-color-scheme: light) {
-    :root {
-      --bg: #f6f8fa; --panel: #ffffff; --line: #d8dee4; --text: #1f2328; --muted: #656d76;
+<link rel="stylesheet" href="css/styles.css">
+<script>
+  // Before first paint, so a stored preference never flashes the other theme.
+  try {
+    const theme = localStorage.getItem("vs-theme");
+    if (theme === "light" || theme === "dark") document.documentElement.dataset.theme = theme;
+    if (localStorage.getItem("vs-sidebar") === "collapsed") {
+      document.documentElement.classList.add("sidebar-collapsed");
     }
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; padding: 24px 16px; background: var(--bg); color: var(--text);
-    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
-  }
-  .wrap { max-width: 1100px; margin: 0 auto; }
-  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 4px; }
-  h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
-  .sub { color: var(--muted); font-size: 13px; }
-  .grid { display: grid; gap: 16px; grid-template-columns: 1fr; margin-top: 20px; }
-  @media (min-width: 860px) { .grid { grid-template-columns: 1.4fr 1fr; } }
-  .panel {
-    background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px;
-  }
-  .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em;
-    color: var(--muted); margin: 0 0 12px; font-weight: 600; }
-  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-  th, td { text-align: right; padding: 7px 8px; border-bottom: 1px solid var(--line); }
-  th:first-child, td:first-child { text-align: left; }
-  th { color: var(--muted); font-weight: 600; font-size: 12px; }
-  tbody tr:last-child td { border-bottom: none; }
-  .bar { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; min-width: 60px; }
-  .bar > i { display: block; height: 100%; background: var(--accent); }
-
-  /* T134: the provisional/final badge. */
-  .badge {
-    display: inline-flex; align-items: center; gap: 8px; padding: 8px 14px;
-    border-radius: 999px; font-weight: 700; font-size: 14px; letter-spacing: 0.01em;
-    border: 2px solid transparent; transition: background .3s, border-color .3s;
-  }
-  .badge .dot { width: 9px; height: 9px; border-radius: 50%; background: currentColor; }
-  .badge.speed { background: color-mix(in srgb, var(--speed) 18%, transparent);
-    color: var(--speed); border-color: var(--speed); }
-  .badge.batch { background: color-mix(in srgb, var(--batch) 18%, transparent);
-    color: var(--batch); border-color: var(--batch); }
-  .badge.unknown { background: var(--line); color: var(--muted); }
-
-  .figure { font-size: 30px; font-weight: 700; font-variant-numeric: tabular-nums; margin: 10px 0 2px; }
-  .label { color: var(--muted); font-size: 12px; }
-  .row { display: flex; gap: 20px; flex-wrap: wrap; margin-top: 12px; }
-  input, select {
-    background: var(--bg); color: var(--text); border: 1px solid var(--line);
-    border-radius: 6px; padding: 6px 8px; font: inherit;
-  }
-  .note { color: var(--muted); font-size: 12px; margin-top: 10px; }
-  .stale { opacity: .45; }
-</style>
+  } catch (_) { /* storage blocked: defaults apply */ }
+</script>
+<script type="module" src="js/app.js"></script>
 </head>
 <body>
-<div class="wrap">
-  <header>
-    <h1>voltstream</h1>
-    <span class="sub">Lambda architecture &middot; smart-grid monitoring and billing</span>
-  </header>
-  <div class="sub" id="clock">connecting&hellip;</div>
+<svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true">
+  <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z"/></symbol>
+  <symbol id="i-live" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></symbol>
+  <symbol id="i-bill" viewBox="0 0 24 24"><path d="M6 2h12v20l-3-2-3 2-3-2-3 2z"/><path d="M9 7h6M9 11h6M9 15h4"/></symbol>
+  <symbol id="i-report" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M8 18v-3M12 18v-6M16 18v-4"/></symbol>
+  <symbol id="i-docs" viewBox="0 0 24 24"><path d="M2 5c3-1.5 7-1.5 10 1 3-2.5 7-2.5 10-1v14c-3-1.5-7-1.5-10 1-3-2.5-7-2.5-10-1z"/><path d="M12 6v14"/></symbol>
+  <symbol id="i-code" viewBox="0 0 24 24"><path d="m8 8-5 4 5 4M16 8l5 4-5 4M14 4l-4 16"/></symbol>
+  <symbol id="i-gauge" viewBox="0 0 24 24"><path d="m12 14 4-4"/><path d="M3.3 17a9 9 0 1 1 17.4 0"/></symbol>
+  <symbol id="i-flow" viewBox="0 0 24 24"><path d="M3 8h11a3 3 0 1 0-3-3M3 16h15a3 3 0 1 1-3 3M3 12h17"/></symbol>
+  <symbol id="i-bars" viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></symbol>
+  <symbol id="i-ext" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></symbol>
+  <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></symbol>
+  <symbol id="i-left" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></symbol>
+  <symbol id="i-right" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
+  <symbol id="i-panel" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+  <symbol id="i-table" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18M3 15h18M9 4v16"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4v16l13-8z"/></symbol>
+  <symbol id="i-replay" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><path d="m12 2 10 5-10 5L2 7z"/><path d="m2 17 10 5 10-5M2 12l10 5 10-5"/></symbol>
+  <symbol id="i-solar" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5 19 19M5 19l1.5-1.5M17.5 6.5 19 5"/></symbol>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="M3 11 12 3l9 8M5 9v11h14V9"/></symbol>
+  <symbol id="i-tag" viewBox="0 0 24 24"><path d="M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8z"/><circle cx="7.5" cy="7.5" r="1.5"/></symbol>
+  <symbol id="i-map" viewBox="0 0 24 24"><path d="M12 21s-7-6.2-7-12a7 7 0 0 1 14 0c0 5.8-7 12-7 12z"/><circle cx="12" cy="9" r="2.5"/></symbol>
+</svg>
 
-  <div class="grid">
-    <section class="panel">
-      <h2>Grid load by zone &mdash; speed layer</h2>
-      <table>
-        <thead>
-          <tr><th>Zone</th><th>Consumption kWh</th><th>Solar kWh</th>
-              <th>Renewable</th><th></th><th>Meters</th></tr>
-        </thead>
-        <tbody id="zones"><tr><td colspan="6" class="label">loading&hellip;</td></tr></tbody>
-      </table>
-      <div class="note">
-        15-simulated-minute windows, updated every trigger. This view is deliberately
-        approximate &mdash; it trades completeness for latency.
+<div class="app">
+  <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+    <div class="brand">
+      <span class="brand-mark"><svg class="icon"><use href="#i-bolt"/></svg></span>
+      <span class="brand-text">
+        <span class="brand-name">Voltstream</span>
+        <span class="brand-tag">Smart-grid monitoring &amp; billing</span>
+      </span>
+    </div>
+
+    <nav class="nav">
+      <span class="nav-label">Dashboard</span>
+      <a href="#/live" data-view="live"><svg class="icon"><use href="#i-live"/></svg><span class="nav-text">Live grid</span></a>
+      <a href="#/bills" data-view="bills"><svg class="icon"><use href="#i-bill"/></svg><span class="nav-text">Household bills</span></a>
+      <a href="#/report" data-view="report"><svg class="icon"><use href="#i-report"/></svg><span class="nav-text">Daily report</span></a>
+      <span class="nav-label">Learn</span>
+      <a href="#/docs" data-view="docs"><svg class="icon"><use href="#i-docs"/></svg><span class="nav-text">How it works</span></a>
+      <span class="nav-label">Tools</span>
+      <a href="/docs" target="_blank" rel="noopener" data-ext="api"><svg class="icon"><use href="#i-code"/></svg><span class="nav-text">API reference</span><svg class="icon ext"><use href="#i-ext"/></svg></a>
+      <a href="#" target="_blank" rel="noopener" data-ext="grafana"><svg class="icon"><use href="#i-gauge"/></svg><span class="nav-text">Grafana</span><svg class="icon ext"><use href="#i-ext"/></svg></a>
+      <a href="#" target="_blank" rel="noopener" data-ext="airflow"><svg class="icon"><use href="#i-flow"/></svg><span class="nav-text">Airflow</span><svg class="icon ext"><use href="#i-ext"/></svg></a>
+      <a href="#" target="_blank" rel="noopener" data-ext="prometheus"><svg class="icon"><use href="#i-bars"/></svg><span class="nav-text">Prometheus</span><svg class="icon ext"><use href="#i-ext"/></svg></a>
+    </nav>
+
+    <div class="sidebar-foot">
+      <button class="collapse-btn" id="collapseBtn" type="button" aria-label="Collapse sidebar" title="Collapse sidebar">
+        <svg class="icon"><use href="#i-panel"/></svg><span class="nav-text">Collapse</span>
+      </button>
+    </div>
+  </aside>
+  <div class="scrim" id="scrim"></div>
+
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn menu-btn" id="menuBtn" type="button" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false">
+        <svg class="icon"><use href="#i-menu"/></svg>
+      </button>
+      <div class="page-head">
+        <h1 id="pageTitle">Live grid</h1>
+        <p id="pageSub">&nbsp;</p>
       </div>
-    </section>
 
-    <section class="panel">
-      <h2>Household bill &mdash; the merge function</h2>
-      <div class="row">
-        <label class="label">Household
-          <br><input id="hh" value="HH-0001" size="10">
-        </label>
-        <label class="label">Simulated date
-          <br><input id="day" type="date">
-        </label>
+      <div class="simclock" id="simclock" aria-live="off">
+        <div class="simclock-top">
+          <span class="eyebrow"><svg class="icon"><use href="#i-clock"/></svg>Simulated time</span>
+          <span class="scale-chip" id="simScale" title="Simulated seconds per real second">&mdash;&times;</span>
+        </div>
+        <div class="simclock-now">
+          <span class="simclock-time" id="simTime">--:--</span>
+          <span class="simclock-date" id="simDate">connecting&hellip;</span>
+        </div>
+        <div class="simclock-day">
+          <span class="dayprog" aria-hidden="true"><i id="dayFill"></i></span>
+          <span class="simclock-close" id="dayClose">&nbsp;</span>
+        </div>
       </div>
 
-      <div style="margin-top:16px">
-        <span id="badge" class="badge unknown"><span class="dot"></span><span id="badgeText">&mdash;</span></span>
+      <div class="status">
+        <button class="health" id="healthBtn" type="button" aria-label="System health">
+          <span class="dot" data-dep="api"></span><span class="dot" data-dep="postgres"></span><span class="dot" data-dep="objectstore"></span>
+          <span class="health-text" id="healthText">Checking</span>
+        </button>
+        <button class="alert-chip" id="alertChip" type="button" data-tone="muted">
+          <svg class="icon"><use href="#i-check"/></svg><span id="alertText">Alerts</span>
+        </button>
+        <button class="icon-btn" id="themeBtn" type="button" aria-label="Switch theme" title="Switch theme">
+          <svg class="icon"><use href="#i-sun"/></svg>
+        </button>
       </div>
+    </header>
 
-      <div class="figure" id="total">&mdash;</div>
-      <div class="label" id="tariffNote">&nbsp;</div>
+    <div class="alert-banner" id="alertBanner" role="alert" hidden>
+      <svg class="icon"><use href="#i-alert"/></svg>
+      <div class="alert-list" id="alertList"></div>
+      <button class="icon-btn small" id="alertDismiss" type="button" aria-label="Dismiss"><svg class="icon"><use href="#i-x"/></svg></button>
+    </div>
 
-      <table style="margin-top:14px">
-        <tbody id="breakdown"></tbody>
-      </table>
-      <div class="note" id="mergeNote">
-        The badge is the architecture as a user-facing feature: the same URL answers from
-        the speed layer while the day is open, and from the batch layer once it closes.
-      </div>
-    </section>
+    <main class="content">
+      <!-- ================================================================== LIVE -->
+      <section class="view" id="view-live" hidden>
+        <div class="toolbar">
+          <div class="field">
+            <span class="field-label">Range (simulated)</span>
+            <div class="seg" role="group" aria-label="Time range" id="liveRange">
+              <button type="button" data-min="180">3h</button>
+              <button type="button" data-min="360">6h</button>
+              <button type="button" data-min="720">12h</button>
+              <button type="button" data-min="1440">24h</button>
+            </div>
+          </div>
+          <div class="field">
+            <span class="field-label">Zone</span>
+            <div class="seg" role="group" aria-label="Zone" id="liveScope">
+              <button type="button" data-zone="all" aria-pressed="true">All zones</button>
+            </div>
+          </div>
+          <span class="toolbar-note" id="liveNote"><span class="live-dot"></span>Speed layer &middot; 15-simulated-minute windows</span>
+        </div>
+
+        <div class="kpis" id="liveKpis">
+          <div class="kpi" id="kpiLoad">
+            <div class="kpi-label"><span class="key-line" style="--k:var(--c-grid)"></span>Grid load</div>
+            <div class="kpi-value"><span data-v class="skeleton">000.0</span><span class="kpi-unit">kWh</span></div>
+            <div class="kpi-sub" data-sub>latest 15-min window</div>
+            <div class="kpi-spark" data-spark></div>
+          </div>
+          <div class="kpi" id="kpiSolar">
+            <div class="kpi-label"><span class="key-line" style="--k:var(--c-solar)"></span>Solar generation</div>
+            <div class="kpi-value"><span data-v class="skeleton">000.0</span><span class="kpi-unit">kWh</span></div>
+            <div class="kpi-sub" data-sub>latest 15-min window</div>
+            <div class="kpi-spark" data-spark></div>
+          </div>
+          <div class="kpi" id="kpiRenew">
+            <div class="kpi-label">Renewable share</div>
+            <div class="kpi-value"><span data-v class="skeleton">00.0%</span></div>
+            <div class="kpi-sub" data-sub>of consumption met by solar</div>
+            <div class="meter" data-meter style="--c:var(--c-solar)"><i></i></div>
+          </div>
+          <div class="kpi" id="kpiMeters">
+            <div class="kpi-label">Active meters</div>
+            <div class="kpi-value"><span data-v class="skeleton">00</span><span class="kpi-unit" data-of></span></div>
+            <div class="kpi-sub" data-sub>reporting in the latest window</div>
+            <div class="meter" data-meter style="--c:var(--accent)"><i></i></div>
+          </div>
+          <div class="kpi" id="kpiLag">
+            <div class="kpi-label">Speed-layer lag</div>
+            <div class="kpi-value"><span data-v class="skeleton">00</span><span class="kpi-unit" data-unit></span></div>
+            <div class="kpi-sub" data-sub>behind simulated now</div>
+          </div>
+        </div>
+
+        <div class="row row-2-1">
+          <article class="card" id="loadCard">
+            <header class="card-head">
+              <div>
+                <h2>Grid load vs solar</h2>
+                <p class="card-sub" id="loadSub">&nbsp;</p>
+              </div>
+              <div class="card-tools">
+                <div class="legend" id="loadLegend"></div>
+                <button class="icon-btn small" type="button" data-table-toggle aria-pressed="false" title="Show as table" aria-label="Show as table"><svg class="icon"><use href="#i-table"/></svg></button>
+              </div>
+            </header>
+            <div class="card-body">
+              <div class="chart-box" id="loadChart"></div>
+              <div class="table-box" id="loadTable" hidden></div>
+            </div>
+            <footer class="card-foot">
+              The newest window is still filling, so it rises until the watermark closes it.
+              This view trades completeness for latency.
+            </footer>
+          </article>
+
+          <article class="card" id="zoneCompareCard">
+            <header class="card-head">
+              <div>
+                <h2>Zones compared</h2>
+                <p class="card-sub" id="zoneCompareSub">latest window per zone &middot; kWh</p>
+              </div>
+              <div class="card-tools">
+                <button class="icon-btn small" type="button" data-table-toggle aria-pressed="false" title="Show as table" aria-label="Show as table"><svg class="icon"><use href="#i-table"/></svg></button>
+              </div>
+            </header>
+            <div class="card-body">
+              <div class="legend legend-top" id="zoneLegend"></div>
+              <div class="chart-box" id="zoneBars"></div>
+              <div class="table-box" id="zoneTable" hidden></div>
+            </div>
+            <footer class="card-foot">Click a zone to focus every chart on this page on it.</footer>
+          </article>
+        </div>
+
+        <h2 class="section-title">Zones</h2>
+        <div class="zone-grid" id="zoneCards"></div>
+      </section>
+
+      <!-- ================================================================= BILLS -->
+      <section class="view" id="view-bills" hidden>
+        <div class="toolbar">
+          <div class="field">
+            <label class="field-label" for="hhSelect">Household</label>
+            <div class="stepper">
+              <button class="icon-btn small" type="button" id="hhPrev" aria-label="Previous household"><svg class="icon"><use href="#i-left"/></svg></button>
+              <select id="hhSelect" class="select"></select>
+              <button class="icon-btn small" type="button" id="hhNext" aria-label="Next household"><svg class="icon"><use href="#i-right"/></svg></button>
+            </div>
+          </div>
+          <div class="field">
+            <label class="field-label" for="billDate">Simulated date</label>
+            <div class="stepper">
+              <button class="icon-btn small" type="button" id="dayPrev" aria-label="Previous day"><svg class="icon"><use href="#i-left"/></svg></button>
+              <input type="date" id="billDate" class="input">
+              <button class="icon-btn small" type="button" id="dayNext" aria-label="Next day"><svg class="icon"><use href="#i-right"/></svg></button>
+            </div>
+          </div>
+          <button class="btn" type="button" id="billLatest">Latest day</button>
+          <div class="chips" id="hhChips"></div>
+        </div>
+
+        <div class="bills-grid" id="billGrid">
+          <article class="card hero-card" id="billHero">
+            <div class="card-body hero-body">
+              <div class="hero-top">
+                <span id="badge" class="badge unknown"><svg class="icon"><use href="#i-clock"/></svg><span id="badgeText">Waiting</span></span>
+                <span class="hero-caption" id="heroCaption">&nbsp;</span>
+              </div>
+              <div class="hero-total" id="heroTotal">&mdash;</div>
+              <div class="hero-note" id="tariffNote">&nbsp;</div>
+              <ol class="lifecycle" id="lifecycle">
+                <li data-step="1">Estimating<small>speed layer</small></li>
+                <li data-step="2">Day closed<small>simulated midnight</small></li>
+                <li data-step="3">Final<small>batch layer</small></li>
+                <li data-step="4">Reconciled<small>divergence explained</small></li>
+              </ol>
+              <div class="hero-status" id="heroStatus">&nbsp;</div>
+            </div>
+          </article>
+
+          <article class="card" id="waterfallCard">
+            <header class="card-head">
+              <div>
+                <h2>How the total is built</h2>
+                <p class="card-sub">charges up, discounts and credits down</p>
+              </div>
+              <div class="card-tools">
+                <button class="icon-btn small" type="button" data-table-toggle aria-pressed="false" title="Show as table" aria-label="Show as table"><svg class="icon"><use href="#i-table"/></svg></button>
+              </div>
+            </header>
+            <div class="card-body">
+              <div class="chart-box" id="waterfall"></div>
+              <div class="table-box" id="waterfallTable" hidden></div>
+            </div>
+          </article>
+
+          <article class="card" id="energyCard">
+            <header class="card-head">
+              <div>
+                <h2>Energy flow</h2>
+                <p class="card-sub">where the household's energy came from, and where its solar went</p>
+              </div>
+            </header>
+            <div class="card-body" id="energyFlow"></div>
+          </article>
+
+          <article class="card" id="deltaCard">
+            <header class="card-head">
+              <div>
+                <h2>Speed estimate vs batch final</h2>
+                <p class="card-sub">the same bill, from each layer</p>
+              </div>
+            </header>
+            <div class="card-body" id="deltaBody"></div>
+          </article>
+
+          <article class="card" id="tierCard">
+            <header class="card-head">
+              <div>
+                <h2>Block tariff</h2>
+                <p class="card-sub">grid import priced block by block</p>
+              </div>
+            </header>
+            <div class="card-body" id="tierBody"></div>
+          </article>
+
+          <article class="card" id="detailCard">
+            <header class="card-head">
+              <div>
+                <h2>Lineage</h2>
+                <p class="card-sub">where this figure came from</p>
+              </div>
+            </header>
+            <div class="card-body" id="detailBody"></div>
+          </article>
+        </div>
+        <div class="empty-state" id="billEmpty" hidden></div>
+      </section>
+
+      <!-- ================================================================ REPORT -->
+      <section class="view" id="view-report" hidden>
+        <div class="toolbar">
+          <div class="field">
+            <label class="field-label" for="reportDate">Simulated date</label>
+            <div class="stepper">
+              <button class="icon-btn small" type="button" id="rDayPrev" aria-label="Previous day"><svg class="icon"><use href="#i-left"/></svg></button>
+              <input type="date" id="reportDate" class="input">
+              <button class="icon-btn small" type="button" id="rDayNext" aria-label="Next day"><svg class="icon"><use href="#i-right"/></svg></button>
+            </div>
+          </div>
+          <div class="report-status" id="reportStatus"></div>
+          <a class="btn ghost" id="reportJson" href="#" target="_blank" rel="noopener"><svg class="icon"><use href="#i-code"/></svg>Raw JSON</a>
+        </div>
+
+        <div class="kpis" id="reportKpis"></div>
+
+        <div class="row row-2">
+          <article class="card">
+            <header class="card-head">
+              <div>
+                <h2>Zone totals</h2>
+                <p class="card-sub">authoritative daily rollup &middot; kWh</p>
+              </div>
+            </header>
+            <div class="card-body">
+              <div class="legend legend-top" id="rZoneLegend"></div>
+              <div id="rZoneBars"></div>
+            </div>
+          </article>
+          <article class="card">
+            <header class="card-head">
+              <div>
+                <h2>Rejected records</h2>
+                <p class="card-sub" id="rRejectSub">by reason</p>
+              </div>
+            </header>
+            <div class="card-body"><div id="rRejects"></div></div>
+          </article>
+        </div>
+
+        <article class="card">
+          <header class="card-head">
+            <div>
+              <h2>Zones in detail</h2>
+              <p class="card-sub">peak window, self-consumption and export per zone</p>
+            </div>
+          </header>
+          <div class="card-body" id="rZoneTable"></div>
+        </article>
+
+        <article class="card">
+          <header class="card-head">
+            <div>
+              <h2>Billing runs</h2>
+              <p class="card-sub">every run for this day, newest first &mdash; superseded runs included on purpose</p>
+            </div>
+          </header>
+          <div class="card-body" id="rRuns"></div>
+        </article>
+      </section>
+
+      <!-- ================================================================== DOCS -->
+      <section class="view docs" id="view-docs" hidden>
+        <div class="docs-hero">
+          <div>
+            <span class="eyebrow">Lambda architecture</span>
+            <h2>One stream, two layers, one answer</h2>
+            <p>
+              Fifty simulated smart meters stream readings into Kafka. A <strong class="ink-speed">speed layer</strong>
+              turns them into live, approximate figures within seconds. A <strong class="ink-batch">batch layer</strong>
+              recomputes each closed day from the immutable master dataset and produces the authoritative
+              bill. The API merges the two: final if the batch layer has closed the day, otherwise the
+              speed layer's estimate, labelled as such.
+            </p>
+          </div>
+          <dl class="docs-facts" id="docsFacts">
+            <div><dt>Time compression</dt><dd>288&times;</dd></div>
+            <div><dt>One simulated day</dt><dd>5 real min</dd></div>
+            <div><dt>Households &middot; zones</dt><dd>50 &middot; 5</dd></div>
+            <div><dt>Window</dt><dd>15 sim-min</dd></div>
+          </dl>
+        </div>
+
+        <article class="card pipeline-card">
+          <header class="card-head">
+            <div>
+              <h2>The pipeline</h2>
+              <p class="card-sub">Click any stage for details, or follow one reading from meter to bill.</p>
+            </div>
+            <div class="card-tools">
+              <div class="legend">
+                <span class="legend-item"><span class="legend-key" style="--k:var(--c-speed)"></span>Speed path</span>
+                <span class="legend-item"><span class="legend-key" style="--k:var(--c-batch)"></span>Batch path</span>
+              </div>
+              <button class="btn" type="button" id="tourBtn"><svg class="icon"><use href="#i-play"/></svg>Follow a reading</button>
+              <button class="icon-btn small" type="button" id="replayBtn" title="Replay animation" aria-label="Replay animation"><svg class="icon"><use href="#i-replay"/></svg></button>
+            </div>
+          </header>
+          <div class="pipeline-wrap">
+            <div class="pipeline-stage" id="pipeline"></div>
+            <aside class="pl-panel" id="plPanel" aria-live="polite"></aside>
+          </div>
+        </article>
+
+        <div class="docs-cols">
+          <article class="card prose-card">
+            <header class="card-head"><h2>Speed layer vs batch layer</h2></header>
+            <div class="card-body">
+              <div class="table-scroll">
+                <table class="table compare">
+                  <thead><tr><th></th><th><span class="key-dot" style="--k:var(--c-speed)"></span>Speed layer</th><th><span class="key-dot" style="--k:var(--c-batch)"></span>Batch layer</th></tr></thead>
+                  <tbody>
+                    <tr><th>Reads</th><td>The live Kafka stream</td><td>A closed day's Parquet from MinIO, rescanned in full</td></tr>
+                    <tr><th>Runs</th><td>Continuously, a micro-batch every 10 real s</td><td>Once per simulated day, after its tariff file lands</td></tr>
+                    <tr><th>Latency</th><td>Seconds</td><td>Minutes after the day closes</td></tr>
+                    <tr><th>Tariff</th><td>Yesterday's &mdash; today's does not exist yet</td><td>The day's own</td></tr>
+                    <tr><th>Late data</th><td>Dropped once past the 30-sim-minute watermark</td><td>Included: the rescan sees everything that arrived</td></tr>
+                    <tr><th>Writes</th><td><code>zone_metrics_rt</code>, <code>household_running_rt</code></td><td><code>household_bill_daily</code>, <code>zone_metrics_daily</code>, <code>pipeline_runs</code></td></tr>
+                    <tr><th>Its answer is</th><td><span class="badge speed small"><svg class="icon"><use href="#i-bolt"/></svg>Provisional</span></td><td><span class="badge batch small"><svg class="icon"><use href="#i-layers"/></svg>Final</span></td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </article>
+
+          <article class="card prose-card">
+            <header class="card-head"><h2>The merge function</h2></header>
+            <div class="card-body prose">
+              <p>The whole of Lambda's promise reduces to a choice between two rows. The API makes it on every request:</p>
+<pre class="code"><span class="c-kw">if</span> the day has a <span class="c-str">'success'</span> row in pipeline_runs:
+    serve household_bill_daily   <span class="c-cm"># source: batch, provisional: false</span>
+<span class="c-kw">else</span>:
+    serve household_running_rt   <span class="c-cm"># source: speed, provisional: true</span></pre>
+              <p>
+                The batch row wins whenever it exists: it saw the late data the speed layer dropped and
+                applied the day's own tariff. Once the day is reconciled the difference is explained exactly:
+                <code>estimate &minus; final = tariff effect + data effect</code>.
+              </p>
+            </div>
+          </article>
+
+          <article class="card prose-card">
+            <header class="card-head"><h2>Simulated time</h2></header>
+            <div class="card-body prose">
+              <p>Every timestamp in the data is simulated and runs 288&times; faster than the wall clock, so a full day of grid activity fits in a demo.</p>
+              <dl class="kv">
+                <div><dt>1 real second</dt><dd>4.8 simulated minutes</dd></div>
+                <div><dt>1 simulated day</dt><dd>5 real minutes</dd></div>
+                <div><dt>15-minute window</dt><dd>3.1 real seconds</dd></div>
+                <div><dt>Speed trigger, 10 real s</dt><dd>48 simulated minutes</dd></div>
+                <div><dt>Watermark, 30 sim-min</dt><dd>6.25 real seconds</dd></div>
+              </dl>
+              <p>At this compression the trigger interval, not the watermark, decides what the speed layer drops.</p>
+            </div>
+          </article>
+
+          <article class="card prose-card">
+            <header class="card-head"><h2>Faults injected on purpose</h2></header>
+            <div class="card-body">
+              <ul class="faults">
+                <li><b>Duplicates</b><span>2% of readings re-sent with the same id</span><em>removed by the shared dedup key</em></li>
+                <li><b>Out of order</b><span>3% shifted 1&ndash;30 simulated minutes late</span><em>absorbed by the watermark</em></li>
+                <li><b>Null fields</b><span>1% with a required field missing</span><em>rejected, kept in <code>rejected_records</code></em></li>
+                <li><b>Negative values</b><span>0.5% with negative kWh</span><em>rejected</em></li>
+                <li><b>Unknown household</b><span>0.5% from a meter nobody owns</span><em>rejected</em></li>
+                <li><b>Meter dropouts</b><span>30 real s outages, then store-and-forward</span><em>batch recovers the backlog; speed drops part of it</em></li>
+              </ul>
+            </div>
+          </article>
+
+          <article class="card prose-card">
+            <header class="card-head"><h2>Observability</h2></header>
+            <div class="card-body prose">
+              <p>Every service exposes Prometheus metrics, and every log line is structured JSON carrying the reading's <code>trace_id</code>. Five alert rules live in the repository as code:</p>
+              <ul class="alert-rules">
+                <li><code>MeterDataStale</code> a zone stopped reporting</li>
+                <li><code>LowRenewableContribution</code> solar share below threshold</li>
+                <li><code>HighRejectRate</code> too many readings rejected</li>
+                <li><code>BatchSLAMiss</code> a closed day was not billed in time</li>
+                <li><code>LambdaDivergenceHigh</code> speed and batch disagree too much</li>
+              </ul>
+              <p class="links">
+                <a data-ext="grafana" href="#" target="_blank" rel="noopener">Grafana dashboards</a>
+                <a data-ext="prometheus" href="#" target="_blank" rel="noopener">Prometheus</a>
+                <a data-ext="airflow" href="#" target="_blank" rel="noopener">Airflow DAGs</a>
+                <a href="/docs" target="_blank" rel="noopener">API reference</a>
+              </p>
+            </div>
+          </article>
+
+          <article class="card prose-card">
+            <header class="card-head"><h2>Reading this dashboard</h2></header>
+            <div class="card-body">
+              <dl class="glossary">
+                <div><dt>Provisional</dt><dd>A speed-layer estimate. Changes as readings arrive and uses yesterday's tariff.</dd></div>
+                <div><dt>Final</dt><dd>The batch layer's bill for a closed day. Does not change unless the day is restated.</dd></div>
+                <div><dt>Window</dt><dd>A 15-simulated-minute bucket of readings. The newest is still filling.</dd></div>
+                <div><dt>Renewable share</dt><dd>Solar generation as a share of consumption, capped at 100%.</dd></div>
+                <div><dt>Speed-layer lag</dt><dd>How far the newest window trails simulated now: roughly one trigger interval.</dd></div>
+                <div><dt>Tariff effect / data effect</dt><dd>The two causes of the gap between estimate and final: the stale tariff and the readings the speed layer never counted.</dd></div>
+              </dl>
+            </div>
+          </article>
+        </div>
+      </section>
+    </main>
   </div>
 </div>
 
-<script>
-// Poll every 5 s (§8.3). Same origin as the API, so no CORS.
-const POLL_MS = 5000;
-const $ = (id) => document.getElementById(id);
-const fmt = (v, dp = 2) =>
-  v === null || v === undefined ? "—" : Number(v).toLocaleString(undefined,
-    { minimumFractionDigits: dp, maximumFractionDigits: dp });
-
-async function getJSON(url) {
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) throw new Error(`${res.status} ${url}`);
-  return res.json();
-}
-
-async function refreshZones() {
-  try {
-    const zones = await getJSON("/api/v1/zones/load");
-    $("zones").innerHTML = zones.map((z) => {
-      const pct = Number(z.renewable_ratio) * 100;
-      return `<tr>
-        <td>${z.grid_zone}</td>
-        <td>${fmt(z.total_consumption_kwh, 4)}</td>
-        <td>${fmt(z.total_solar_kwh, 4)}</td>
-        <td>${pct.toFixed(1)}%</td>
-        <td><span class="bar"><i style="width:${Math.min(100, pct).toFixed(1)}%"></i></span></td>
-        <td>${z.active_meters}</td>
-      </tr>`;
-    }).join("");
-    const newest = zones.map((z) => z.window_end).sort().pop();
-    $("clock").textContent = `newest window ${newest ?? "—"} (simulated)`;
-    $("zones").classList.remove("stale");
-    // Default the date box to the newest simulated day the speed layer has seen, so the
-    // page is useful without the operator knowing what "today" is in simulated time.
-    // Checked on every poll, not once at load: a page opened straight after `run` loads
-    // before the speed layer's first window exists, and a one-off attempt left the box
-    // empty for good, so the bill panel never asked for anything.
-    if (!$("day").value) {
-      const newestStart = zones.map((z) => z.window_start).sort().pop();
-      if (newestStart) $("day").value = newestStart.slice(0, 10);
-    }
-  } catch (err) {
-    // Keep the last good values on screen but mark them stale, rather than blanking the
-    // page on one failed poll — a dashboard that clears itself on a blip is worse than
-    // one that says it is out of date.
-    $("zones").classList.add("stale");
-    $("clock").textContent = `zone data unavailable (${err.message})`;
-  }
-}
-
-function paintBadge(source, provisional) {
-  const badge = $("badge");
-  const text = $("badgeText");
-  badge.classList.remove("speed", "batch", "unknown");
-  if (source === "batch") {
-    badge.classList.add("batch");
-    text.textContent = "Final (batch)";
-  } else if (source === "speed") {
-    badge.classList.add("speed");
-    text.textContent = "Provisional (speed)";
-  } else {
-    badge.classList.add("unknown");
-    text.textContent = "—";
-  }
-  badge.title = provisional === undefined ? "" :
-    provisional ? "The day is still open; this is an estimate."
-                : "The day has been closed by a successful billing run.";
-}
-
-async function refreshBill() {
-  const hh = $("hh").value.trim();
-  const day = $("day").value;
-  if (!hh || !day) {
-    // Say why the panel is empty rather than leaving it blank.
-    paintBadge(null, undefined);
-    $("total").textContent = "—";
-    $("tariffNote").textContent = !hh
-      ? "enter a household id"
-      : "waiting for the speed layer's first window — or pick a date";
-    $("breakdown").innerHTML = "";
-    return;
-  }
-  try {
-    const bill = await getJSON(
-      `/api/v1/households/${encodeURIComponent(hh)}/bill?date=${day}`);
-    paintBadge(bill.source, bill.provisional);
-    $("total").textContent = fmt(bill.total);
-    $("tariffNote").textContent =
-      bill.source === "speed"
-        ? `computed against the tariff for ${bill.tariff_date} — deliberately stale`
-        : `computed against the tariff for ${bill.tariff_date}`;
-    $("breakdown").innerHTML = [
-      ["Consumption", fmt(bill.consumption_kwh, 4) + " kWh"],
-      ["Solar", fmt(bill.solar_kwh, 4) + " kWh"],
-      ["Billable import", fmt(bill.billable_import_kwh, 4) + " kWh"],
-      ["Exported", fmt(bill.export_kwh, 4) + " kWh"],
-      ["Energy charge", fmt(bill.energy_charge)],
-      ["Fixed charge", fmt(bill.fixed_charge)],
-      ["Subsidy discount", "-" + fmt(bill.subsidy_discount)],
-      ["Export credit", "-" + fmt(bill.export_credit)],
-      ["Readings", bill.readings_count ?? "—"],
-      ["Duplicates removed", bill.duplicates_removed ?? "—"],
-    ].map(([k, v]) => `<tr><td class="label">${k}</td><td>${v}</td></tr>`).join("");
-  } catch (err) {
-    paintBadge(null, undefined);
-    $("total").textContent = "—";
-    $("tariffNote").textContent = "no bill for this household and date";
-    $("breakdown").innerHTML = "";
-  }
-}
-
-// Zones first: that poll is what fills an empty date box, and the bill needs the date.
-// refreshZones never throws, so the bill is refreshed even when the zone poll fails.
-async function tick() { await refreshZones(); refreshBill(); }
-
-(function init() {
-  tick();
-  setInterval(tick, POLL_MS);
-  $("hh").addEventListener("change", refreshBill);
-  $("day").addEventListener("change", refreshBill);
-})();
-</script>
+<div class="toasts" id="toasts" aria-live="polite"></div>
 </body>
 </html>

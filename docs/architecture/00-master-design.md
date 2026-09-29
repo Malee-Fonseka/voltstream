@@ -1111,8 +1111,11 @@ voltstream/
 │   │   └── pipeline_watchdog_dag.py
 │   └── plugins/
 │
-├── dashboard/
-│   └── index.html                       # single-file polling dashboard
+├── dashboard/                           # polling dashboard: static files, no build step
+│   ├── index.html                       # shell and the four views
+│   ├── css/styles.css                   # theme tokens (light + dark), layout
+│   └── js/                              # ES modules: app, api, charts (hand-drawn SVG),
+│       └── views/                       #   live, bills, report, docs (animated pipeline)
 │
 ├── scripts/
 │   ├── demo.sh                          # full end-to-end demo sequence

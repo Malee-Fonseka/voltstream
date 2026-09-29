@@ -43,6 +43,36 @@ def zone_load(trace_id: TraceIdDep) -> list[ZoneLoad]:
 
 
 @router.get(
+    "/history",
+    response_model=list[ZoneHistory],
+    summary="Every zone's recent windows",
+)
+def all_zones_history(
+    trace_id: TraceIdDep,
+    minutes: int = Query(
+        360,
+        ge=1,
+        le=_MAX_HISTORY_MINUTES,
+        description="How far back to look, in SIMULATED minutes.",
+    ),
+) -> list[ZoneHistory]:
+    """Windows for every zone over a simulated-time interval, in one request.
+
+    What the dashboard's trend charts poll. Anchored to `sim_now()` for the same reason as
+    the per-zone endpoint. An empty list rather than a 404 when nothing is in range: the
+    question "what did every zone do" has an answer even when it is "nothing yet", and a
+    dashboard shows that as an empty state rather than an error.
+    """
+    now = sim_now()
+    rows = repositories.get_all_zone_metrics_range(now - timedelta(minutes=minutes), now)
+    by_zone: dict[str, list[ZoneLoad]] = {}
+    for row in rows:
+        by_zone.setdefault(row.grid_zone, []).append(ZoneLoad(**row._asdict()))
+    log.info("zone history served", extra={"stage": "api", "zones": len(by_zone)})
+    return [ZoneHistory(grid_zone=zone, windows=windows) for zone, windows in by_zone.items()]
+
+
+@router.get(
     "/{grid_zone}/history",
     response_model=ZoneHistory,
     summary="One zone's recent windows",

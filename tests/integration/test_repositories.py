@@ -109,6 +109,32 @@ def test_zone_metrics_range_is_ordered_and_bounded() -> None:
     ]
 
 
+def test_all_zone_metrics_range_orders_by_zone_then_time() -> None:
+    base = datetime(2020, 1, 1, 12, 0, tzinfo=UTC)
+    for i in (2, 0, 1):
+        _insert_zone_window(base + timedelta(minutes=15 * i), f"{10 + i}.0000", "1.0000")
+
+    rows = [
+        r
+        for r in repositories.get_all_zone_metrics_range(base, base + timedelta(hours=1))
+        if r.grid_zone == _ZONE
+    ]
+    assert [r.window_start for r in rows] == [base + timedelta(minutes=15 * i) for i in range(3)]
+
+
+def test_households_lists_the_seeded_dimension() -> None:
+    """The seed (03_seed_households.sql), in id order, with its cycling attributes."""
+    rows = repositories.list_households()
+    ids = [r.household_id for r in rows]
+
+    assert ids == sorted(ids)
+    seeded = {r.household_id: r for r in rows if r.household_id.startswith("HH-00")}
+    assert len(seeded) == 50
+    assert seeded["HH-0003"].grid_zone == "ZONE-C"
+    assert seeded["HH-0003"].has_solar is True
+    assert seeded["HH-0004"].subsidy_flag is True
+
+
 def test_running_estimate_round_trips_every_component() -> None:
     with postgres.transaction() as cur:
         cur.execute(

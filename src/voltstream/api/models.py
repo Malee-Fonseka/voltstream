@@ -46,6 +46,36 @@ class ZoneHistory(BaseModel):
     windows: list[ZoneLoad]
 
 
+class HouseholdInfo(BaseModel):
+    """One seeded household: who it is, not what it used."""
+
+    household_id: str
+    meter_id: str
+    grid_zone: str
+    billing_tier: str
+    subsidy_flag: bool
+    has_solar: bool
+
+
+class ClockResponse(BaseModel):
+    """The simulated clock as the API process reads it (§3.4).
+
+    A dashboard shows this rather than the newest window's end, which trails the
+    simulated present by up to a trigger interval. `time_scale` is included so a client
+    can advance the clock smoothly between polls and re-sync on the next one.
+    """
+
+    sim_now: datetime = Field(description="The current simulated instant, UTC.")
+    sim_date: date = Field(description="The simulated day that instant falls on.")
+    time_scale: int = Field(description="Simulated seconds per real second.")
+    day_progress: float = Field(
+        description="Fraction of the simulated day elapsed, 0 at midnight, towards 1."
+    )
+    real_seconds_to_day_close: float = Field(
+        description="REAL seconds until simulated midnight, when the day becomes billable."
+    )
+
+
 class BillResponse(BaseModel):
     """A household's bill for a simulated day, from whichever layer can answer.
 
