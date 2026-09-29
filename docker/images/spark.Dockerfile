@@ -25,7 +25,10 @@ FROM python:3.11-slim-bookworm AS builder
 
 WORKDIR /build
 RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:${PATH}"
+# pip gives up on a download that stalls for 15 s, and does not retry it: a cold build once
+# died eleven minutes into pyspark's 318 MB download on a slow link (T175).
+ENV PATH="/opt/venv/bin:${PATH}" \
+    PIP_DEFAULT_TIMEOUT=120
 
 # Dependencies first, source second. pyspark is a ~317 MB wheel and installing it takes
 # the better part of an hour on a slow link; copying src/ before this step put every

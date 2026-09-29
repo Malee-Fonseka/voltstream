@@ -13,7 +13,9 @@ FROM python:3.11-slim-bookworm AS builder
 
 WORKDIR /build
 RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:${PATH}"
+# Longer than pip's 15 s default, which a slow link's stalls exceed (see spark.Dockerfile).
+ENV PATH="/opt/venv/bin:${PATH}" \
+    PIP_DEFAULT_TIMEOUT=120
 
 # Dependencies first, source second, so a source edit does not re-resolve and re-download
 # the whole dependency tree. Same reasoning as spark.Dockerfile, where it matters far more.
