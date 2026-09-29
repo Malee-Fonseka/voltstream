@@ -1,0 +1,31 @@
+# voltstream — sql_exporter (T147, D9): gauges computed from Postgres, for the two alerts
+# the application's own metrics cannot express.
+#
+# - MeterDataStale needs "when did each zone last receive a reading". The eight metrics in
+#   metrics.py carry no per-zone reading signal: the renewable-ratio gauge sits at a
+#   constant 0 all night, so an unchanged value cannot be told apart from a dead feed.
+# - BatchSLAMiss needs "when did billing last succeed", which only the run ledger knows.
+#
+# Both answers are already in Postgres, written by the pipeline itself, so reading them
+# there adds no new instrumentation to keep in sync. The data source name, password
+# included, is passed on the command line by docker-compose.yml, so nothing secret is
+# committed here.
+
+global:
+  # Under Prometheus' 15 s scrape interval, so a slow query fails the scrape rather than
+  # overlapping the next one.
+  scrape_timeout: 10s
+  scrape_timeout_offset: 500ms
+  # Run the queries on every scrape: both are index-backed or over small tables.
+  min_interval: 0s
+  max_connections: 2
+  max_idle_connections: 2
+  max_connection_lifetime: 5m
+
+target:
+  # Overridden by -config.data-source-name; kept so `sql_exporter -config.check` parses.
+  data_source_name: "postgres://voltstream_reader@postgres:5432/voltstream?sslmode=disable"
+  collectors: [voltstream_*]
+
+collector_files:
+  - "*.collector.yml"

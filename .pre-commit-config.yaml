@@ -67,9 +67,12 @@ repos:
   - repo: local
     hooks:
       # D7: the repository slug is `volstream`; the code is `voltstream`. The
-      # misspelling may appear only in the README's note and in repository URLs.
+      # misspelling may appear only in the README's note, in repository URLs, and in
+      # comments explaining this rule. Comment lines (#, --, //) are skipped, the same
+      # rule `make lint` applies: what this guards against is a misspelled identifier
+      # (a container, volume, package or column name), and those cannot live in a comment.
       - id: no-volstream-misspelling
         name: D7 — no 'volstream' inside source, config, docker, airflow, scripts, tests
         language: pygrep
-        entry: '(?i)volstream'
+        entry: '(?i)^(?!\s*(#|--|//)).*volstream'
         files: ^(src|docker|config|airflow|scripts|tests)/

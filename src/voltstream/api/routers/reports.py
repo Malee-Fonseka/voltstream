@@ -43,7 +43,9 @@ def daily_report(
     zones = [ReportZone(**z._asdict()) for z in repositories.get_zone_daily(report_date)]
     billing = repositories.get_billing_summary(report_date)
     runs = [ReportRun(**r._asdict()) for r in repositories.get_run_summary(report_date)]
-    rejected = repositories.get_rejected_for_day(report_date)
+    rejected = repositories.get_rejected_for_day(
+        report_date, repositories.reject_stage_for(finalised)
+    )
     reconciliation = repositories.get_reconciliation_summary(report_date)
 
     # Spelled out rather than inferred from `finalised` alone, because the three can come

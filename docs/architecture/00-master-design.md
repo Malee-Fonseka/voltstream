@@ -609,6 +609,14 @@ reads as less considered.
 **Rejected — HDFS.** NameNode operational overhead is unjustified at this scale, and
 it reintroduces the compute/storage coupling that object storage removes.
 
+> **Update (2026-09-26, decision D8):** MinIO Inc. withdrew its community distribution
+> between October 2025 and September 2026. It stopped publishing images, archived the
+> repository, and deleted its Docker Hub repositories, so `quay.io/minio/*` and `minio/*`
+> no longer pull. The stack now runs `pgsty/silo`, a community-maintained fork of MinIO with
+> the same S3 API, pinned to a release tag. SeaweedFS is the planned long-term replacement.
+> The swap changed two image lines and no code: this section's argument that moving store is
+> "a change of endpoint and credentials", tested for real.
+
 Two caveats worth a paragraph in the report, because they demonstrate genuine
 understanding:
 
@@ -832,6 +840,7 @@ voltstream-landing/                   ← daily drops (as received)
 
 voltstream-archive/                   ← processed reference, immutable
   tariff/  sim_date=2026-08-10/tariff.parquet
+  reports/ report_2026-08-10.md       ← daily report (T131); a restatement replaces it
 
 voltstream-checkpoints/               ← Spark checkpoints (see §8.5)
   speed_layer/
@@ -840,7 +849,21 @@ voltstream-checkpoints/               ← Spark checkpoints (see §8.5)
 
 ### 6.4 Postgres schema (essentials)
 
+The authoritative DDL is `docker/init/postgres/01_schema.sql` and `02_indexes.sql`; this
+is the shape of it.
+
 ```sql
+-- DIMENSION: the 50 simulated households, seeded once (T038)
+CREATE TABLE households (
+    household_id  TEXT PRIMARY KEY,
+    meter_id      TEXT NOT NULL UNIQUE,
+    grid_zone     TEXT NOT NULL,
+    billing_tier  TEXT NOT NULL,
+    subsidy_flag  BOOLEAN NOT NULL,
+    has_solar     BOOLEAN NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- SPEED VIEW: zone metrics, upserted every micro-batch
 CREATE TABLE zone_metrics_rt (
     grid_zone            TEXT        NOT NULL,
@@ -854,6 +877,8 @@ CREATE TABLE zone_metrics_rt (
     PRIMARY KEY (grid_zone, window_start)
 );
 CREATE INDEX idx_zone_metrics_rt_window ON zone_metrics_rt (window_start DESC);
+-- The newest window per zone, for /zones/load (R32)
+CREATE INDEX idx_zone_metrics_rt_zone_window ON zone_metrics_rt (grid_zone, window_start DESC);
 
 -- SPEED VIEW: per-household running total, provisional
 CREATE TABLE household_running_rt (
@@ -893,6 +918,30 @@ CREATE TABLE household_bill_daily (
     PRIMARY KEY (household_id, sim_date)
 );
 
+-- Every billing run's bills, append-only: the audit trail of restatements (D6, R25)
+CREATE TABLE household_bill_history (
+    LIKE household_bill_daily INCLUDING DEFAULTS,
+    PRIMARY KEY (pipeline_run_id, household_id)
+);
+
+-- BATCH VIEW: authoritative per-zone daily totals, from the master dataset (T037)
+CREATE TABLE zone_metrics_daily (
+    grid_zone             TEXT          NOT NULL,
+    sim_date              DATE          NOT NULL,
+    total_consumption_kwh NUMERIC(12,4) NOT NULL,
+    total_solar_kwh       NUMERIC(12,4) NOT NULL,
+    self_consumed_kwh     NUMERIC(12,4) NOT NULL,  -- sum of the households' bills (R24)
+    export_kwh            NUMERIC(12,4) NOT NULL,
+    renewable_ratio       NUMERIC(5,4)  NOT NULL,
+    peak_window_start     TIMESTAMPTZ   NOT NULL,
+    peak_consumption_kwh  NUMERIC(12,4) NOT NULL,
+    active_meters         INTEGER       NOT NULL,
+    readings_count        INTEGER       NOT NULL,
+    pipeline_run_id       UUID          NOT NULL,  -- lineage
+    computed_at           TIMESTAMPTZ   NOT NULL DEFAULT now(),
+    PRIMARY KEY (grid_zone, sim_date)
+);
+
 -- Dead-letter records: evidence for observability marks
 CREATE TABLE rejected_records (
     id            BIGSERIAL PRIMARY KEY,
@@ -909,11 +958,12 @@ CREATE TABLE pipeline_runs (
     run_id          UUID PRIMARY KEY,
     sim_date        DATE NOT NULL,
     layer           TEXT NOT NULL,        -- 'batch_billing' | 'batch_rollup'
-    status          TEXT NOT NULL,        -- 'running' | 'success' | 'failed'
+    status          TEXT NOT NULL,        -- 'running' | 'success' | 'failed' | 'superseded'
     rows_in         BIGINT,
     rows_out        BIGINT,
     started_at      TIMESTAMPTZ NOT NULL,
-    finished_at     TIMESTAMPTZ
+    finished_at     TIMESTAMPTZ,
+    orchestrator_run_id TEXT              -- the Airflow run that produced it (T122)
 );
 CREATE UNIQUE INDEX idx_runs_date_layer_success
     ON pipeline_runs (sim_date, layer) WHERE status = 'success';
@@ -1172,16 +1222,16 @@ purpose of the master dataset, expressed operationally.
 
 ### 8.2 What `docker compose up` starts
 
-Eleven containers in four dependency tiers. Compose starts services roughly in
-parallel, so `depends_on` with **health conditions** is mandatory — otherwise
-application containers crash-loop against a Kafka that is not yet listening.
+Eighteen containers in four dependency tiers, three of them one-shot. Compose starts
+services roughly in parallel, so `depends_on` with **health conditions** is mandatory —
+otherwise application containers crash-loop against a Kafka that is not yet listening.
 
 | Tier | Containers | Ready when |
 |---|---|---|
 | **1 — Infrastructure** | `kafka`, `postgres`, `minio` | Kafka accepts connections; Postgres accepts queries; MinIO API responds |
 | **2 — Bootstrap** *(run once, then exit 0)* | `kafka-init`, `postgres-init`, `minio-init` | Exit code 0 |
 | **3 — Long-running apps** | `meter-producer`, `reference-dropper`, `speed-layer`, `raw-archiver`, `api` | Own `/health` endpoints pass |
-| **4 — Orchestration & observability** | `airflow`, `prometheus`, `grafana`, `alertmanager` | Scheduler heartbeat; scrape targets up |
+| **4 — Orchestration & observability** | `airflow`, `docker-socket-proxy`, `prometheus`, `alertmanager`, `pushgateway`, `sql-exporter`, `grafana` | Scheduler heartbeat; scrape targets up (see `04-observability.md`) |
 
 **Tier 2 is the one people forget.** These are short-lived jobs, not services: they
 create topics, apply `01_schema.sql`, create buckets, then exit. Without them, tier-3
@@ -1425,7 +1475,7 @@ at once — ingestion robustness (15), processing correctness (15), and observab
 
 **The reconciliation metric is the standout addition.** After each batch run, emit
 `abs(speed_estimate − batch_final)` per household as a Prometheus gauge and alert
-above a threshold. This is a system that **monitors its own Lambda divergence** — 
+above a threshold. This is a system that **monitors its own Lambda divergence** —
 roughly forty lines of code, and the thing an examiner will remember.
 
 **Exit criteria:**
@@ -1679,7 +1729,10 @@ count. Furthermore, end-to-end latency is dominated by two numbers we configured
 | API read | ~20–50 ms |
 
 Postgres contributes on the order of 1%. We measure this with
-`voltstream_e2e_latency_seconds` rather than asserting it. Writes go through
+`voltstream_e2e_latency_seconds` rather than asserting it. *(Measured 2026-09-28: speed path
+p50 5.1 s, p95 14.3 s, none over 60 s; the watermark adds nothing in update mode, so the
+"~30 s" row above is wrong and the trigger alone dominates. Table and method:
+`04-observability.md` §11, T168.)* Writes go through
 `foreachBatch` as bulk upserts — one write of ~500 rows per micro-batch, not 500
 round-trips — and a Postgres outage stalls offset advancement rather than losing
 data, because Kafka absorbs it.

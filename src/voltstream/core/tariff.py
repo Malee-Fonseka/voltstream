@@ -102,8 +102,11 @@ def energy_charge(
         charge = round_money(kwh_in_block * block.rate)
         breakdown.append(
             BlockCharge(
-                name=block.name, up_to_kwh=block.upper, rate=block.rate,
-                kwh=kwh_in_block, charge=charge,
+                name=block.name,
+                up_to_kwh=block.upper,
+                rate=block.rate,
+                kwh=kwh_in_block,
+                charge=charge,
             )
         )
     total = sum((line.charge for line in breakdown), Decimal("0.00"))

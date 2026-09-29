@@ -8,7 +8,7 @@ for the integration tests.
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -22,6 +22,7 @@ from pyspark.sql.types import (
 )
 
 from voltstream.streaming.speed_layer import (
+    deduplicated,
     household_aggregation,
     with_provisional_bill,
     zone_aggregation,
@@ -29,6 +30,8 @@ from voltstream.streaming.speed_layer import (
 
 _KWH = DecimalType(12, 4)
 _TS = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+# Wall clock, when the record reached Kafka — unrelated to the simulated _TS on purpose.
+_KAFKA_TS = datetime(2026, 9, 26, 10, 0, 0, tzinfo=UTC)
 
 _READING_SCHEMA = StructType(
     [
@@ -38,6 +41,7 @@ _READING_SCHEMA = StructType(
         StructField("meter_id", StringType()),
         StructField("consumption_kwh", _KWH),
         StructField("solar_generation_kwh", _KWH),
+        StructField("kafka_timestamp", TimestampType()),
     ]
 )
 
@@ -55,8 +59,10 @@ _TARIFF_SCHEMA = StructType(
 )
 
 
-def _reading(zone: str, household: str, meter: str, consumption: str, solar: str, ts=_TS):
-    return (ts, zone, household, meter, Decimal(consumption), Decimal(solar))
+def _reading(
+    zone: str, household: str, meter: str, consumption: str, solar: str, ts=_TS, kafka_ts=_KAFKA_TS
+):
+    return (ts, zone, household, meter, Decimal(consumption), Decimal(solar), kafka_ts)
 
 
 @pytest.fixture(scope="module")
@@ -94,6 +100,22 @@ def test_renewable_ratio_is_solar_over_consumption(zone_rows) -> None:  # type: 
 def test_window_bounds_are_present_and_ordered(zone_rows) -> None:  # type: ignore[no-untyped-def]
     a = zone_rows["ZONE-A"]
     assert a["window_start"] < a["window_end"]
+
+
+def test_each_window_carries_its_newest_kafka_timestamp(spark) -> None:  # type: ignore[no-untyped-def]
+    """R21: the zone sink measures latency from the newest record in each window it
+    writes, so the aggregation has to carry that timestamp through to foreachBatch."""
+    later = _KAFKA_TS + timedelta(seconds=7)
+    df = spark.createDataFrame(
+        [
+            _reading("ZONE-A", "HH-0001", "MTR-0001", "1.0000", "0.0000", kafka_ts=_KAFKA_TS),
+            _reading("ZONE-A", "HH-0002", "MTR-0002", "1.0000", "0.0000", kafka_ts=later),
+        ],
+        schema=_READING_SCHEMA,
+    )
+    [row] = zone_aggregation(df).collect()
+    # collect() returns a naive local-time datetime; compare as epoch seconds.
+    assert row["newest_kafka_ts"].timestamp() == later.timestamp()
 
 
 def test_zero_consumption_zone_does_not_divide_by_zero(spark) -> None:  # type: ignore[no-untyped-def]
@@ -211,3 +233,43 @@ def test_surplus_solar_saturates_the_ratio(spark) -> None:  # type: ignore[no-un
     assert row["renewable_ratio"] == Decimal("1.0000")
     # The surplus is still recoverable: both raw totals are kept on the same row.
     assert row["total_solar_kwh"] > row["total_consumption_kwh"]
+
+
+# ---------------------------------------------------------------------------
+# R02: the speed layer counts each reading once, on the batch layer's key.
+# ---------------------------------------------------------------------------
+
+
+def test_duplicates_collapse_on_the_batch_layers_key(spark) -> None:  # type: ignore[no-untyped-def]
+    """Same (meter_id, event_ts) is one reading, whatever else differs about the copy;
+    a different meter or a different instant is a different reading."""
+    later = _TS.replace(minute=10)
+    df = spark.createDataFrame(
+        [
+            _reading("ZONE-A", "HH-0001", "MTR-0001", "2.0000", "0.0000"),
+            _reading("ZONE-A", "HH-0001", "MTR-0001", "2.0000", "0.0000"),  # re-sent
+            _reading("ZONE-A", "HH-0002", "MTR-0002", "2.0000", "0.0000"),  # other meter
+            _reading("ZONE-A", "HH-0001", "MTR-0001", "2.0000", "0.0000", ts=later),
+        ],
+        schema=_READING_SCHEMA,
+    )
+    assert deduplicated(df).count() == 3
+
+
+def test_zone_and_household_totals_do_not_double_count_a_resent_reading(spark) -> None:  # type: ignore[no-untyped-def]
+    """Before R02 both views summed the injected duplicates the batch layer removes, so
+    every provisional figure ran about 2 % high."""
+    df = deduplicated(
+        spark.createDataFrame(
+            [
+                _reading("ZONE-B", "HH-0003", "MTR-0003", "1.5000", "0.5000"),
+                _reading("ZONE-B", "HH-0003", "MTR-0003", "1.5000", "0.5000"),  # re-sent
+            ],
+            schema=_READING_SCHEMA,
+        )
+    )
+    [zone] = zone_aggregation(df).collect()
+    [household] = household_aggregation(df).collect()
+    assert zone["total_consumption_kwh"] == Decimal("1.5000")
+    assert zone["total_solar_kwh"] == Decimal("0.5000")
+    assert household["consumption_kwh"] == Decimal("1.5000")

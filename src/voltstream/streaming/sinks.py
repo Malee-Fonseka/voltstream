@@ -20,13 +20,13 @@ from __future__ import annotations
 
 from collections import Counter
 
-import psycopg
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
 from voltstream.config import get_config
 from voltstream.logging_setup import get_logger
-from voltstream.metrics import records_rejected_total
+from voltstream.metrics import e2e_latency_seconds, records_rejected_total
+from voltstream.storage.postgres import connect
 
 log = get_logger("sinks")
 
@@ -88,46 +88,101 @@ def upsert_batch(
 
     # psycopg 3 has no execute_values (that was psycopg2); executemany is pipelined and
     # sends the whole batch in one round trip, which is what the design note is after.
-    with psycopg.connect(pg_connection_string()) as conn, conn.cursor() as cur:
+    with connect(pg_connection_string()) as conn, conn.cursor() as cur:
         cur.executemany(statement, rows)
         conn.commit()
 
     return len(rows)
 
 
-def write_rejected(df: DataFrame, stage: str) -> int:
-    """Write rejected records to `rejected_records` and to the DLQ topic.
+def observe_e2e_latency(df: DataFrame, produced_at_col: str, layer: str) -> int:
+    """Observe `voltstream_e2e_latency_seconds{layer}` once per row of `df`: wall-clock
+    now minus the Kafka record timestamp in `produced_at_col`. Returns observations made.
 
-    Both destinations, not one: the table is queryable for the report and joins against
-    the rest of the serving layer, while the topic keeps a rejected record replayable
-    once the reason it was rejected is fixed. They carry the same `trace_id`, so one
-    identifier follows a bad record through both.
+    Call it after the sink has committed, so the figure includes the write. The origin is
+    the Kafka record timestamp (T030), never `event_ts`, which is simulated and would read
+    288 times too large. Casting a timestamp to double keeps its microseconds, where
+    `unix_timestamp()` truncated to whole seconds — below the histogram's first bucket.
     """
-    config = get_config()
+    latencies = df.select(
+        (F.current_timestamp().cast("double") - F.col(produced_at_col).cast("double")).alias(
+            "seconds"
+        )
+    ).collect()
 
+    observed = 0
+    for (seconds,) in latencies:
+        # Negative only when the producer's clock runs ahead of the driver's. That is not
+        # a latency, so it is dropped rather than clamped to zero.
+        if seconds is not None and seconds >= 0:
+            e2e_latency_seconds.labels(layer=layer).observe(seconds)
+            observed += 1
+    return observed
+
+
+INSERT_REJECTED = (
+    "INSERT INTO rejected_records (stage, reason, trace_id, raw_payload) VALUES (%s, %s, %s, %s)"
+)
+
+RejectedRow = tuple[str, str, str | None, str]
+
+
+def _prepared_rejects(df: DataFrame, stage: str) -> DataFrame:
     # trace_id is nulled rather than assumed when the caller pruned it away. The column
     # is nullable in rejected_records precisely because not every reader carries it, and
     # a sink shared by two layers must not fail on the one that reads fewer columns.
     trace_col = (
         F.col("trace_id").cast("string") if "trace_id" in df.columns else F.lit(None).cast("string")
     )
-    prepared = df.select(
+    return df.select(
         F.lit(stage).alias("stage"),
         F.col("reason"),
         trace_col.alias("trace_id"),
         F.col("payload").alias("raw_payload"),
     )
 
-    rows = prepared.collect()
+
+def _count_rejects(rows: list[RejectedRow], stage: str) -> None:
+    for reason, count in Counter(r[1] for r in rows).items():
+        records_rejected_total.labels(layer=stage, reason=reason).inc(count)
+
+
+def collect_rejected(df: DataFrame, stage: str) -> list[RejectedRow]:
+    """Rejected records as `rejected_records` rows, counted but not written (R23).
+
+    For the batch layer, which writes them in the same transaction as the day's bills:
+    replacing the day's earlier batch rejects, so a retry or a restatement does not add
+    another full set, and never publishing them to the DLQ, where the speed layer has
+    already put every one of them.
+    """
+    rows: list[RejectedRow] = [
+        (r["stage"], r["reason"], r["trace_id"], r["raw_payload"])
+        for r in _prepared_rejects(df, stage).collect()
+    ]
+    _count_rejects(rows, stage)
+    return rows
+
+
+def write_rejected(df: DataFrame, stage: str) -> int:
+    """Write the speed layer's rejected records to `rejected_records` and the DLQ topic.
+
+    Both destinations, not one: the table is queryable for the report and joins against
+    the rest of the serving layer, while the topic keeps a rejected record replayable
+    once the reason it was rejected is fixed. They carry the same `trace_id`, so one
+    identifier follows a bad record through both. The batch layer uses
+    `collect_rejected` instead.
+    """
+    config = get_config()
+
+    prepared = _prepared_rejects(df, stage)
+    rows: list[RejectedRow] = [
+        (r["stage"], r["reason"], r["trace_id"], r["raw_payload"]) for r in prepared.collect()
+    ]
     if not rows:
         return 0
 
-    with psycopg.connect(pg_connection_string()) as conn, conn.cursor() as cur:
-        cur.executemany(
-            "INSERT INTO rejected_records (stage, reason, trace_id, raw_payload) "
-            "VALUES (%s, %s, %s, %s)",
-            [(r["stage"], r["reason"], r["trace_id"], r["raw_payload"]) for r in rows],
-        )
+    with connect(pg_connection_string()) as conn, conn.cursor() as cur:
+        cur.executemany(INSERT_REJECTED, rows)
         conn.commit()
 
     # Spark's Kafka sink, keyed by trace_id so a record's rejection sits in the same
@@ -143,7 +198,5 @@ def write_rejected(df: DataFrame, stage: str) -> int:
         .save()
     )
 
-    for reason, count in Counter(r["reason"] for r in rows).items():
-        records_rejected_total.labels(layer=stage, reason=reason).inc(count)
-
+    _count_rejects(rows, stage)
     return len(rows)

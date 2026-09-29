@@ -1,0 +1,6 @@
+grid_zone,forecast_date,cloud_cover_pct,temperature_c,solar_irradiance_index
+ZONE-A,2025-06-15,20,28,0.800
+ZONE-B,2025-06-15,35,27,0.650
+ZONE-C,2025-06-15,10,30,0.900
+ZONE-D,2025-06-15,60,25,0.400
+ZONE-E,2025-06-15,45,26,0.550

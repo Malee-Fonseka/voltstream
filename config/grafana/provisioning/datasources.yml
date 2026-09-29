@@ -1,0 +1,42 @@
+# voltstream — Grafana datasources, provisioned as code (T151). A cold start gets both
+# without anyone clicking through the UI (§2.5: reproducibility is graded).
+#
+# Mounted at /etc/grafana/provisioning/datasources/ by docker-compose.yml. The fixed uids
+# are what the dashboard JSON files refer to, so a dashboard never depends on the order
+# datasources happened to be created in.
+
+apiVersion: 1
+
+datasources:
+  # Pipeline health (T152), and the alert inputs.
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      # The scrape interval, so $__rate_interval is sized to real samples.
+      timeInterval: 15s
+      httpMethod: POST
+
+  # Grid operations (T153) and Lambda divergence (T154): the speed and batch views
+  # themselves. The read-only role from docker/init/postgres/04_observability.sql, never
+  # the owner, since anonymous viewers can open these dashboards. The password is
+  # interpolated from the container's environment at startup.
+  - name: Postgres
+    uid: postgres
+    type: grafana-postgresql-datasource
+    access: proxy
+    url: postgres:5432
+    user: voltstream_reader
+    editable: false
+    jsonData:
+      database: voltstream
+      sslmode: disable
+      postgresVersion: 1600
+      timescaledb: false
+      maxOpenConns: 5
+    secureJsonData:
+      password: ${POSTGRES_READER_PASSWORD}

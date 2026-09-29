@@ -81,15 +81,18 @@ def test_netting_invariants_exact(consumption: Decimal, solar: Decimal) -> None:
 @_MANY_EXAMPLES
 @given(consumption=_kwh, solar=_kwh, rates=_rates_strategy())
 @example(
-    consumption=Decimal("60.0100"), solar=Decimal("0"),
+    consumption=Decimal("60.0100"),
+    solar=Decimal("0"),
     rates=_r("240.00", False, "0"),
 )
 @example(
-    consumption=Decimal("61.2345"), solar=Decimal("25.5000"),
+    consumption=Decimal("61.2345"),
+    solar=Decimal("25.5000"),
     rates=_r("240.00", True, "25"),
 )
 @example(
-    consumption=Decimal("4.0000"), solar=Decimal("19.0000"),
+    consumption=Decimal("4.0000"),
+    solar=Decimal("19.0000"),
     rates=_r("120.00", False, "0"),
 )
 def test_row_invariants_exact(consumption: Decimal, solar: Decimal, rates: TariffRates) -> None:

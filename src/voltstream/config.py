@@ -20,13 +20,17 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime
+from decimal import Decimal
 from functools import lru_cache
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
+
+from voltstream.core.tariff import BlockBoundary
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _ENV_VAR_PREFIX = "VOLTSTREAM__"
@@ -55,6 +59,31 @@ class GeneratorDefaults(_StrictModel):
 class TariffConfig(_StrictModel):
     blocks: list[TariffBlock]
     generator_defaults: GeneratorDefaults
+
+    @model_validator(mode="after")
+    def _blocks_are_a_valid_structure(self) -> TariffConfig:
+        """D2's load-time rules (R14): three blocks, strictly increasing upper bounds, and
+        exactly one unbounded block, last. A bad file fails here, naming the rule, instead
+        of mis-billing later: unordered bounds priced silently wrong, and a wrong count
+        only surfaced deep inside `build_blocks`."""
+        bounds = [b.up_to_kwh for b in self.blocks]
+        if len(bounds) != 3:
+            raise ValueError(f"tariff.blocks: expected 3 blocks, got {len(bounds)}")
+        if bounds[-1] is not None or None in bounds[:-1]:
+            raise ValueError("tariff.blocks: exactly one block may be unbounded, and it is last")
+        finite = [b for b in bounds[:-1] if b is not None]
+        if any(b <= 0 for b in finite) or any(a >= b for a, b in pairwise(finite)):
+            raise ValueError(f"tariff.blocks: bounds must be positive and increasing: {finite}")
+        return self
+
+    def boundaries(self) -> list[BlockBoundary]:
+        """The block structure as `core/tariff.py` takes it: `Decimal` edges, `None` for
+        the unbounded top block. `core/` may not read config, so callers translate here —
+        one conversion, rather than one per layer that bills."""
+        return [
+            BlockBoundary(b.name, None if b.up_to_kwh is None else Decimal(b.up_to_kwh))
+            for b in self.blocks
+        ]
 
 
 class SimulationConfig(_StrictModel):
@@ -133,6 +162,8 @@ class ApiConfig(_StrictModel):
 class ObservabilityConfig(_StrictModel):
     metrics_port: int
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"]
+    # Where short-lived batch processes push their metrics. None = do not push.
+    pushgateway_url: str | None = None
 
 
 class VoltstreamConfig(_StrictModel):
@@ -223,6 +254,15 @@ def _load_config() -> VoltstreamConfig:
             merged = _deep_merge(merged, _load_yaml(overlay_path))
 
     merged = _apply_env_overrides(merged)
+
+    # `.env` names the database password POSTGRES_PASSWORD, as the Postgres image wants it.
+    # Compose hands containers VOLTSTREAM__POSTGRES__PASSWORD, but a process on the host
+    # (`make test-all`, a script) reads `.env` and gets only the former, and without this
+    # could not connect at all. The explicit variable still wins.
+    postgres = merged.setdefault("postgres", {})
+    if not postgres.get("password") and os.environ.get("POSTGRES_PASSWORD"):
+        postgres["password"] = os.environ["POSTGRES_PASSWORD"]
+
     return VoltstreamConfig(**merged)
 
 

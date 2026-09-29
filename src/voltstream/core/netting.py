@@ -20,8 +20,10 @@ def net(consumption_kwh: Decimal, solar_kwh: Decimal) -> NettingResult:
     """§3.3c, exactly:
 
         self_consumed   = min(solar_kwh, consumption_kwh)
-        billable_import  = consumption_kwh - self_consumed
-        export_kwh       = solar_kwh - self_consumed
+        billable_import = consumption_kwh - self_consumed
+        export_kwh      = solar_kwh - self_consumed
+
+    No rounding: kWh in at <= 4 dp comes out at <= 4 dp, exactly.
     """
     self_consumed = min(solar_kwh, consumption_kwh)
     return NettingResult(

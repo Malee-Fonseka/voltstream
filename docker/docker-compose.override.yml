@@ -1,0 +1,71 @@
+# voltstream — developer overrides (T178, §7.2). Never part of the demo path.
+#
+# What it changes, for development only:
+#   - The source tree is bind-mounted and put first on PYTHONPATH, so containers run the
+#     code in ../src instead of the copy baked into the image: no rebuild after an edit.
+#   - The API runs under uvicorn --reload and restarts itself when a file changes.
+#   - DEBUG logging everywhere.
+#   - The Spark UI (4040) of both streaming jobs is published: 4041 speed layer, 4042 raw
+#     archiver. That is the debugging view Spark offers: jobs, stages, streaming query
+#     progress and state-store sizes.
+#
+# How it is used: Compose loads a file with this name automatically only when run from
+# docker/ with no -f. Every script and Makefile target passes -f docker/docker-compose.yml,
+# which switches that off, so `make up`, `make demo` and voltstream.ps1 never see this
+# file. To use it:
+#
+#   docker compose --env-file .env -f docker/docker-compose.yml \
+#       -f docker/docker-compose.override.yml up -d
+#
+# Not covered: the batch jobs. Airflow launches them from the images through the socket
+# proxy, which cannot mount the repository, so batch code changes still need
+# `voltstream.ps1 build`. A Spark job must also be restarted to pick up an edit
+# (`docker compose ... restart speed-layer`): only the API reloads on its own.
+
+services:
+  api:
+    command:
+      - uvicorn
+      - voltstream.api.main:app
+      - --host=0.0.0.0
+      - --port=8000
+      - --reload
+      - --reload-dir=/app/src
+      - --no-access-log
+    environment:
+      PYTHONPATH: /app/src
+      VOLTSTREAM__OBSERVABILITY__LOG_LEVEL: DEBUG
+    volumes:
+      - ../src:/app/src:ro
+
+  meter-producer:
+    environment:
+      PYTHONPATH: /app/src
+      VOLTSTREAM__OBSERVABILITY__LOG_LEVEL: DEBUG
+    volumes:
+      - ../src:/app/src:ro
+
+  reference-dropper:
+    environment:
+      PYTHONPATH: /app/src
+      VOLTSTREAM__OBSERVABILITY__LOG_LEVEL: DEBUG
+    volumes:
+      - ../src:/app/src:ro
+
+  speed-layer:
+    environment:
+      PYTHONPATH: /app/src
+      VOLTSTREAM__OBSERVABILITY__LOG_LEVEL: DEBUG
+    volumes:
+      - ../src:/app/src:ro
+    ports:
+      - "4041:4040"
+
+  raw-archiver:
+    environment:
+      PYTHONPATH: /app/src
+      VOLTSTREAM__OBSERVABILITY__LOG_LEVEL: DEBUG
+    volumes:
+      - ../src:/app/src:ro
+    ports:
+      - "4042:4040"

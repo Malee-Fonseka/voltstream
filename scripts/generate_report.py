@@ -1,9 +1,16 @@
-"""Write the daily report to a file (T131, §9 Phase 3).
+"""Publish the daily report as a file (T131, §9 Phase 3).
 
-The API serves the same figures as JSON; this writes them as Markdown to an output volume
-so the day's report exists as an artefact rather than only as a request someone has to
-know to make. That is what the brief means by a consolidated report: something produced,
-not something available.
+The API serves the same figures as JSON; this writes them as Markdown so the day's report
+exists as an artefact rather than only as a request someone has to know to make. That is
+what the brief means by a consolidated report: something produced, not something
+available.
+
+**Where it goes (R08):** `voltstream-archive/reports/report_<date>.md` in object storage.
+The DAG runs this in a container that is removed as soon as it exits, and a file written
+to that container's own disk went with it. Object storage outlives the container, the
+stack's `stop`, and a restatement, which simply replaces the day's report. It can be
+opened in the MinIO console. `--out DIR` writes a local file instead, for runs outside the
+stack.
 
 Markdown rather than CSV because the report is not one table — it has per-zone rows, a
 billing summary, a run history and reject counts, and flattening those into a single CSV
@@ -17,17 +24,17 @@ filled.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from datetime import date
 from pathlib import Path
 
+from voltstream.config import get_config
 from voltstream.logging_setup import get_logger
-from voltstream.storage import repositories
+from voltstream.storage import objectstore, repositories
 
 log = get_logger("report-generator")
 
-_DEFAULT_OUTPUT_DIR = Path(os.environ.get("VOLTSTREAM_REPORT_DIR", "/var/lib/voltstream/reports"))
+_CONTENT_TYPE = "text/markdown; charset=utf-8"
 
 
 def _fmt(value: object, dp: int = 2) -> str:
@@ -53,7 +60,7 @@ def render(sim_date: date) -> str:
     zones = repositories.get_zone_daily(sim_date)
     billing = repositories.get_billing_summary(sim_date)
     runs = repositories.get_run_summary(sim_date)
-    rejected = repositories.get_rejected_for_day(sim_date)
+    rejected = repositories.get_rejected_for_day(sim_date, repositories.reject_stage_for(finalised))
     reconciliation = repositories.get_reconciliation_summary(sim_date)
 
     status = "FINAL" if finalised else "PROVISIONAL"
@@ -66,9 +73,10 @@ def render(sim_date: date) -> str:
 
     if not finalised:
         lines += [
-            "> This day has not been closed by a successful billing run. Figures below",
-            "> come from the speed layer where the batch layer has not yet written, and",
-            "> are estimates computed against the previous day's tariff.",
+            "> This day has not been closed by a successful billing run, so the sections",
+            "> below that depend on it are empty. Until it is, each household's bill is",
+            "> the speed layer's provisional estimate, served by the API at",
+            "> `/api/v1/households/{id}/bill`.",
             "",
         ]
 
@@ -150,30 +158,42 @@ def render(sim_date: date) -> str:
     return "\n".join(lines)
 
 
-def write_report(sim_date: date, output_dir: Path | None = None) -> Path:
-    directory = output_dir or _DEFAULT_OUTPUT_DIR
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"report_{sim_date.isoformat()}.md"
+def publish_report(sim_date: date) -> str:
+    """Render the day's report and store it in the archive bucket. Returns where it went."""
+    bucket = get_config().minio.bucket_archive
+    key = objectstore.report_key(sim_date)
+    objectstore.put_object_bytes(bucket, key, render(sim_date).encode("utf-8"), _CONTENT_TYPE)
+    return f"{bucket}/{key}"
+
+
+def write_report(sim_date: date, output_dir: Path) -> Path:
+    """Render the day's report to a local file, for runs outside the stack."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"report_{sim_date.isoformat()}.md"
     path.write_text(render(sim_date), encoding="utf-8")
     return path
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Write the daily report for one simulated day.")
+    parser = argparse.ArgumentParser(description="Publish the daily report for one simulated day.")
     parser.add_argument("--sim-date", required=True, help="Simulated date, YYYY-MM-DD.")
-    parser.add_argument("--out", default=None, help="Output directory.")
+    parser.add_argument(
+        "--out", default=None, help="Write to this local directory instead of object storage."
+    )
     args = parser.parse_args()
 
-    # No pool: this runs as a one-shot task in the Spark image, where psycopg_pool is not
-    # installed. repositories' transaction() opens a direct connection when no pool exists.
+    # No pool: this runs as a one-shot task. repositories' transaction() opens a direct
+    # connection when no pool exists.
     try:
         sim_date = date.fromisoformat(args.sim_date)
-        path = write_report(sim_date, Path(args.out) if args.out else None)
+        where = (
+            str(write_report(sim_date, Path(args.out))) if args.out else publish_report(sim_date)
+        )
         log.info(
             "daily report written",
-            extra={"stage": "report", "sim_date": sim_date.isoformat(), "path": str(path)},
+            extra={"stage": "report", "sim_date": sim_date.isoformat(), "location": where},
         )
-        print(str(path))
+        print(where)
     except Exception as exc:  # noqa: BLE001 - exit code is the DAG's signal
         print(f"generate_report failed: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc

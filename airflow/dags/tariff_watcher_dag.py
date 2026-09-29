@@ -28,6 +28,10 @@ BUCKET = "voltstream-landing"
 PREFIX = "tariff/"
 AWS_CONN_ID = "minio_s3"
 
+# The master dataset, laid out by the raw archiver as meter_readings/sim_date=YYYY-MM-DD/.
+RAW_BUCKET = "voltstream-raw"
+RAW_PREFIX = "meter_readings"
+
 # tariff_2026-01-02.csv -> 2026-01-02
 _TARIFF_NAME = re.compile(r"tariff_(\d{4}-\d{2}-\d{2})\.csv$")
 
@@ -36,32 +40,43 @@ _TARIFF_NAME = re.compile(r"tariff_(\d{4}-\d{2}-\d{2})\.csv$")
 def list_pending_days() -> list[dict]:
     """Every tariff file in the landing zone, as trigger arguments.
 
-    Returns every *complete* day, not only new ones. Deciding what is "new" would need
+    Returns every day with a tariff, not only new ones. Deciding what is "new" would need
     state that can drift from the bucket; letting the trigger operator skip runs that
     already exist keeps the bucket itself as the only source of truth. It also means a day
     whose run was deleted gets picked up again, which is the behaviour you want.
+
+    A tariff file's arrival *is* the signal that its day is over: the reference dropper
+    writes `tariff_D.csv` at the simulated midnight that closes D (§8.3, R03). The billing
+    DAG then waits out the late-data grace from that moment before rescanning the day.
     """
     keys = S3Hook(aws_conn_id=AWS_CONN_ID).list_keys(bucket_name=BUCKET, prefix=PREFIX) or []
-    days = sorted({m.group(1) for key in keys if (m := _TARIFF_NAME.search(key))})
+    complete = sorted({m.group(1) for key in keys if (m := _TARIFF_NAME.search(key))})
 
-    # **The newest day is deliberately excluded.** The reference dropper writes
-    # `tariff_D.csv` at the *start* of simulated day D, not at its end, so the presence of
-    # that file says the day has begun — not that it is over. Billing on arrival meant
-    # rescanning a partition the archiver was still writing into: the billing job and the
-    # zone rollup read it a minute apart and saw 216 kWh and 337 kWh of the same day. The
-    # cross-check gate caught it, which is what that gate is for.
-    #
-    # A day is complete once the *next* day's tariff exists. That is a fact about the
-    # simulated clock rather than a timer, so it stays correct if the stack is paused,
-    # slow, or replayed.
-    complete = days[:-1]
+    # **A day with no readings is not billed (R04).** The dropper seeds a tariff for the
+    # day before the first one (T075), so the speed layer can price day one against
+    # "yesterday's" tariff. No meter ever reported on that seed day, so billing it could
+    # only fail — every cold start used to leave a red run in the UI, and a watchdog on
+    # "tariff files without a successful billing run" would have alarmed forever. The same
+    # rule covers any day the producer never ran. A watchdog must apply it too.
+    hook = S3Hook(aws_conn_id=AWS_CONN_ID)
+    billable = [day for day in complete if _has_readings(hook, day)]
+    skipped = [day for day in complete if day not in billable]
+    if skipped:
+        print(f"not billing {skipped}: no readings for those days in {RAW_BUCKET}")
+
     return [
         {
             "trigger_run_id": f"billing__{day}",
             "conf": {"sim_date": day},
         }
-        for day in complete
+        for day in billable
     ]
+
+
+def _has_readings(hook: S3Hook, day: str) -> bool:
+    """Whether the master dataset holds anything for `day`. One key is enough to know."""
+    prefix = f"{RAW_PREFIX}/sim_date={day}/"
+    return bool(hook.list_keys(bucket_name=RAW_BUCKET, prefix=prefix, max_items=1))
 
 
 with DAG(

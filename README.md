@@ -1,5 +1,7 @@
 # voltstream
 
+[![ci](https://github.com/Malee-Fonseka/voltstream/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Malee-Fonseka/voltstream/actions/workflows/ci.yml)
+
 A Lambda-architecture data platform for smart-grid monitoring and billing, built for
 EC8203 Applied Big Data Engineering (Use Case 3).
 
@@ -36,7 +38,13 @@ report.)_
 
 ## Prerequisites
 
-- Docker Desktop, with roughly 6 GB available to the engine
+- Docker Desktop with **at least 8 GB of memory, 10 GB recommended**, and 4+ CPUs (8
+  recommended). Measured on 2026-09-28 (T176): 15 long-running containers use 5.3–6.1 GiB,
+  and up to 6.4 GiB while a billing run's Spark container is up, with CPU peaks of about
+  12 cores. At 8 GB the stack runs but swaps during billing runs, which can briefly stall
+  Docker's DNS. On Windows, Docker gets half the machine's RAM by default; to give it
+  10 GB, put `[wsl2]` and `memory=10GB` in `%UserProfile%\.wslconfig`, run
+  `wsl --shutdown` and restart Docker Desktop (see `docs/runbook.md`).
 - Python 3.11 (`.python-version` pins 3.11.9 — PySpark 3.5 does not support 3.12+)
 - `make`. On Windows use Git Bash with `choco install make`, or WSL.
 
@@ -48,7 +56,7 @@ make demo
 ```
 
 `make demo` brings the stack up, waits on health checks rather than sleeping, runs one
-simulated day, and prints where to look. First run builds two images and takes a while;
+simulated day, and prints where to look. First run builds three images and takes a while;
 later runs start in under a minute.
 
 Then:
@@ -56,9 +64,20 @@ Then:
 - **API and docs** — <http://localhost:8000/docs>
 - **MinIO console** — <http://localhost:9001> (`voltstream` / `voltstream-dev`)
 - **Live zone load** — `curl http://localhost:8000/api/v1/zones/load`
+- **Grafana** — <http://localhost:3000> (no login): pipeline health, grid operations and
+  Lambda divergence dashboards
+- **Prometheus** — <http://localhost:9090> (targets, alert rules) and **Alertmanager** —
+  <http://localhost:9093>
 
 Other targets: `make up`, `make down`, `make clean` (destroys volumes), `make test`,
-`make test-all`, `make lint`, `make logs s=speed-layer`.
+`make test-all`, `make lint`, `make check-alerts`, `make logs s=speed-layer`.
+Observability is described in [`docs/architecture/04-observability.md`](docs/architecture/04-observability.md).
+
+To break it on purpose and prove the alerts notice: `make faults` (or one scenario:
+`make faults s=stale`), `make backfill d=<date>` for the restatement demo, and
+`make kill-test` for a speed-layer crash. On Windows without `make`, the same commands are
+`.\scripts\voltstream.ps1 faults | backfill -Date <date> | killtest | demo`. The demo, the
+fault drills and what to say during them are in [`docs/runbook.md`](docs/runbook.md).
 
 ## Simulated time
 
@@ -77,19 +96,26 @@ into the future. Bringing the stack up with raw `docker compose` skips that — 
 |---|---|---|
 | `kafka` | 29092 | Event log; 3 partitions, ~7 day retention |
 | `postgres` | 5432 | Serving layer — speed and batch views |
-| `minio` | 9000 / 9001 | Master dataset and the daily landing zone |
+| `minio` | 9000 / 9001 | Master dataset and the daily landing zone. Runs `pgsty/silo`, a MinIO-compatible fork, since MinIO stopped publishing images (decision D8) |
 | `meter-producer` | — | 50 meters, one reading each per 2 real seconds, with injected faults |
 | `reference-dropper` | — | One tariff and weather file per simulated day |
 | `raw-archiver` | 8011 | Kafka → Parquet, no transformation whatsoever |
 | `speed-layer` | 8012 | Windowed zone metrics and the provisional bill |
 | `api` | 8000 | Serving API and OpenAPI docs |
+| `airflow` | 8080 | Orchestration: a watcher bills each simulated day as its tariff lands, and each billing run starts Spark in its own container |
+| `docker-socket-proxy` | — | Lets Airflow start those containers without access to the Docker socket itself |
+| `prometheus` | 9090 | Scrapes the services' metrics and evaluates the five alert rules |
+| `alertmanager` | 9093 | Routes firing alerts back to the API's webhook |
+| `pushgateway` | 9091 | Holds the metrics of batch containers that exit before a scrape |
+| `sql-exporter` | — | Serving-layer facts as metrics: data age per zone, last billing success (D9) |
+| `grafana` | 3000 | Pipeline health, grid operations and Lambda divergence dashboards |
 
 ## Where to look
 
 | Looking for | Start here |
 |---|---|
-| Lambda vs Kappa, and why | [00-master-design.md](docs/architecture/00-master-design.md) §3 |
-| Decisions the design left open | [05-open-decisions.md](docs/architecture/05-open-decisions.md) D1–D7 |
+| Lambda vs Kappa, and why | [00-master-design.md](docs/architecture/00-master-design.md) §4 |
+| Decisions the design left open | [05-open-decisions.md](docs/architecture/05-open-decisions.md) D1–D9 |
 | Billing logic, shared by both layers | [src/voltstream/core/](src/voltstream/core/) |
 | That the two layers agree | [tests/consistency/test_pure_vs_spark.py](tests/consistency/test_pure_vs_spark.py) |
 | Ingestion | [simulators/](src/voltstream/simulators/), [streaming/sources.py](src/voltstream/streaming/sources.py) |
@@ -98,6 +124,20 @@ into the future. Bringing the stack up with raw `docker compose` skips that — 
 | Serving layer | [storage/repositories.py](src/voltstream/storage/repositories.py), [api/](src/voltstream/api/) |
 | Observability | [metrics.py](src/voltstream/metrics.py), [logging_setup.py](src/voltstream/logging_setup.py) |
 | Measured limitations, honestly | [docs/assumptions.md](docs/assumptions.md) |
+
+## Tests
+
+| Command | What runs | Needs |
+|---|---|---|
+| `make test` | Unit, property and consistency tests, including the pure-Python vs Spark billing check | Python and Java; no Docker |
+| `make coverage` | The same, with CI's gate: `core/` must stay at 100 % coverage | as above |
+| `make check-alerts` | promtool on the alert rules and their unit tests, amtool on the routing | Docker |
+| `make test-all` | Everything, including the integration tests: producer to Kafka, the batch job end to end on committed fixtures with hand-computed bills, the merge function, archiver restart | the stack up |
+| `make cold-starts` | Five starts from nothing, asserting no container crash-loops | Docker; destroys the stack's data |
+| `make cold-start` | Gate 5: a fresh clone, images rebuilt with no cache, the demo run with no manual steps | Docker; destroys the stack's data |
+
+CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs the first three on every
+push and pull request.
 
 ## What is deliberately simplified
 

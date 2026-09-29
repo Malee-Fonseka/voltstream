@@ -1,15 +1,27 @@
 # voltstream — tiers 1 (infrastructure) and 2 (bootstrap) of the stack (§8.2, T043-T047).
 #
 # `name: voltstream` below is mandatory per D7: Compose otherwise derives the project
-# name from the folder holding this file (`docker/`), and the repository folder is
-# `volstream` (missing a "t") — this key is what makes every network, volume and
-# container come out `voltstream-*` regardless.
+# name from the folder holding this file (`docker/`), and the repository folder is not
+# spelled like the package (see D7). This key is what makes every network, volume and
+# container come out `voltstream-*` regardless of where the repository is checked out.
 #
 # Tier 1 (kafka, postgres, minio) has real healthchecks, never a `sleep` (§8.2). Tier 2
 # (the three `-init` services) apply schema/topics/buckets and exit 0; every statement
 # they run is idempotent, because they run again on every `compose up`, not only once.
 
 name: voltstream
+
+# The object store image, defined once for the server and the bucket-creating init job.
+#
+# MinIO Inc. stopped publishing community images in October 2025, archived the repository
+# in February 2026 and deleted its Docker Hub repositories in September 2026, so
+# quay.io/minio/* and minio/* no longer pull on a clean machine (D8). pgsty/silo is a
+# community-maintained fork (formerly pgsty/minio): same S3 API, same MINIO_* variables,
+# same /minio/health/live endpoint, with `mc` in the same image. Pinned to a release tag,
+# never `latest` — a single-maintainer fork must not change underneath a graded demo. Not
+# the `-distroless` variant: the healthcheck needs curl, and minio-init needs a shell.
+# Planned replacement: SeaweedFS (D8).
+x-object-store-image: &object-store-image pgsty/silo:RELEASE.2026-09-16T00-00-00Z
 
 services:
   # ============================================================================
@@ -33,6 +45,10 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # Where kafka_data is mounted. The image's default is /tmp/kraft-combined-logs, inside
+      # the container: topics then vanished on `make down && make up` while the Spark
+      # checkpoints on their own volumes survived, pointing at offsets that no longer exist.
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
     ports:
       - "${KAFKA_HOST_PORT:-29092}:29092"
     volumes:
@@ -65,10 +81,9 @@ services:
       retries: 20
       start_period: 5s
 
+  # The service keeps the name `minio`: `minio:9000` is the S3 endpoint every client uses.
   minio:
-    # minio/minio on Docker Hub started refusing anonymous pulls in 2024; quay.io is the
-    # unauthenticated mirror MinIO itself documents as the replacement.
-    image: quay.io/minio/minio:latest
+    image: *object-store-image
     container_name: voltstream-minio
     restart: unless-stopped
     command: server /data --console-address ":9001"
@@ -103,6 +118,8 @@ services:
       PGUSER: ${POSTGRES_USER:-voltstream}
       PGPASSWORD: ${POSTGRES_PASSWORD:-voltstream}
       PGDATABASE: ${POSTGRES_DB:-voltstream}
+      # The read-only role Grafana and sql_exporter log in as (04_observability.sql).
+      READER_PASSWORD: ${POSTGRES_READER_PASSWORD:-voltstream-reader}
     volumes:
       - ./init/postgres:/sql:ro
     networks: [voltstream]
@@ -112,7 +129,7 @@ services:
         set -e
         for f in /sql/*.sql; do
           echo "applying $$f"
-          psql -v ON_ERROR_STOP=1 -f "$$f"
+          psql -v ON_ERROR_STOP=1 -v reader_password="$$READER_PASSWORD" -f "$$f"
         done
 
   kafka-init:
@@ -133,7 +150,8 @@ services:
     entrypoint: ["/bin/bash", "/scripts/create_topics.sh"]
 
   minio-init:
-    image: quay.io/minio/mc:latest
+    # The server image carries `mc`, so the separate client image is no longer needed.
+    image: *object-store-image
     container_name: voltstream-minio-init
     depends_on:
       minio:
@@ -397,11 +415,18 @@ services:
         aws://${MINIO_ROOT_USER:-voltstream}:${MINIO_ROOT_PASSWORD:-voltstream-dev}@/?endpoint_url=http%3A%2F%2Fminio%3A9000&region_name=us-east-1
       AIRFLOW_CONN_VOLTSTREAM_PG: >-
         postgresql://${POSTGRES_USER:-voltstream}:${POSTGRES_PASSWORD:-voltstream}@postgres:5432/${POSTGRES_DB:-voltstream}
-      # Passed to the Spark container the DAG launches.
+      # The images the DAG launches: Spark for billing and the rollup, the app image for
+      # reconciliation (D6).
       VOLTSTREAM_SPARK_IMAGE: voltstream-spark:${VOLTSTREAM_IMAGE_TAG:-local}
+      VOLTSTREAM_APP_IMAGE: voltstream-app:${VOLTSTREAM_IMAGE_TAG:-local}
       VOLTSTREAM_NETWORK: voltstream
       VOLTSTREAM_ANCHOR_REAL: ${VOLTSTREAM_ANCHOR_REAL:-}
       DOCKER_HOST: tcp://docker-socket-proxy:2375
+      # The DAG hands these to the containers it launches (R36). Without them it fell back
+      # to the defaults, and a non-default password in .env failed every batch task.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-voltstream}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-voltstream}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-voltstream-dev}
     ports:
       - "${AIRFLOW_HOST_PORT:-8080}:8080"
     volumes:
@@ -419,6 +444,132 @@ services:
       docker-socket-proxy:
         condition: service_started
 
+  # ============================================================================
+  # Tier 4 — observability (T142-T155, §5.7, §10.1)
+  # ============================================================================
+  # Images pinned to release tags, never `latest`, for the same reason as the object store:
+  # a graded demo must not change underneath itself.
+
+  # Short-lived batch containers exit before a scrape could reach them, so they push here
+  # as they finish (T116, R07). The DAG passes the URL to them; Prometheus scrapes it.
+  pushgateway:
+    image: prom/pushgateway:v1.11.3
+    container_name: voltstream-pushgateway
+    restart: unless-stopped
+    ports:
+      - "${PUSHGATEWAY_HOST_PORT:-9091}:9091"
+    networks: [voltstream]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9091/-/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Gauges computed from Postgres for MeterDataStale and BatchSLAMiss (T147, D9). Logs in
+  # as the read-only role; the DSN is built here so the password comes from .env.
+  sql-exporter:
+    image: burningalchemist/sql_exporter:0.24.8
+    container_name: voltstream-sql-exporter
+    restart: unless-stopped
+    command:
+      - -config.file=/etc/sql_exporter/sql_exporter.yml
+      - -config.data-source-name=postgres://voltstream_reader:${POSTGRES_READER_PASSWORD:-voltstream-reader}@postgres:5432/${POSTGRES_DB:-voltstream}?sslmode=disable
+    volumes:
+      - ../config/sql_exporter:/etc/sql_exporter:ro
+    networks: [voltstream]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # The role it logs in as is created there (04_observability.sql).
+      postgres-init:
+        condition: service_completed_successfully
+
+  alertmanager:
+    image: prom/alertmanager:v0.34.1
+    container_name: voltstream-alertmanager
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    ports:
+      - "${ALERTMANAGER_HOST_PORT:-9093}:9093"
+    volumes:
+      - ../config/alertmanager:/etc/alertmanager:ro
+      # Silences and notification state, so a restart does not re-send every alert.
+      - alertmanager_data:/alertmanager
+    networks: [voltstream]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9093/-/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    container_name: voltstream-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      # POST /-/reload re-reads the config and rules after an edit, without a restart.
+      - --web.enable-lifecycle
+    ports:
+      - "${PROMETHEUS_HOST_PORT:-9090}:9090"
+    volumes:
+      - ../config/prometheus:/etc/prometheus:ro
+      - prometheus_data:/prometheus
+    networks: [voltstream]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    depends_on:
+      alertmanager:
+        condition: service_started
+
+  # Anonymous viewers, so the demo needs no login (T155); the admin login still exists for
+  # anyone who needs to explore. Datasources and dashboards are provisioned from the
+  # repository (T151): a cold start has all of them, with no clicking.
+  grafana:
+    image: grafana/grafana:13.2.2
+    container_name: voltstream-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GF_SECURITY_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/pipeline-health.json
+      # Offline-friendly: no phoning home from a demo laptop.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      # Interpolated into the Postgres datasource (provisioning/datasources.yml).
+      POSTGRES_READER_PASSWORD: ${POSTGRES_READER_PASSWORD:-voltstream-reader}
+    ports:
+      - "${GRAFANA_HOST_PORT:-3000}:3000"
+    volumes:
+      # The task's two provisioning files, each mounted where Grafana looks for its kind.
+      - ../config/grafana/provisioning/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+      - ../config/grafana/provisioning/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml:ro
+      - ../config/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    networks: [voltstream]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    depends_on:
+      prometheus:
+        condition: service_started
+      postgres-init:
+        condition: service_completed_successfully
+
 networks:
   voltstream:
     name: voltstream
@@ -434,3 +585,8 @@ volumes:
   # of convenience.
   speed_checkpoints:
   archiver_checkpoints:
+  # Tier 4 — observability state. Also survive `make down`; `make clean` resets them with
+  # the rest, so a fresh run starts with empty history.
+  prometheus_data:
+  alertmanager_data:
+  grafana_data:

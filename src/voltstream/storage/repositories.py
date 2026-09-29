@@ -1,4 +1,4 @@
-"""Every query the API makes (T100, T101, §7.2).
+"""Every query the API makes (T100, T101, §7.2), plus the reconciliation job's (D4).
 
 **All SQL lives here.** Routers call functions on this module and never write SQL — the
 rule is enforced by grepping the router package, and it exists so a schema change has one
@@ -58,6 +58,32 @@ class ReconciliationEffects(NamedTuple):
     data_effect: Decimal
     abs_divergence: Decimal
     pct_divergence: Decimal
+
+
+class BatchBill(NamedTuple):
+    """The part of a `household_bill_daily` row reconciliation needs: `B`, the kWh it was
+    computed from, and the gross charges that are `pct_divergence`'s base (D5)."""
+
+    household_id: str
+    sim_date: date
+    consumption_kwh: Decimal
+    solar_kwh: Decimal
+    energy_charge: Decimal
+    fixed_charge: Decimal
+    final_bill: Decimal
+
+
+class ReconciliationRow(NamedTuple):
+    """One row of `reconciliation_daily`, in the table's column order."""
+
+    household_id: str
+    sim_date: date
+    speed_estimate: Decimal
+    batch_final: Decimal
+    abs_divergence: Decimal
+    pct_divergence: Decimal
+    tariff_effect: Decimal
+    data_effect: Decimal
 
 
 class RejectedSummary(NamedTuple):
@@ -136,18 +162,35 @@ def is_day_finalised(sim_date: date) -> bool:
         return cur.fetchone() is not None
 
 
+# In RunningEstimate's field order.
+_RUNNING_COLUMNS = (
+    "household_id, sim_date, consumption_kwh, solar_kwh, self_consumed_kwh, "
+    "billable_import_kwh, export_kwh, energy_charge, fixed_charge, subsidy_discount, "
+    "export_credit, tier_breakdown, estimated_bill, tariff_source_date"
+)
+
+
 def get_running_estimate(household_id: str, sim_date: date) -> RunningEstimate | None:
     """The speed layer's provisional bill for one household and day."""
     with transaction() as cur:
         cur.execute(
-            "SELECT household_id, sim_date, consumption_kwh, solar_kwh, self_consumed_kwh, "
-            "billable_import_kwh, export_kwh, energy_charge, fixed_charge, subsidy_discount, "
-            "export_credit, tier_breakdown, estimated_bill, tariff_source_date "
-            "FROM household_running_rt WHERE household_id = %s AND sim_date = %s",
+            f"SELECT {_RUNNING_COLUMNS} FROM household_running_rt "
+            "WHERE household_id = %s AND sim_date = %s",
             (household_id, sim_date),
         )
         row = cur.fetchone()
         return RunningEstimate(*row) if row else None
+
+
+def get_running_estimates_for_day(sim_date: date) -> list[RunningEstimate]:
+    """Every household's provisional bill for one day — reconciliation's `S` (D4)."""
+    with transaction() as cur:
+        cur.execute(
+            f"SELECT {_RUNNING_COLUMNS} FROM household_running_rt "
+            "WHERE sim_date = %s ORDER BY household_id",
+            (sim_date,),
+        )
+        return [RunningEstimate(*r) for r in cur.fetchall()]
 
 
 _BILL_COLUMNS = (
@@ -188,6 +231,40 @@ def get_reconciliation_effects(household_id: str, sim_date: date) -> Reconciliat
         )
         row = cur.fetchone()
         return ReconciliationEffects(*row) if row else None
+
+
+def get_batch_bills_for_day(sim_date: date) -> list[BatchBill]:
+    """Every household's final bill for one day — reconciliation's `B` (D4)."""
+    with transaction() as cur:
+        cur.execute(
+            "SELECT household_id, sim_date, consumption_kwh, solar_kwh, energy_charge, "
+            "fixed_charge, final_bill FROM household_bill_daily "
+            "WHERE sim_date = %s ORDER BY household_id",
+            (sim_date,),
+        )
+        return [BatchBill(*r) for r in cur.fetchall()]
+
+
+def replace_reconciliation(sim_date: date, rows: list[ReconciliationRow]) -> int:
+    """Replace one day's reconciliation, in one transaction. Returns rows written.
+
+    Delete-then-insert rather than upsert, so a rerun after a restatement cannot leave
+    behind a row for a household the new run no longer reconciles. One transaction, so a
+    reader never sees the day half-replaced — which also makes a DAG retry safe.
+    """
+    stray = {row.sim_date for row in rows} - {sim_date}
+    if stray:
+        raise ValueError(f"rows for {sorted(stray)} passed to replace the day {sim_date}")
+
+    with transaction() as cur:
+        cur.execute("DELETE FROM reconciliation_daily WHERE sim_date = %s", (sim_date,))
+        if rows:
+            cur.executemany(
+                f"INSERT INTO reconciliation_daily ({', '.join(ReconciliationRow._fields)}) "
+                f"VALUES ({', '.join(['%s'] * len(ReconciliationRow._fields))})",
+                rows,
+            )
+    return len(rows)
 
 
 def get_reconciliation(sim_date: date) -> list[tuple]:
@@ -296,20 +373,31 @@ def get_run_summary(sim_date: date) -> list[RunSummary]:
         return [RunSummary(*r) for r in cur.fetchall()]
 
 
-def get_rejected_for_day(sim_date: date) -> list[RejectedSummary]:
-    """Rejections attributable to a simulated day.
+def reject_stage_for(finalised: bool) -> str:
+    """Whose rejects describe a day: the batch layer's once it is billed, else the speed's."""
+    return "batch" if finalised else "speed"
+
+
+def get_rejected_for_day(sim_date: date, stage: str) -> list[RejectedSummary]:
+    """One layer's rejections attributable to a simulated day.
+
+    One layer, not both (R23): the two validate the same readings, so counting both
+    reported every bad reading twice. Use `reject_stage_for(finalised)`. The batch layer's
+    figures are the day's authoritative ones — deduplicated, and replaced on every run.
+    The speed layer validates before it deduplicates, so its count also includes the
+    injected duplicates of bad readings.
 
     Matched on the payload's `event_ts` rather than `rejected_at`: a record rejected by
     the batch layer is rejected when the job runs, which can be a different real day from
     the simulated one it belongs to. Counting by wall clock would attribute a restatement
-    of last week's data to today.
+    of last week's data to today. `daily_billing.finalise` deletes by the same expression.
     """
     with transaction() as cur:
         cur.execute(
             "SELECT reason, count(*) FROM rejected_records "
-            "WHERE (raw_payload ->> 'event_ts')::timestamptz::date = %s "
+            "WHERE stage = %s AND (raw_payload ->> 'event_ts')::timestamptz::date = %s "
             "GROUP BY reason ORDER BY count(*) DESC",
-            (sim_date,),
+            (stage, sim_date),
         )
         return [RejectedSummary(reason, total) for reason, total in cur.fetchall()]
 

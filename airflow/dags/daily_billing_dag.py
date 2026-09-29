@@ -1,8 +1,9 @@
-"""Bill one simulated day (T121–T123, D6).
+"""Bill one simulated day (T121–T123, T139, D6).
 
-Triggered by `tariff_watcher` with `conf={"sim_date": "YYYY-MM-DD"}`. Four steps: wait for
-the tariff file, wait out the late-data grace, run the Spark job in its own container,
-then check what it wrote.
+Triggered by `tariff_watcher` with `conf={"sim_date": "YYYY-MM-DD"}`. In order: wait for
+the tariff file, wait out the late-data grace, run the Spark billing job in its own
+container, check what it wrote, roll up the zones, reconcile the speed layer's estimates
+against the new bills, and write the day's report.
 
 **Every task is keyed on `params.sim_date`, never on the logical date.** That is what makes
 a restatement work (T123): re-running this DAG for an already-billed day with a fresh
@@ -49,6 +50,12 @@ def _config() -> dict:
 _CFG = _config()
 _GRACE_SECONDS = int(_CFG["batch"]["late_data_grace_real_seconds"])
 _SLA_MINUTES = int(_CFG["alerts"]["batch_sla_minutes"])
+
+# Where the batch containers push their metrics as they exit (T116, T142): billing and the
+# rollup push voltstream_batch_duration_seconds, reconciliation pushes
+# voltstream_lambda_divergence. Set here rather than in base.yaml so a local run or a test
+# never tries to reach a Pushgateway that only exists on the Compose network.
+_PUSHGATEWAY_URL = "http://pushgateway:9091"
 _HOUSEHOLDS = int(_CFG["simulation"]["households"])
 
 
@@ -139,6 +146,7 @@ with DAG(
             "VOLTSTREAM__SIMULATION__ANCHOR_REAL": os.environ.get("VOLTSTREAM_ANCHOR_REAL", ""),
             "AWS_ENDPOINT_URL": "http://minio:9000",
             "AWS_DEFAULT_REGION": "us-east-1",
+            "VOLTSTREAM__OBSERVABILITY__PUSHGATEWAY_URL": _PUSHGATEWAY_URL,
             # Lineage: the job records this against pipeline_runs.orchestrator_run_id, so
             # a restated day shows which DAG run produced each of its two ledger rows.
             "VOLTSTREAM_ORCHESTRATOR_RUN_ID": "{{ run_id }}",
@@ -186,7 +194,12 @@ with DAG(
               count(*) > 0                                           AS day_has_bills,
               count(*) FILTER (WHERE final_bill IS NULL)        = 0 AS no_null_bills,
               count(*) FILTER (WHERE tier_breakdown IS NULL)    = 0 AS no_null_breakdown,
-              count(*) FILTER (WHERE readings_count <= 0)       = 0 AS every_bill_has_readings,
+              -- A household with no valid readings all day is billed its fixed charge
+              -- (R35), so one bill at zero readings is legitimate. A day where most are
+              -- is not: that is a meter feed that stopped, not an idle household.
+              count(*) FILTER (WHERE readings_count < 0)        = 0 AS no_negative_counts,
+              count(*) FILTER (WHERE readings_count > 0) > count(*) / 2
+                                                                  AS most_bills_have_readings,
               count(*) FILTER (WHERE abs(final_bill) > 1000000) = 0 AS no_absurd_bills,
               count(*) FILTER (WHERE tariff_effective_date > DATE '{{ params.sim_date }}')
                                                                 = 0 AS no_future_tariff
@@ -222,6 +235,7 @@ with DAG(
             "VOLTSTREAM__SIMULATION__ANCHOR_REAL": os.environ.get("VOLTSTREAM_ANCHOR_REAL", ""),
             "AWS_ENDPOINT_URL": "http://minio:9000",
             "AWS_DEFAULT_REGION": "us-east-1",
+            "VOLTSTREAM__OBSERVABILITY__PUSHGATEWAY_URL": _PUSHGATEWAY_URL,
             "VOLTSTREAM_ORCHESTRATOR_RUN_ID": "{{ run_id }}",
         },
         private_environment={
@@ -230,16 +244,56 @@ with DAG(
             "AWS_SECRET_ACCESS_KEY": os.environ.get("MINIO_ROOT_PASSWORD", "voltstream-dev"),
         },
         # No retries. The cross-check failing is a data-consistency verdict, not a
-        # transient fault, and retrying it would just fail again more slowly.
+        # transient fault, and retrying it would just fail again more slowly. Transient
+        # faults are handled inside the job instead: storage.postgres.connect() retries a
+        # failed connection (R38), which is what lost a day's rollup to one DNS timeout.
         retries=0,
     )
 
-    # Last, because it reports on everything above it — bills, rollup and the run ledger.
+    # T139 — after the bills and the rollup, because it compares the speed layer's
+    # estimates against the bills this run just committed. On the app image, not the Spark
+    # one (D4, D6): fifty rows of Decimal arithmetic with `core/tariff.py` need no cluster.
+    run_reconciliation = DockerOperator(
+        task_id="run_reconciliation",
+        image=os.environ.get("VOLTSTREAM_APP_IMAGE", "voltstream-app:local"),
+        docker_url="tcp://docker-socket-proxy:2375",
+        network_mode=os.environ.get("VOLTSTREAM_NETWORK", "voltstream"),
+        mount_tmp_dir=False,
+        force_pull=False,
+        auto_remove="force",
+        tty=False,
+        command=["voltstream-reconcile", "--sim-date", "{{ params.sim_date }}"],
+        environment={
+            "VOLTSTREAM_ENV": "docker",
+            "VOLTSTREAM_CONFIG_DIR": "/app/config",
+            "VOLTSTREAM__POSTGRES__HOST": "postgres",
+            "VOLTSTREAM__SIMULATION__ANCHOR_REAL": os.environ.get("VOLTSTREAM_ANCHOR_REAL", ""),
+            "AWS_ENDPOINT_URL": "http://minio:9000",
+            "AWS_DEFAULT_REGION": "us-east-1",
+            "VOLTSTREAM__OBSERVABILITY__PUSHGATEWAY_URL": _PUSHGATEWAY_URL,
+        },
+        private_environment={
+            "VOLTSTREAM__POSTGRES__PASSWORD": os.environ.get("POSTGRES_PASSWORD", "voltstream"),
+            "AWS_ACCESS_KEY_ID": os.environ.get("MINIO_ROOT_USER", "voltstream"),
+            "AWS_SECRET_ACCESS_KEY": os.environ.get("MINIO_ROOT_PASSWORD", "voltstream-dev"),
+        },
+        # Safe to retry: the job replaces the day's rows in one transaction.
+        retries=2,
+        retry_delay=timedelta(seconds=30),
+        retry_exponential_backoff=True,
+    )
+
+    # Last, because it reports on everything above it — bills, rollup, reconciliation and
+    # the run ledger.
     # Generated rather than served on request: the brief's deliverable is a report that
     # exists, not an endpoint someone has to know to call.
+    #
+    # Published to voltstream-archive/reports/ (R08). This container is removed as soon as
+    # it exits, so a file on its own disk would vanish with it. On the app image, per D6:
+    # it needs Postgres and the S3 client, not Spark.
     generate_report = DockerOperator(
         task_id="generate_report",
-        image=os.environ.get("VOLTSTREAM_SPARK_IMAGE", "voltstream-spark:local"),
+        image=os.environ.get("VOLTSTREAM_APP_IMAGE", "voltstream-app:local"),
         docker_url="tcp://docker-socket-proxy:2375",
         network_mode=os.environ.get("VOLTSTREAM_NETWORK", "voltstream"),
         mount_tmp_dir=False,
@@ -256,10 +310,14 @@ with DAG(
             "VOLTSTREAM_ENV": "docker",
             "VOLTSTREAM_CONFIG_DIR": "/app/config",
             "VOLTSTREAM__POSTGRES__HOST": "postgres",
-            "VOLTSTREAM_REPORT_DIR": "/var/lib/voltstream/reports",
+            "VOLTSTREAM__SIMULATION__ANCHOR_REAL": os.environ.get("VOLTSTREAM_ANCHOR_REAL", ""),
+            "AWS_ENDPOINT_URL": "http://minio:9000",
+            "AWS_DEFAULT_REGION": "us-east-1",
         },
         private_environment={
             "VOLTSTREAM__POSTGRES__PASSWORD": os.environ.get("POSTGRES_PASSWORD", "voltstream"),
+            "AWS_ACCESS_KEY_ID": os.environ.get("MINIO_ROOT_USER", "voltstream"),
+            "AWS_SECRET_ACCESS_KEY": os.environ.get("MINIO_ROOT_PASSWORD", "voltstream-dev"),
         },
         retries=1,
     )
@@ -270,5 +328,6 @@ with DAG(
         >> run_daily_billing
         >> [verify_row_count, verify_bill_sanity]
         >> run_zone_rollup
+        >> run_reconciliation
         >> generate_report
     )

@@ -1,0 +1,5 @@
+household_id,consumption_kwh,solar_kwh,self_consumed_kwh,billable_import_kwh,export_kwh,energy_charge,fixed_charge,subsidy_discount,export_credit,final_bill,readings_count,duplicates_removed
+HH-0001,60.0100,0.0000,0.0000,60.0100,0.0000,480.17,240.00,0.00,0.00,720.17,2,1
+HH-0002,61.2345,25.5000,25.5000,35.7345,0.0000,285.88,240.00,71.47,0.00,454.41,2,0
+HH-0003,4.0000,19.0000,4.0000,0.0000,15.0000,0.00,120.00,0.00,270.00,-150.00,2,0
+HH-0004,125.0000,0.0000,0.0000,125.0000,0.0000,1592.50,480.00,0.00,0.00,2072.50,2,0

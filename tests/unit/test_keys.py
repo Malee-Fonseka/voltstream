@@ -11,7 +11,7 @@ import pytest
 
 from voltstream.config import get_config
 from voltstream.contracts.events import MeterReading
-from voltstream.core.keys import dedup_key, parquet_partition, partition_key
+from voltstream.core.keys import DEDUP_COLUMNS, dedup_key, parquet_partition, partition_key
 
 
 def _reading(**overrides: object) -> MeterReading:
@@ -60,6 +60,12 @@ def test_dedup_key_differs_on_meter_id() -> None:
 def test_dedup_key_shape() -> None:
     r = _reading()
     assert dedup_key(r) == (r.meter_id, r.event_ts)
+
+
+def test_dedup_columns_name_the_dedup_key() -> None:
+    """The Spark jobs dedup on DEDUP_COLUMNS (R02); it must be the same key, field for field."""
+    r = _reading()
+    assert tuple(getattr(r, column) for column in DEDUP_COLUMNS) == dedup_key(r)
 
 
 def test_partition_key_equals_household_id() -> None:

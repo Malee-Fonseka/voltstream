@@ -81,8 +81,13 @@ def _random_row(rng: random.Random) -> tuple[Decimal, Decimal, TariffRates]:
 
 def _boundary_straddling_rows() -> list[tuple[Decimal, Decimal, TariffRates]]:
     rates = TariffRates(
-        Decimal("8.00"), Decimal("16.50"), Decimal("24.50"),
-        Decimal("240.00"), False, Decimal("0"), Decimal("18.00"),
+        Decimal("8.00"),
+        Decimal("16.50"),
+        Decimal("24.50"),
+        Decimal("240.00"),
+        False,
+        Decimal("0"),
+        Decimal("18.00"),
     )
     rows = []
     for boundary in (Decimal(60), Decimal(120)):
@@ -99,8 +104,13 @@ def _half_cent_tie_rows() -> list[tuple[Decimal, Decimal, TariffRates]]:
     # float rounding from Decimal ROUND_HALF_UP (T002's evidence: 60.01 * ... -> .165).
     rows = []
     rates = TariffRates(
-        Decimal("8.00"), Decimal("16.50"), Decimal("24.50"),
-        Decimal("240.00"), True, Decimal("25"), Decimal("18.00"),
+        Decimal("8.00"),
+        Decimal("16.50"),
+        Decimal("24.50"),
+        Decimal("240.00"),
+        True,
+        Decimal("25"),
+        Decimal("18.00"),
     )
     for kwh_hundredths in range(1, 51):  # 0.01 .. 0.50 kWh into block_2
         consumption = Decimal(60) + Decimal(kwh_hundredths).scaleb(-2)
@@ -128,16 +138,24 @@ def test_pure_and_spark_agree_exactly(spark: SparkSession) -> None:
 
     spark_rows = [
         (
-            i, consumption, solar,
-            rates.block_1_rate, rates.block_2_rate, rates.block_3_rate,
-            rates.fixed_charge, rates.subsidy_flag, rates.subsidy_pct, rates.export_rate,
+            i,
+            consumption,
+            solar,
+            rates.block_1_rate,
+            rates.block_2_rate,
+            rates.block_3_rate,
+            rates.fixed_charge,
+            rates.subsidy_flag,
+            rates.subsidy_pct,
+            rates.export_rate,
         )
         for i, (consumption, solar, rates) in enumerate(dataset)
     ]
     df = spark.createDataFrame(spark_rows, schema=_SCHEMA)
 
     bill_cols = compute_bill_expr(
-        F.col("consumption_kwh"), F.col("solar_kwh"),
+        F.col("consumption_kwh"),
+        F.col("solar_kwh"),
         rate_cols=(F.col("block_1_rate"), F.col("block_2_rate"), F.col("block_3_rate")),
         fixed_charge_col=F.col("fixed_charge"),
         subsidy_flag_col=F.col("subsidy_flag"),
@@ -165,7 +183,11 @@ def test_pure_and_spark_agree_exactly(spark: SparkSession) -> None:
     for kwh_col in ("self_consumed_kwh", "billable_import_kwh", "export_kwh"):
         assert isinstance(schema_by_name[kwh_col], DecimalType), kwh_col
     money_cols = (
-        "energy_charge", "fixed_charge", "subsidy_discount", "export_credit", "final_bill"
+        "energy_charge",
+        "fixed_charge",
+        "subsidy_discount",
+        "export_credit",
+        "final_bill",
     )
     for money_col in money_cols:
         assert isinstance(schema_by_name[money_col], DecimalType), money_col

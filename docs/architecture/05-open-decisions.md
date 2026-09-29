@@ -18,6 +18,8 @@ Task references (`Txxx`) point into [`Implementation_Tasks.md`](../Implementatio
 | D5 | Subsidy and final-bill arithmetic | T006 | ✅ decided 2026-09-19 | T029, T055, T057, T058, T062, T063, T078, T113, T141, T172 |
 | D6 | Airflow → Spark submission, and the sensor | T007 | ✅ decided 2026-09-19 | T039, T119, T120, T121, T122, T123, T125, T139, T162 |
 | D7 | Package and repository name spelling | T008 | ✅ decided 2026-09-19 | T015, T043, T109, T183 |
+| D8 | Object store image after MinIO's withdrawal | — | ✅ decided 2026-09-26 | T043, T047, T050, T182 |
+| D9 | Where two alerts get facts no application metric carries | T147 | ✅ decided 2026-09-27 | T144, T147, T156 |
 
 Legend: ⬜ open · ✅ decided · 🔁 superseded
 
@@ -246,11 +248,16 @@ Per task:
   `generator_defaults`. It must apply a **deterministic, documented day-over-day change** — e.g.
   `block_2_rate` steps by a fixed amount on alternate simulated days — so the stale-tariff
   divergence is non-zero and attributable in T140. Put the rule in the module docstring.
+  **As built (R01, 2026-09-27): the step is on `block_1_rate`, +0.50 on even date
+  ordinals.** Block 2 starts at 60 kWh and no simulated household uses more than about
+  22 kWh a day, so a block 2 step changed no bill and `tariff_effect` was 0.00 everywhere.
 - **T113 `daily_billing.py`:** joins all ten columns. Missing household → fail loudly (already
   specified).
 - **T162 `backfill.sh`:** the corruption step edits a monetary column in the day's CSV (e.g.
   `block_2_rate` `16.50 → 61.50`, large enough to be obvious in a screenshot), runs the DAG,
-  restores the file, backfills.
+  restores the file, backfills. **Corrupt a column every bill uses** — `block_1_rate` or
+  `fixed_charge` — not `block_2_rate`: for the reason in the T074 note above, a block 2 edit
+  leaves every bill unchanged and the demo shows nothing.
 - **T034 `03-data-contracts.md`:** the table above is the frozen tariff contract.
   **T182:** update Master Design §6.2's CSV sample and Appendix A's `tariff` block.
 - **Coupling to D4:** if D4 chooses option 1 (API recomputes the provisional bill), the API must
@@ -372,19 +379,19 @@ second survives measurement.
   watermark is dropped.
 - `T140`'s attribution — "the kWh gap is dropped backfill, nothing else" — is false as
   written and must be stated as measured instead. **A prediction for Phase 11, so it is
-  not rediscovered there:** `T140` splits divergence into `data_effect` (backfill dropped
-  past the watermark) and `tariff_effect` (yesterday's rates vs today's), and expects
-  `data_effect` to carry D3's ~1.7 %. It will not. `reconciliation_daily` compares a
-  household's *daily* speed bill against its batch bill, and the daily window loses
-  nothing — so `data_effect` should come out at or near **zero**, with essentially all
-  divergence in `tariff_effect`. `T140`'s stated acceptance ("the `data_effect` share is
-  inside T094's band") therefore cannot pass as written, for the same structural reason
-  T094's original framing could not: the band was measured on 15-minute windows, and
-  bills are daily.
-- The daily household totals are **unaffected**: they use a 1-day window, which tolerates
-  lateness far beyond anything the fault model injects, and measured 0.00 % missing in
-  every run. The speed-versus-batch divergence *on bills* therefore remains the stale
-  tariff alone, exactly as designed.
+  not rediscovered there** (*superseded by the R02 update below*): `T140` splits
+  divergence into `data_effect` (backfill dropped past the watermark) and `tariff_effect`
+  (yesterday's rates vs today's), and expects `data_effect` to carry D3's ~1.7 %. It will
+  not. `reconciliation_daily` compares a household's *daily* speed bill against its batch
+  bill, and the daily window loses nothing — so `data_effect` should come out at or near
+  **zero**, with essentially all divergence in `tariff_effect`. `T140`'s stated acceptance
+  ("the `data_effect` share is inside T094's band") therefore cannot pass as written, for
+  the same structural reason T094's original framing could not: the band was measured on
+  15-minute windows, and bills are daily.
+- *Superseded by the R02 update below.* The daily household totals are **unaffected**:
+  they use a 1-day window, which tolerates lateness far beyond anything the fault model
+  injects, and measured 0.00 % missing in every run. The speed-versus-batch divergence
+  *on bills* therefore remains the stale tariff alone, exactly as designed.
 
 **What would fix it, and why we did not.** Raising the watermark above one trigger — 60
 simulated minutes rather than 30 — is what this decision's own analysis implies if the
@@ -393,6 +400,38 @@ than applied: the measured finding is more useful than the tuned number, because
 demonstrates the time-compression limitation (§3.4) with data rather than asserting it.
 
 Full figures and method: `docs/assumptions.md` §2.
+
+#### Update (2026-09-27, R02): the daily totals now miss backfill
+
+The two statements above that the daily totals lose nothing, and that `data_effect` will
+sit near zero, described a speed layer that did not deduplicate. It summed the 2 %
+injected duplicates the batch layer removes, and T094's probe compared it against an
+archive that was validated but not deduplicated, so the 0.00 % was two omissions agreeing
+(backlog R02).
+
+The speed layer now deduplicates on the batch layer's key (`core.keys.DEDUP_COLUMNS`)
+before either aggregation, and Spark's streaming dedup drops every record older than the
+watermark, whichever window it would have fallen in. So:
+
+- **Backfill older than the watermark no longer reaches the daily totals.** The daily gap
+  is D3's original prediction again, ≈ 1.7 % of consumption and inside T094's 0.25–5 %
+  band, and `data_effect` carries it: the speed layer bills less energy than the batch
+  layer.
+- **Reordering is still not dropped at the daily grain.** A reordered record is sent with
+  its own tick, and a micro-batch's watermark is the newest tick of the batch before it
+  minus W, so it trails the record's tick by at least W. The probe's control run
+  (dropouts off) asserts a daily gap under 0.05 %, a few readings: the last idle run
+  before R02 measured 0.0162 % there, about one reading, and the cause is not pinned
+  down.
+- **The 15-minute view loses at least what it did.** The dedup tests the record's own
+  `event_ts` against the watermark, which is stricter than the window-end test, so backfill
+  that used to land in a still-open window is now dropped before it gets there.
+
+**Measured on the Gate 4 run (2026-09-27):** the daily gap was **0.523 %** on the first
+complete day (0.861 % on the partial first day), inside T094's band and below the modelled
+1.7 %. D4's "Measured attribution" gives the breakdown and the likely reasons. The probe
+(`tests/integration/test_watermark_behaviour.py`) has not been re-run, so the control,
+reordering alone, is still unmeasured since R02.
 
 Pinned values:
 
@@ -629,6 +668,111 @@ Reconciliation and Grafana also lose a stored speed figure.
 - **Coupling to D2, closed:** the API needs no tariff row, so neither a `tariff_daily` table
   nor MinIO reads from the API are required. The only new tariff reader is `reconciliation.py`,
   which already has `objectstore.py`.
+
+### Measured attribution (T140)
+
+**Status: measured 2026-09-27, on the Gate 4 run** (the first run with R01 and R02
+fixed; `assumptions.md` §7). Both days in the table below come from that one run. Add rows
+from later runs; never fill the table from the expectations further down.
+
+**Where the numbers come from.** `batch/reconciliation.py` logs every figure below in its
+`reconciliation complete` line: `mean_tariff_effect`, `mean_data_effect`,
+`tariff_share_pct`, `mean_pct_divergence`, `max_pct_divergence` and
+`speed_kwh_shortfall_pct`. The same numbers straight from Postgres:
+
+```sql
+-- Split of the divergence, per day.
+SELECT count(*)                                AS households,
+       round(avg(tariff_effect), 2)            AS mean_tariff_effect,
+       round(avg(data_effect), 2)              AS mean_data_effect,
+       round(100 * sum(abs(tariff_effect))
+             / nullif(sum(abs(tariff_effect)) + sum(abs(data_effect)), 0), 3)
+                                               AS tariff_share_pct,
+       round(avg(pct_divergence), 3)           AS mean_pct_divergence,
+       max(pct_divergence)                     AS max_pct_divergence
+FROM reconciliation_daily
+WHERE sim_date = DATE '<sim_date>';
+
+-- data_effect in kWh terms: the energy the speed layer did not see, as a percentage of
+-- what the batch layer billed. Same sign as T094's gap: positive = speed saw less.
+SELECT round(100 * (sum(b.consumption_kwh) - sum(s.consumption_kwh))
+             / sum(b.consumption_kwh), 3)      AS speed_kwh_shortfall_pct
+FROM household_bill_daily b
+JOIN household_running_rt s ON s.household_id = b.household_id AND s.sim_date = b.sim_date
+WHERE b.sim_date = DATE '<sim_date>';
+```
+
+`tariff_share_pct` uses absolute values because the two effects can have opposite signs for
+the same household and would otherwise cancel.
+
+| sim_date | households | mean `tariff_effect` | mean `data_effect` | tariff share | mean pct | max pct | speed kWh shortfall |
+|---|---|---|---|---|---|---|---|
+| 2026-01-01 ¹ | 50 | +5.14 | −0.89 | 85.203 % | 1.570 % | 3.537 % | 0.861 % |
+| 2026-01-02 | 50 | −5.35 | −0.61 | 89.742 % | 1.878 % | 4.450 % | 0.523 % |
+
+¹ Partial: the stack starts at the clock anchor, so the first simulated hours of day one
+have no readings (6,296 readings processed against 6,787 on day two). Quote day two.
+
+Per row, on both days: `tariff_effect` non-zero for all 50 households; `data_effect`
+non-zero for 12 (day one) and 10 (day two) households, all of them negative; the D4
+identity holds on every row. Day two's `tariff_effect` ranged from −9.84 to −0.21, and
+its `data_effect` from −5.63 to 0.00.
+
+**Expected result with the code as of 2026-09-27**, after R01 and R02. Written down before
+the run, so the run confirms or refutes it. It replaces the 2026-09-26 prediction
+(`tariff_effect` 0.00 everywhere, `data_effect` a ~2 % surplus from duplicates), which
+described those two defects rather than the design. Details and evidence are in
+`docs/debugging-backlog.md`.
+
+- **`tariff_effect` non-zero for every household, with a sign that alternates by day**
+  (R01). The dropper's day-over-day change is now `block_1_rate` ± 0.50, and every
+  simulated household's billable import falls in block 1. So `tariff_effect` ≈ 0.50 × the
+  household's billable kWh, less its subsidy share. It is negative when the billed day
+  has an even date ordinal (2026-01-02, 2026-01-04, …), because that day's tariff is dearer
+  than the one the speed layer used, and positive on odd days.
+- **`data_effect` zero for most households, and mostly negative for the rest** (R02). The
+  speed layer now deduplicates on the batch layer's key, so duplicates no longer appear
+  here. What remains is store-and-forward backfill older than the watermark, which the
+  speed layer drops and the batch layer bills. At 0.002 dropouts per meter tick, roughly
+  a quarter of meters drop out on a given day. A household with solar can come out
+  positive when the readings it lost were mostly generation.
+- **`speed_kwh_shortfall_pct` positive, near D3's modelled 1.7 %**, inside T094's
+  0.25 %–5 % band: the speed layer sees *less* energy than the batch layer.
+
+**Consequence for T140's acceptance check.** It can now pass as written. `data_effect` is
+the backfill the watermark dropped, which is what T094's band measures, and T094's probe
+asserts that band at the daily grain (`test_daily_totals_miss_backfill_past_the_watermark`).
+Check the band against `speed_kwh_shortfall_pct`, the kWh measure T094 uses, rather than
+`tariff_share_pct`: that is a split in money, and it depends on the size of the tariff
+step as much as on the data.
+
+**Result: the expectation held, and T140's acceptance check passes.**
+
+- **`tariff_effect`**: non-zero for every household, positive on the odd day (+5.14 mean)
+  and negative on the even day (−5.35), as predicted. HH-0001, which has no solar and no
+  subsidy, shows the rule exactly: 13.4363 kWh × −0.50 = −6.72 on day two.
+- **`data_effect`**: zero for most households and negative for the rest. On day two the
+  10 non-zero households match the 10 dropouts the producer injected that day.
+- **`speed_kwh_shortfall_pct`**: 0.523 % on day two (0.861 % on the partial day one).
+  That is inside T094's 0.25 %–5 % band, so the acceptance check passes.
+- **Share of divergence**: the tariff effect carries about 90 % of it in money terms. That
+  is the size of the 0.50 step, not a statement about the data.
+
+**Below D3's modelled 1.7 %, for two reasons, one of them measured.**
+
+- **Fewer dropouts than modelled** (measured). Day two had 10 dropouts, 126 backfilled
+  readings or 1.9 % of the day, against the ~14 the model's rate implies. That is Poisson
+  noise.
+- **A smaller share of each backlog dropped** (inferred). The speed layer missed about
+  3.8 kWh, roughly 35 readings or a quarter of the backlog, where D3's model has 57.5 %.
+  The micro-batches ran at the 10 s trigger throughout (median 10.0 s), so a starved
+  driver is not the cause. A likely one, not yet verified: since Spark 3.4, stateful
+  operators filter late rows against the *previous* batch's watermark, which gives a
+  backfilled row one more trigger (48 simulated minutes) of slack than D3's model allows.
+- **Also on day two**: the producer emitted 138 ticks, not 150, because stalled ticks are
+  never made up (backlog R37). That shrinks the day, not the ratio.
+
+The report should quote the measured figures and name the model as a model.
 
 ---
 
@@ -1031,6 +1175,25 @@ demo-appropriate topology, not a production one.
   proxy), §9 Phase 3 table (`FileSensor, retries, SLA` → `S3KeySensor, retries`), and
   Appendix B's `make backfill` comment.
 
+**Update 2026-09-29 (backlog R25, and T040's rule stated once).** Until now the audit-trail
+sentence above was half true: `pipeline_runs` kept every run, but each restatement
+overwrote the day's bills and its archived tariff, so the wrong bill was gone. The rule,
+as implemented:
+
+- A billing run commits, in **one** transaction, the day's bills, its rejects, the demotion of
+  the day's previous `success` row to `superseded`, and its own `success`. The partial
+  unique index permits one `success` per `(sim_date, layer)`. A failed attempt supersedes
+  nothing and is recorded as `failed`.
+- `household_bill_daily` holds the current bills only and is replaced as a whole, so a
+  restatement that bills fewer households leaves no rows from a superseded run behind.
+- Every run's bills are also appended to **`household_bill_history`**, keyed by
+  `pipeline_run_id`. The wrong bill and the corrected one both stay queryable, each joined to
+  its run's status and `orchestrator_run_id`. `backfill.sh` prints them.
+- Each run archives the tariff it used under `tariff/sim_date=…/run_id=…/`, so a superseded
+  bill still leads to the rates it was computed from (D2's lineage).
+
+The zone rollup keeps the same ledger as `batch_rollup` (R24).
+
 ---
 
 ## D7 — Package and repository name spelling
@@ -1085,6 +1248,161 @@ it is called.
 - **Guard for the future:** `grep -rni "volstream" src/ docker/ config/ airflow/ scripts/
   tests/` must return nothing — the misspelling is allowed only in the README's note and in
   URLs. Add it to T016's lint target so it runs with `make lint`.
+
+---
+
+## D8 — Object store image after MinIO's withdrawal
+
+**Status:** ✅ decided 2026-09-26 · **Resolved in:** infrastructure change outside the task list
+
+### Context
+
+§5.4 chose MinIO as the object store, because it serves the S3 API from a container. Between
+October 2025 and September 2026, MinIO Inc. withdrew its community distribution:
+
+- **October 2025:** it stopped publishing images.
+- **December 2025:** the repository went into maintenance mode.
+- **February 2026:** the repository was archived.
+- **11 September 2026:** its Docker Hub repositories were deleted.
+
+On 2026-09-26 both images the stack used failed on a clean machine.
+`quay.io/minio/minio` and `quay.io/minio/mc` returned *401 Unauthorized*; `minio/minio` and
+`minio/mc` on Docker Hub reported that the repository does not exist. A fresh clone could no
+longer start the stack, which breaks the graded reproducibility requirement (§2.5, Gate 5).
+
+The architecture is unaffected. Every reader and writer speaks the S3 API against a
+configurable endpoint: `s3a://` in Spark, boto3 in Python, and the S3 hook and sensor in
+Airflow. §5.4 anticipated this: moving store is "a change of endpoint and credentials —
+nothing structural".
+
+Sources: [lobehub#9845](https://github.com/lobehub/lobehub/issues/9845),
+[StableBuild](https://www.stablebuild.com/blog/minio-images-disappeared-from-docker-hub),
+[VONNG: MinIO Is Dead, Long Live MinIO](https://blog.vonng.com/en/db/minio-resurrect/),
+[VONNG: Silo](https://vonng.com/en/db/silo-is-coming/).
+
+### Options
+
+| # | Option | For | Against |
+|---|---|---|---|
+| 1 | **`pgsty/silo`**, a community fork of MinIO (named `pgsty/minio` until August 2026) | Drop-in: same S3 API, same `MINIO_*` variables, same `/minio/health/live`, `mc` in the same image. No code change. Multi-arch. | One maintainer; already renamed once, over the trademark |
+| 2 | SeaweedFS (Apache-2.0) | Established, multi-maintainer, S3 gateway | New healthcheck, bucket creation and credential config; no `mc`, no MinIO console; Spark S3A to be verified |
+| 3 | Garage (AGPL-3.0) | Lightweight, maintained | Cluster layout and key setup through its CLI: more bootstrap |
+| 4 | Build MinIO from the archived source | The original code | Unmaintained; security fixes missing; adds a build step |
+| 5 | Local volume instead of object storage (§9.2, cut 5) | No external dependency | Gives up the object-store semantics the report claims |
+
+### Decision
+
+**Option 1 now, pinned: `pgsty/silo:RELEASE.2026-09-16T00-00-00Z`. Option 2 (SeaweedFS) is
+the planned long-term replacement.**
+
+The tag is pinned rather than `latest`, so a single-maintainer project cannot change
+underneath a graded demo. The `-distroless` variant is excluded: it has no `curl` for the
+healthcheck and no shell for `minio-init`.
+
+Verified on 2026-09-26 before adopting, against this repository's own configuration:
+
+- The image pulls, for both amd64 and arm64.
+- It starts with the compose file's `server /data --console-address ":9001"` and `MINIO_*`
+  variables.
+- The existing healthcheck (`curl -f …/minio/health/live`) returns 200.
+- `minio-init`'s unmodified `create_buckets.sh` creates all three buckets, and exits 0 when
+  run a second time.
+- boto3 1.43, with its default request checksums, completes every call the pipeline makes:
+  `head_bucket`, the reference dropper's put, copy and delete, `list_objects_v2`,
+  `head_object`, `get_object`, and a multipart upload (the path Spark's S3A takes for larger
+  files).
+
+Spark S3A itself has not yet run against it. It is the same server code as MinIO, but T082
+and T083 should confirm it on the next full run. **Confirmed on the Gate 4 run
+(2026-09-27):** the raw archiver wrote the master dataset, and the batch jobs read it and
+archived the tariff Parquet, all through S3A against this image.
+
+### Consequence
+
+- **`docker-compose.yml`:** the image is defined once (`x-object-store-image`) and used by
+  both `minio` and `minio-init`; the separate `mc` image is gone. The service keeps the name
+  `minio`, because `minio:9000` is the endpoint every client is configured with.
+- **`scripts/smoke_test.sh` and `scripts/voltstream.ps1`:** bucket listings run `mc` inside
+  the `voltstream-minio` container with `docker exec`, so neither script names an image.
+- **T182 / report:** §5.4 and the tech-stack chapter name MinIO. Keep the S3-compatible
+  store as the choice, note the fork, and add to the limitations that the store is a
+  single-maintainer fork. The episode is also evidence for the viva: the vendor withdrew its
+  images, and because the pipeline only speaks S3, the swap was two image lines and no code.
+- **The SeaweedFS migration** should need no Python or Spark code changes, because the
+  endpoint is configuration. What would change, to be verified at the time:
+  - The image, and an S3 gateway command.
+  - Credentials, set through SeaweedFS's S3 identity configuration instead of
+    `MINIO_ROOT_*`.
+  - The healthcheck.
+  - Bucket creation through the S3 API (boto3 from the app image, or the AWS CLI) instead
+    of `mc`.
+  - The scripts' listings, for the same reason.
+  - The MinIO console link, which would go.
+
+  Also re-check Spark S3A (multipart upload, rename as copy plus delete, `ListObjectsV2`)
+  and boto3's default checksums. If the store rejects those checksums, set
+  `AWS_REQUEST_CHECKSUM_CALCULATION=when_required`.
+
+---
+
+## D9 — Where two alerts get facts no application metric carries
+
+**Status:** ✅ decided 2026-09-27 · **Resolved in:** T147 (also serves T144)
+
+### Context
+
+Two of the five alert rules need a fact that none of the eight metrics in `metrics.py`
+carries:
+
+- **MeterDataStale (T144)** needs to know when each zone last received a reading. The
+  obvious candidate, `voltstream_zone_renewable_ratio{grid_zone}`, cannot answer it: the
+  ratio is a constant 0 all night, so an unchanged value is indistinguishable from a dead
+  feed. Prometheus cannot see that a gauge was *set*, only its value.
+- **BatchSLAMiss (T147)** needs to know when billing last succeeded. T147 names the gap
+  itself ("a 'last successful run' gauge, which does not exist yet") and asks for either
+  the Pushgateway or a Postgres exporter.
+
+Both facts are already in Postgres, written by the pipeline: `zone_metrics_rt.updated_at`
+is set to `now()` on every speed-layer write, and `pipeline_runs.finished_at` records every
+billing run.
+
+### Options
+
+| # | Option | For | Against |
+|---|---|---|---|
+| 1 | **`sql_exporter`**: gauges from our own SQL | Reads facts the pipeline already writes; nothing new to keep in sync; metric names and types chosen freely; maintained for exactly this purpose | One more container; if it or Postgres is down, both alerts go quiet |
+| 2 | `postgres_exporter` with custom queries | The tool T147 names | Its custom-query flag (`--extend.query-path`) is marked **deprecated** in the current release (v0.20.1) |
+| 3 | BatchSLAMiss from the Pushgateway's `push_time_seconds{job="daily_billing"}` | No new service for that alert | Lost on a Pushgateway restart; absent until the first run, so a DAG that never runs never alerts; and it does nothing for MeterDataStale |
+| 4 | New or relabelled application metrics (e.g. `grid_zone` on `events_consumed_total`) | No exporter | Changes the eight-metric contract (§10.1, T027); a dead speed layer removes the series instead of firing |
+
+### Decision
+
+**Option 1: `burningalchemist/sql_exporter:0.24.8`, pinned, with two gauges and nothing else.**
+
+- `voltstream_pg_zone_data_age_seconds{grid_zone}`: `now() − updated_at` of the zone's
+  newest window. It is the newest window rather than the latest write anywhere, because a
+  backfill after an outage rewrites old windows while the zone is still silent. It also
+  grows when the speed layer is down, which is correct: no reading is reaching the live view.
+- `voltstream_pg_billing_last_success_timestamp_seconds`: `max(finished_at)` of successful
+  billing runs; the stack's creation time before the first, so a DAG that never runs still
+  ages past the SLA.
+
+The `voltstream_pg_` prefix keeps them apart from the application metrics; a unit test
+fails if the exporter ever defines a name `metrics.py` owns.
+
+### Consequence
+
+- **A read-only database role**, `voltstream_reader` (`docker/init/postgres/04_observability.sql`):
+  `SELECT` only, read-only transactions and a 5-second statement timeout. Grafana uses it
+  too, since anonymous viewers can open its dashboards.
+- **BatchSLAMiss measures the age of the last success, not each day's deadline.** It fires
+  when the age exceeds one simulated day plus the SLA (900 s), about a minute after the exact
+  deadline (04-observability.md §6).
+- **One more silent-failure mode**, stated in 04-observability.md §9: if the exporter stops,
+  both alerts lose their input. Its scrape target shows as down on the pipeline health
+  dashboard.
+- **T182 / report:** §10.1's metric table is unchanged. The two gauges are a separate table
+  in 04-observability.md §3.3.
 
 ---
 

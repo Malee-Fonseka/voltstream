@@ -103,9 +103,7 @@ def test_out_of_order_and_backfilled_readings_are_valid_not_rejected() -> None:
 
 
 def test_out_of_order_shift_within_configured_spread() -> None:
-    cfg = _all_zero_faults(
-        out_of_order_rate=1.0, out_of_order_lateness_sim_minutes=(5, 10)
-    )
+    cfg = _all_zero_faults(out_of_order_rate=1.0, out_of_order_lateness_sim_minutes=(5, 10))
     injector = FaultInjector(cfg, random.Random(7))
     original = _reading()
     for _ in range(50):
@@ -175,9 +173,7 @@ def test_dropout_backfill_false_discards_the_buffer() -> None:
 
 def test_is_dropped_out_reflects_state() -> None:
     clock = {"now": datetime(2026, 1, 1, tzinfo=UTC)}
-    cfg = _all_zero_faults(
-        dropout_probability_per_meter_tick=1.0, dropout_duration_real_seconds=10
-    )
+    cfg = _all_zero_faults(dropout_probability_per_meter_tick=1.0, dropout_duration_real_seconds=10)
     injector = FaultInjector(cfg, random.Random(1), now_fn=lambda: clock["now"])
 
     assert injector.is_dropped_out("MTR-0001") is False

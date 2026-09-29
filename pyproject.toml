@@ -165,7 +165,8 @@ no_implicit_reexport = true
 strict_equality = true
 extra_checks = true
 
-# Third-party libraries without (complete) type information.
+# Third-party libraries without (complete) type information. Only modules imported under
+# src/ belong here — mypy checks src alone, and `warn_unused_configs` flags anything else.
 [[tool.mypy.overrides]]
 module = [
   "pyspark.*",
@@ -173,7 +174,6 @@ module = [
   "confluent_kafka.*",
   "boto3.*",
   "botocore.*",
-  "hypothesis.*",
 ]
 ignore_missing_imports = true
 
@@ -186,6 +186,10 @@ warn_required_dynamic_aliases = true
 [tool.pytest.ini_options]
 minversion = "8.0"
 testpaths = ["tests"]
+# The repository root, so tests can import `scripts/` (test_contracts.py imports
+# scripts.export_schemas). `python -m pytest` adds the working directory implicitly; bare
+# `pytest`, which CI runs (T169), does not.
+pythonpath = ["."]
 # --strict-markers: unregistered @pytest.mark.* is an error.
 # --strict-config:  any unknown key in this section is an error.
 addopts = "-ra --strict-markers --strict-config"
@@ -198,6 +202,9 @@ markers = [
 # --- coverage ----------------------------------------------------------------
 # The CI gate (T170) is `--cov=voltstream.core --cov-fail-under=<N>`: core/ is
 # where the correctness marks live; gating the whole package rewards testing glue.
+# The coverage *gate* is on core/ only and lives in CI (.github/workflows/ci.yml, T170) and
+# `make coverage`: `--cov=voltstream.core --cov-fail-under=100`. It is not a fail_under
+# here, because that would apply to every coverage run, including whole-package ones.
 [tool.coverage.run]
 source = ["voltstream"]
 branch = true

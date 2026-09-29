@@ -13,7 +13,9 @@ FROM python:3.11-slim-bookworm AS builder
 
 WORKDIR /build
 RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:${PATH}"
+# Longer than pip's 15 s default, which a slow link's stalls exceed (see spark.Dockerfile).
+ENV PATH="/opt/venv/bin:${PATH}" \
+    PIP_DEFAULT_TIMEOUT=120
 
 # Dependencies first, source second, so a source edit does not re-resolve and re-download
 # the whole dependency tree. Same reasoning as spark.Dockerfile, where it matters far more.
@@ -38,6 +40,12 @@ ENV PATH="/opt/venv/bin:${PATH}"
 # without needing the repository on the host.
 COPY dashboard/ /app/dashboard/
 COPY config/ /app/config/
+
+# The report generator, launched by the billing DAG as its last task. A script rather than
+# package code: it is an entry point for the orchestrator, not something anything imports.
+# Here rather than in the Spark image because it reads Postgres and writes one object to
+# the archive bucket (R08) — the api and sim groups installed above are all it needs.
+COPY scripts/generate_report.py /app/scripts/
 
 WORKDIR /app
 USER voltstream

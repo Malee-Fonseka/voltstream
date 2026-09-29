@@ -85,9 +85,7 @@ class _ServiceFilter(logging.Filter):
 
 class _JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
-        ts = datetime.fromtimestamp(record.created, tz=UTC).isoformat(
-            timespec="milliseconds"
-        )
+        ts = datetime.fromtimestamp(record.created, tz=UTC).isoformat(timespec="milliseconds")
         envelope: dict[str, Any] = {
             "ts": ts.replace("+00:00", "Z"),
             "level": record.levelname,

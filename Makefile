@@ -16,23 +16,26 @@ ifeq (,$(wildcard .venv/Scripts/python.exe))
 PY := .venv/bin/python
 endif
 
-# One simulated day is 5 real minutes; give the demo a day plus margin to close one.
-DEMO_SECONDS ?= 420
 
-.PHONY: help up demo down clean test test-all lint logs faults backfill anchor
+.PHONY: help up demo down clean test test-all coverage lint check-alerts logs faults backfill kill-test cold-starts cold-start anchor
 
 help:
 	@echo "voltstream targets:"
 	@echo "  make up          bring the stack up and wait for health"
-	@echo "  make demo        up, run one simulated day, print where to look"
+	@echo "  make demo        start, show a provisional bill, wait for it to finalise, show the delta"
 	@echo "  make down        stop the stack, keep the data"
 	@echo "  make clean       stop the stack and DESTROY volumes"
 	@echo "  make test        unit, property and consistency tests"
 	@echo "  make test-all    everything, including integration (needs the stack up)"
+	@echo "  make coverage    the CI gate: core/ coverage must stay at 100 %"
 	@echo "  make lint        ruff and mypy"
+	@echo "  make check-alerts  validate the alert rules and Alertmanager config, run the rule tests"
 	@echo "  make logs s=api  follow one service's logs"
-	@echo "  make faults      trigger each alert in turn"
+	@echo "  make faults      break the pipeline and assert each alert fires   [s=stale|rejects|sla|renewable|divergence]"
 	@echo "  make backfill d=2026-01-02   restate one simulated day"
+	@echo "  make kill-test   kill the speed layer mid-day, show recovery and unaffected bills"
+	@echo "  make cold-starts [n=5]  wipe and start from nothing n times; no crash-loops (DESTROYS data)"
+	@echo "  make cold-start  Gate 5: fresh clone, no-cache build, demo (DESTROYS data)"
 
 # Stamp a fresh clock anchor into .env. Every start goes through this: the anchor is a
 # real instant that simulated time is measured from, scaled by 288, so one left over from
@@ -55,16 +58,13 @@ up: anchor
 	@echo "  MinIO    http://localhost:9001   (voltstream / voltstream-dev)"
 	@echo "  metrics  http://localhost:8011/metrics  (archiver)"
 	@echo "           http://localhost:8012/metrics  (speed layer)"
+	@echo "  Grafana  http://localhost:3000   (no login; three dashboards)"
+	@echo "  Prometheus http://localhost:9090  Alertmanager http://localhost:9093"
 
-demo: up
-	@echo
-	@echo "running one simulated day ($(DEMO_SECONDS)s at 288x)..."
-	@sleep $(DEMO_SECONDS)
-	@echo
-	@echo "zone load now:"
-	@curl -s http://localhost:8000/api/v1/zones/load | head -c 2000 || true
-	@echo
-	@echo "open http://localhost:8000/docs to explore."
+# T163. demo.sh starts the stack itself (keeping the clock of a stack that already holds
+# data, which `up` would re-anchor) and needs no human input.
+demo:
+	bash scripts/demo.sh
 
 down:
 	$(COMPOSE) down
@@ -80,6 +80,10 @@ test:
 
 test-all:
 	$(PY) -m pytest
+
+# The CI coverage gate (T170), locally: core/ must stay fully covered.
+coverage:
+	$(PY) -m pytest -m "not integration" --cov=voltstream.core --cov-branch --cov-fail-under=100 --cov-report=term-missing
 
 lint:
 	$(PY) -m ruff check src tests
@@ -97,13 +101,33 @@ lint:
 	fi
 	@echo "lint clean"
 
+# The alerting configuration, checked by the tools that will load it, in the images Compose
+# pins (so the checker is the same version as the server). `promtool check config` also
+# checks the rule file it references; `test rules` runs alert_rules.test.yml against
+# synthetic series. Needs Docker, not the running stack.
+check-alerts:
+	$(COMPOSE) run --rm --no-deps --entrypoint promtool prometheus check config /etc/prometheus/prometheus.yml
+	$(COMPOSE) run --rm --no-deps --entrypoint promtool prometheus test rules /etc/prometheus/alert_rules.test.yml
+	$(COMPOSE) run --rm --no-deps --entrypoint amtool alertmanager check-config /etc/alertmanager/alertmanager.yml
+
 logs:
 	@test -n "$(s)" || { echo "usage: make logs s=<service>"; exit 1; }
 	$(COMPOSE) logs -f $(s)
 
 faults:
-	bash scripts/inject_faults.sh
+	bash scripts/inject_faults.sh $(or $(s),all)
 
 backfill:
 	@test -n "$(d)" || { echo "usage: make backfill d=YYYY-MM-DD"; exit 1; }
 	bash scripts/backfill.sh $(d)
+
+kill-test:
+	bash scripts/smoke_test.sh kill-speed-layer
+
+# T177 and T175. Both DESTROY the stack's data. cold-start clones the committed repository
+# into a new directory and rebuilds from scratch: the Gate 5 check.
+cold-starts:
+	bash scripts/smoke_test.sh cold-starts $(or $(n),5)
+
+cold-start:
+	bash scripts/smoke_test.sh cold-start

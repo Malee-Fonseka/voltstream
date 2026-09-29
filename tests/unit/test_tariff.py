@@ -92,9 +92,7 @@ def test_subsidised_reduces_final_bill_versus_unsubsidised() -> None:
     assert subsidised.subsidy_discount == round(unsubsidised.energy_charge * Decimal("0.25"), 2)  # type: ignore[attr-defined]
 
 
-@pytest.mark.parametrize(
-    "fixed_charge", [Decimal("120.00"), Decimal("240.00"), Decimal("480.00")]
-)
+@pytest.mark.parametrize("fixed_charge", [Decimal("120.00"), Decimal("240.00"), Decimal("480.00")])
 def test_each_fixed_charge_tier_passes_through_unchanged(fixed_charge: Decimal) -> None:
     bill = _bill("10", "0", _rates(fixed_charge=fixed_charge))
     assert bill.fixed_charge == fixed_charge  # type: ignore[attr-defined]
