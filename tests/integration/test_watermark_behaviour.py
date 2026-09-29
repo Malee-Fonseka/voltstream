@@ -62,10 +62,9 @@ _RUN_SECONDS = 700
 
 _PROBE = f"""
 import json
-from datetime import timedelta
 from voltstream.streaming.session import build_session
 from voltstream.streaming.sinks import pg_connection_string
-from voltstream.streaming.sources import split_valid_invalid
+from voltstream.streaming.sources import event_ts_bounds, known_household_ids, split_valid_invalid
 from voltstream.config import get_config
 from voltstream.core.keys import DEDUP_COLUMNS
 from pyspark.sql import functions as F
@@ -79,12 +78,9 @@ raw = spark.read.parquet(f"s3a://{{config.minio.bucket_raw}}/meter_readings")
 
 # The same validation the speed layer applies, so the only remaining difference between
 # the two totals is lateness.
-known = frozenset(f"HH-{{i:04d}}" for i in range(1, config.simulation.households + 1))
-bounds = (
-    config.simulation.epoch_sim - timedelta(days=365),
-    config.simulation.epoch_sim + timedelta(days=365 * 50),
+valid, _ = split_valid_invalid(
+    raw, known_household_ids=known_household_ids(), event_ts_bounds=event_ts_bounds()
 )
-valid, _ = split_valid_invalid(raw, known_household_ids=known, event_ts_bounds=bounds)
 # ... and the same dedup (R02): each physical reading counted once, as both layers do.
 valid = valid.dropDuplicates(list(DEDUP_COLUMNS))
 

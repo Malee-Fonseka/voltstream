@@ -50,8 +50,14 @@ class DatabaseUnavailable(RuntimeError):
 
     A typed error rather than letting psycopg's exception escape: `/health/ready` has to
     distinguish "the database is down" from "the query was wrong", and the two look alike
-    if both surface as a bare OperationalError.
+    if both surface as a bare OperationalError. Only an outage becomes this; a query that
+    is wrong keeps its own exception (R31).
     """
+
+
+# How long /health/ready waits for a connection. Well inside the compose healthcheck's 5 s,
+# so an outage reads as "not ready" rather than as a probe that timed out (R31).
+_HEALTHCHECK_TIMEOUT_SECONDS = 2.0
 
 
 def connection_string() -> str:
@@ -147,6 +153,10 @@ def transaction() -> Iterator[Any]:
 
     Reads use it too. A read-only transaction costs nothing and means a caller that later
     grows a write cannot accidentally leave it uncommitted.
+
+    Only `psycopg.OperationalError` becomes `DatabaseUnavailable`: a refused or lost
+    connection, or the pool timing out (`PoolTimeout` is one). A SQL typo or a mapping bug
+    propagates as itself, so it is reported as the bug it is rather than as an outage (R31).
     """
     try:
         if _pool is not None:
@@ -155,17 +165,24 @@ def transaction() -> Iterator[Any]:
         else:
             with connect() as conn, conn.cursor() as cur:
                 yield cur
-    except DatabaseUnavailable:
-        raise
-    except Exception as exc:  # noqa: BLE001 - re-raised as a typed error below
-        raise DatabaseUnavailable(f"postgres query failed: {exc}") from exc
+    except psycopg.OperationalError as exc:
+        raise DatabaseUnavailable(f"postgres unavailable: {exc}") from exc
 
 
 def healthcheck() -> bool:
-    """True when Postgres answers. Used by `/health/ready` (T105)."""
+    """True when Postgres answers within `_HEALTHCHECK_TIMEOUT_SECONDS`. For `/health/ready`.
+
+    Not through `transaction()`: that waits up to the pool's 30 s for a connection, or
+    retries a failed connect for about 15 s, and the compose healthcheck gives up after 5
+    (R31). A probe must fail fast.
+    """
     try:
-        with transaction() as cur:
-            cur.execute("SELECT 1")
-            return cur.fetchone() is not None
-    except DatabaseUnavailable:
+        if _pool is not None:
+            with _pool.connection(timeout=_HEALTHCHECK_TIMEOUT_SECONDS) as conn:
+                return conn.execute("SELECT 1").fetchone() is not None
+        with psycopg.connect(
+            connection_string(), connect_timeout=int(_HEALTHCHECK_TIMEOUT_SECONDS)
+        ) as conn:
+            return conn.execute("SELECT 1").fetchone() is not None
+    except psycopg.OperationalError:
         return False

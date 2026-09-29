@@ -1175,6 +1175,25 @@ demo-appropriate topology, not a production one.
   proxy), §9 Phase 3 table (`FileSensor, retries, SLA` → `S3KeySensor, retries`), and
   Appendix B's `make backfill` comment.
 
+**Update 2026-09-29 (backlog R25, and T040's rule stated once).** Until now the audit-trail
+sentence above was half true: `pipeline_runs` kept every run, but each restatement
+overwrote the day's bills and its archived tariff, so the wrong bill was gone. The rule,
+as implemented:
+
+- A billing run commits, in **one** transaction, the day's bills, its rejects, the demotion of
+  the day's previous `success` row to `superseded`, and its own `success`. The partial
+  unique index permits one `success` per `(sim_date, layer)`. A failed attempt supersedes
+  nothing and is recorded as `failed`.
+- `household_bill_daily` holds the current bills only and is replaced as a whole, so a
+  restatement that bills fewer households leaves no rows from a superseded run behind.
+- Every run's bills are also appended to **`household_bill_history`**, keyed by
+  `pipeline_run_id`. The wrong bill and the corrected one both stay queryable, each joined to
+  its run's status and `orchestrator_run_id`. `backfill.sh` prints them.
+- Each run archives the tariff it used under `tariff/sim_date=…/run_id=…/`, so a superseded
+  bill still leads to the rates it was computed from (D2's lineage).
+
+The zone rollup keeps the same ledger as `batch_rollup` (R24).
+
 ---
 
 ## D7 — Package and repository name spelling

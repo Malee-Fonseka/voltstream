@@ -60,7 +60,7 @@ def render(sim_date: date) -> str:
     zones = repositories.get_zone_daily(sim_date)
     billing = repositories.get_billing_summary(sim_date)
     runs = repositories.get_run_summary(sim_date)
-    rejected = repositories.get_rejected_for_day(sim_date)
+    rejected = repositories.get_rejected_for_day(sim_date, repositories.reject_stage_for(finalised))
     reconciliation = repositories.get_reconciliation_summary(sim_date)
 
     status = "FINAL" if finalised else "PROVISIONAL"

@@ -8,8 +8,8 @@ Two usage patterns:
   call `start_metrics_server()` once at startup, which serves `/metrics` on
   `observability.metrics_port` via `prometheus_client`'s built-in WSGI server.
 - **FastAPI** does not call `start_metrics_server()` — it mounts the shared
-  `REGISTRY` itself (via `prometheus-fastapi-instrumentator`) so `/metrics` is served on
-  the same port as the rest of the API.
+  `REGISTRY` itself (a plain `/metrics` route in `api/main.py`) so it is served on the
+  same port as the rest of the API.
 - **One-shot batch containers** exit before Prometheus could scrape them, so they call
   `push_metrics()` once at the end of the run instead (T138).
 
@@ -34,7 +34,7 @@ from voltstream.config import get_config
 from voltstream.logging_setup import get_logger
 
 # One registry, shared by every metric below and by whichever server exposes them —
-# either start_metrics_server() (non-HTTP services) or the FastAPI instrumentator (API).
+# either start_metrics_server() (non-HTTP services) or the API's own /metrics route.
 REGISTRY = CollectorRegistry()
 
 # Seconds. Covers "well under a second" up to a few minutes, log-ish spacing, so both the
@@ -129,7 +129,7 @@ def start_metrics_server(port: int | None = None) -> None:
     """Serve `REGISTRY` over HTTP for a process with no web server of its own.
 
     `port` defaults to `observability.metrics_port`. FastAPI does not call this — it
-    exposes `/metrics` itself, on its own port, via `prometheus-fastapi-instrumentator`.
+    exposes `/metrics` itself, on its own port, from a route in `api/main.py`.
     """
     start_http_server(port or get_config().observability.metrics_port, registry=REGISTRY)
 

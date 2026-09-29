@@ -18,7 +18,7 @@ Cross-references: `00-master-design.md` §3.3b, §3.4, §5.4, §5.7 and §10.2;
 |---|---|---|
 | Time compression | 1 simulated day = 5 real minutes (`TIME_SCALE = 288`) | `config/base.yaml` `simulation.time_scale` |
 | Emit interval | one reading per household per 2 real seconds | `simulation.emit_interval_seconds` |
-| Readings per meter per simulated day | 150 | derived: 300 real s ÷ 2 s |
+| Readings per meter per simulated day | 150 | derived: 300 real s ÷ 2 s; held exactly by the producer's fixed tick grid (R37) |
 | Raw events per simulated day | ~7,500 across 50 households | derived |
 
 **Limitation — time compression scales event time but not processing time** (§3.4).
@@ -251,6 +251,9 @@ asserting the latter would be asserting something the file sink does not provide
   only by explicit schema declaration at the ingestion boundary and by T033's drift guard.
 - **Simplified dimension handling.** The tariff dimension uses an effective-dated join
   rather than a full slowly-changing-dimension implementation with validity intervals.
+- **No weather join in billing.** T113 lists one, but nothing in a bill depends on the
+  weather, and the producer does not use cloud cover either (R16, decided not to fix). The
+  daily weather file is dropped into the landing zone and read by nothing.
 - **Single points of failure throughout** — one Kafka broker, one Spark node, one
   PostgreSQL instance. No replication, no failover.
 - **Secrets live in `.env`**, not in a secret manager. Every credential in the repository
@@ -330,7 +333,7 @@ clock anchor 2026-09-27 12:45:06 UTC. Times below are real UTC.
 | A complete, finalised day (T126) | 2026-01-02: 50 rows in `household_bill_daily`; `pipeline_runs` `success`, 7,029 rows in, 50 out, 12:55:56–12:56:15; tariff archived under `voltstream-archive/tariff/sim_date=2026-01-02/` |
 | Merge function flips, same household and date | HH-0001, 2026-01-02. At 12:54:13, day still open: `source=speed`, `provisional=true`, tariff 2026-01-01, total 200.53 (10.0665 kWh so far). At 12:57:33, after billing: `source=batch`, `provisional=false`, tariff 2026-01-02, total 234.21 (13.4363 kWh, 138 readings, 3 duplicates removed) |
 | `reconciliation_daily` populated | 50 rows for each of 2026-01-01 and 2026-01-02; the D4 identity holds on every row. The split is in `05-open-decisions.md` D4, "Measured attribution" |
-| Daily report generated | `voltstream-archive/reports/report_2026-01-01.md` and `report_2026-01-02.md`, both FINAL with every section filled. Their reject counts are doubled (backlog R23): day one lists 212 where 105 readings were rejected |
+| Daily report generated | `voltstream-archive/reports/report_2026-01-01.md` and `report_2026-01-02.md`, both FINAL with every section filled. Their reject counts are doubled (backlog R23, fixed 2026-09-29): day one lists 212 where 105 readings were rejected |
 | Whole billing DAG | `billing__2026-01-02`: all 8 tasks `success`, 12:55:49–12:56:48 (59 s) |
 | No failed runs | 2 `daily_billing` runs, both `success`; no run for the seed day 2025-12-31 (R04) |
 | Speed path meanwhile | end-to-end latency 5.78 s average (NFR: under 60 s); consumer lag 0 |
@@ -341,4 +344,4 @@ clock anchor 2026-09-27 12:45:06 UTC. Times below are real UTC.
 
 **Seen on this run, not gate criteria:** the late-data grace slept about 1 s, because R03
 is still open, and the producer emitted 138 ticks per simulated day rather than 150
-(R37).
+(R37). Both were fixed on 2026-09-29.

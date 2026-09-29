@@ -71,15 +71,19 @@ def landing_tariff_path(sim_date: date) -> str:
     return f"s3a://{get_config().minio.bucket_landing}/{landing_tariff_key(sim_date)}"
 
 
-def archive_tariff_path(sim_date: date) -> str:
-    """Where a consumed tariff file is archived, per §6.3.
+def archive_tariff_path(sim_date: date, run_id: str) -> str:
+    """Where a billing run archives the tariff it consumed, per §6.3.
 
-    Partitioned Parquet (`tariff/sim_date=…/`) rather than the CSV it came from. The
-    landing zone gets cleaned up; this is what a restatement months later reads, so it
+    Partitioned Parquet (`tariff/sim_date=…/run_id=…/`) rather than the CSV it came from.
+    The landing zone gets cleaned up; this is what a restatement months later reads, so it
     wants the same typed, columnar format as the master dataset rather than text whose
     types have to be re-inferred — which is exactly how a Decimal rate becomes a float.
+
+    One directory per run (R25): a restatement used to overwrite the day's archive, so a
+    superseded bill's `pipeline_run_id` no longer led to the rates it was computed from.
     """
-    return f"s3a://{get_config().minio.bucket_archive}/{_TARIFF_PREFIX}/sim_date={sim_date.isoformat()}"
+    bucket = get_config().minio.bucket_archive
+    return f"s3a://{bucket}/{_TARIFF_PREFIX}/sim_date={sim_date.isoformat()}/run_id={run_id}"
 
 
 def report_key(sim_date: date) -> str:

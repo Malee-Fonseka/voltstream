@@ -2,6 +2,18 @@
 source: once per simulated day, writes `tariff_<date>.csv` and `weather_<date>.csv` into
 `voltstream-landing/`.
 
+**When each file lands (§8.3, D3, R03).** `tariff_D` is written when day D *closes* —
+at the simulated midnight into D+1 — because its arrival is what tells the orchestrator
+the day is over and can be billed, and the late-data grace is timed from it. A tariff for
+D written while D was still running undercut §2.4 ("depends on data that does not exist
+until the day ends") and turned the grace into a no-op. `weather_D` is a forecast, so it
+lands when D *starts*.
+
+The speed layer costs day D against `tariff_{D-1}`, which therefore appears within one
+poll of D beginning. On start, the dropper writes the tariff of every closed day since
+the newest one already in the bucket: on a fresh stack that is only yesterday (the T075
+day-zero seed), and after a restart it is whatever closed while the dropper was down.
+
 This is the **only** module allowed to read `config.tariff.generator_defaults` (D2) — the
 money values there exist purely to let this module write a plausible daily file; nothing
 else in the codebase may read them (`core/`, `streaming/`, `batch/`, `api/` all get their
@@ -34,6 +46,7 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 import time
 from datetime import date, timedelta
 from decimal import Decimal
@@ -41,6 +54,7 @@ from typing import Any
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import ClientError
 
 from voltstream import simclock
 from voltstream.config import GeneratorDefaults, VoltstreamConfig, get_config
@@ -51,7 +65,14 @@ from voltstream.simulators.households import Household, household_roster
 PRODUCER_ID = "reference-dropper"
 
 _BLOCK_1_STEP = Decimal("0.50")  # D2/T074: alternate-day step, documented here in full.
-_POLL_INTERVAL_REAL_SECONDS = 5
+# One real second is 4.8 simulated minutes: how late after midnight a day's tariff can land.
+_POLL_INTERVAL_REAL_SECONDS = 1
+# A restart after a long stop owes a tariff per closed day; beyond a week, nobody is
+# waiting for those bills, and the days have no readings to bill anyway (R04).
+_MAX_CATCH_UP_DAYS = 7
+
+# tariff/tariff_2026-01-02.csv -> 2026-01-02
+_TARIFF_NAME = re.compile(r"tariff_(\d{4}-\d{2}-\d{2})\.csv$")
 
 _TARIFF_FIELDS = [
     "household_id",
@@ -165,50 +186,93 @@ def _put_atomically(s3: Any, bucket: str, key: str, data: bytes) -> None:
     s3.delete_object(Bucket=bucket, Key=tmp_key)
 
 
-def drop_reference_files(
+def drop_tariff(
     s3: Any, config: VoltstreamConfig, households: list[Household], sim_date: date
 ) -> None:
-    """Write `tariff_<sim_date>.csv` and `weather_<sim_date>.csv`, atomically."""
-    bucket = config.minio.bucket_landing
+    """Write `tariff_<sim_date>.csv`, atomically. Called once `sim_date` has closed."""
+    rows = _tariff_rows(sim_date, households, config.tariff.generator_defaults)
+    _put_atomically(
+        s3, config.minio.bucket_landing, _tariff_key(sim_date), _write_csv(_TARIFF_FIELDS, rows)
+    )
 
-    tariff_rows = _tariff_rows(sim_date, households, config.tariff.generator_defaults)
-    _put_atomically(s3, bucket, _tariff_key(sim_date), _write_csv(_TARIFF_FIELDS, tariff_rows))
 
-    weather_rows = _weather_rows(sim_date, config.simulation.zones)
-    _put_atomically(s3, bucket, _weather_key(sim_date), _write_csv(_WEATHER_FIELDS, weather_rows))
+def drop_weather(s3: Any, config: VoltstreamConfig, sim_date: date) -> None:
+    """Write `weather_<sim_date>.csv`, atomically. Called as `sim_date` starts."""
+    rows = _weather_rows(sim_date, config.simulation.zones)
+    _put_atomically(
+        s3, config.minio.bucket_landing, _weather_key(sim_date), _write_csv(_WEATHER_FIELDS, rows)
+    )
+
+
+def closed_days_owed(dropped: set[date], today: date) -> list[date]:
+    """The closed days whose tariff the landing zone is missing, oldest first.
+
+    Every day after the newest tariff already dropped, up to yesterday. With nothing
+    dropped yet that is yesterday alone: the T075 seed, so the speed layer has a tariff to
+    cost day one against. Capped at `_MAX_CATCH_UP_DAYS`.
+    """
+    yesterday = today - timedelta(days=1)
+    closed = [d for d in dropped if d <= yesterday]
+    first = max(closed) + timedelta(days=1) if closed else yesterday
+    first = max(first, yesterday - timedelta(days=_MAX_CATCH_UP_DAYS - 1))
+    return [first + timedelta(days=i) for i in range((yesterday - first).days + 1)]
+
+
+def _dropped_tariff_dates(s3: Any, bucket: str) -> set[date]:
+    dates: set[date] = set()
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix="tariff/"):
+        for obj in page.get("Contents", []):
+            if match := _TARIFF_NAME.search(obj["Key"]):
+                dates.add(date.fromisoformat(match.group(1)))
+    return dates
+
+
+def _exists(s3: Any, bucket: str, key: str) -> bool:
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") in ("404", "NoSuchKey", "NotFound"):
+            return False
+        raise
+    return True
 
 
 def main() -> None:
     config = get_config()
     logger = get_logger(PRODUCER_ID)
     s3 = _s3_client()
+    bucket = config.minio.bucket_landing
     households = household_roster(config.simulation.households, config.simulation.zones)
 
     today = simclock.sim_date_of(simclock.sim_now())
 
-    # T075: the speed layer's provisional estimate costs against *yesterday's* tariff
-    # (§3.1). On the first simulated day there is no yesterday on disk yet unless we put
-    # one there now, or household_running_rt.estimated_bill has nothing to join against.
-    drop_reference_files(s3, config, households, today - timedelta(days=1))
-    logger.info(
-        "seeded day-zero (yesterday's) reference files",
-        extra={"stage": "startup", "sim_date": (today - timedelta(days=1)).isoformat()},
-    )
+    for closed in closed_days_owed(_dropped_tariff_dates(s3, bucket), today):
+        drop_tariff(s3, config, households, closed)
+        logger.info(
+            "dropped tariff for a day that closed before startup",
+            extra={"stage": "startup", "sim_date": closed.isoformat()},
+        )
+    if not _exists(s3, bucket, _weather_key(today)):
+        drop_weather(s3, config, today)
 
-    last_dropped: date | None = None
+    last_seen = today
     while True:
         current = simclock.sim_date_of(simclock.sim_now())
-        if current != last_dropped:
-            drop_reference_files(s3, config, households, current)
-            last_dropped = current
-            logger.info(
-                "dropped reference files",
-                extra={
-                    "stage": "produce",
-                    "sim_date": current.isoformat(),
-                    "households": len(households),
-                },
-            )
+        if current > last_seen:
+            # Normally one day; more only if this process stalled across a midnight.
+            for offset in range((current - last_seen).days):
+                closed = last_seen + timedelta(days=offset)
+                drop_tariff(s3, config, households, closed)
+                logger.info(
+                    "day closed, tariff dropped",
+                    extra={
+                        "stage": "produce",
+                        "sim_date": closed.isoformat(),
+                        "households": len(households),
+                    },
+                )
+            drop_weather(s3, config, current)
+            last_seen = current
         time.sleep(_POLL_INTERVAL_REAL_SECONDS)
 
 

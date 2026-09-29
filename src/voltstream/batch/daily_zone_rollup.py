@@ -20,28 +20,25 @@ import argparse
 import sys
 import time
 import uuid
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql.types import DecimalType
 
-from voltstream.batch.daily_billing import (
-    _event_ts_bounds,
-    _known_household_ids,
-    deduplicate,
-    read_day,
-)
+from voltstream.batch import ledger
+from voltstream.batch.daily_billing import deduplicate, read_day
 from voltstream.core.spark_expr import netting_expr
 from voltstream.logging_setup import get_logger
 from voltstream.metrics import batch_duration_seconds, push_metrics
 from voltstream.storage.postgres import connect
 from voltstream.streaming.session import build_session
 from voltstream.streaming.sinks import pg_connection_string
-from voltstream.streaming.sources import split_valid_invalid
+from voltstream.streaming.sources import event_ts_bounds, known_household_ids, split_valid_invalid
 
 _JOB = "daily_zone_rollup"
+_LEDGER_LAYER = "batch_rollup"
 
 log = get_logger("zone-rollup")
 
@@ -52,6 +49,10 @@ _RATIO = DecimalType(5, 4)
 # place from summing in a different order. A tolerance of one hundredth of a kWh is far
 # below anything that would matter and far above float-ordering noise.
 _CROSS_CHECK_TOLERANCE_KWH = Decimal("0.01")
+
+# How far back the speed view keeps its 15-minute windows (R32). Fourteen simulated days
+# is 70 real minutes, more than the one hour the longest Grafana dashboard looks back.
+_SPEED_WINDOW_RETENTION_DAYS = 14
 
 
 class CrossCheckFailed(RuntimeError):
@@ -66,35 +67,34 @@ class CrossCheckFailed(RuntimeError):
 def zone_rollup(valid: DataFrame, sim_date: date, run_id: uuid.UUID) -> DataFrame:
     """Per-zone daily totals, including the peak 15-simulated-minute window.
 
-    Netting comes from `core/spark_expr.py`, the same function the bill uses — a zone's
-    self-consumed and exported energy must be the sum of its households', not a separately
-    derived number that happens to look similar.
+    Self-consumed and exported energy are the sums of the zone's households' figures, as
+    their bills compute them: each household's day is netted on its daily totals, with
+    `core/spark_expr.py`'s function, and only then summed by zone (R24). Netting each
+    reading instead counted midday export that the household's bill nets away against its
+    evening import, so the zone figures did not add up to the bills they sit beside.
     """
-    netting = netting_expr(F.col("consumption_kwh"), F.col("solar_generation_kwh"))
-    per_reading = valid.select(
-        "grid_zone",
-        "meter_id",
-        "event_ts",
-        "consumption_kwh",
-        "solar_generation_kwh",
-        netting.self_consumed_kwh.alias("self_consumed_kwh"),
-        netting.export_kwh.alias("export_kwh"),
+    households = valid.groupBy("grid_zone", "household_id").agg(
+        F.sum("consumption_kwh").cast(_KWH).alias("consumption_kwh"),
+        F.sum("solar_generation_kwh").cast(_KWH).alias("solar_kwh"),
     )
-
-    daily = per_reading.groupBy("grid_zone").agg(
+    netting = netting_expr(F.col("consumption_kwh"), F.col("solar_kwh"))
+    energy = households.groupBy("grid_zone").agg(
         F.sum("consumption_kwh").cast(_KWH).alias("total_consumption_kwh"),
-        F.sum("solar_generation_kwh").cast(_KWH).alias("total_solar_kwh"),
-        F.sum("self_consumed_kwh").cast(_KWH).alias("self_consumed_kwh"),
-        F.sum("export_kwh").cast(_KWH).alias("export_kwh"),
+        F.sum("solar_kwh").cast(_KWH).alias("total_solar_kwh"),
+        F.sum(netting.self_consumed_kwh).cast(_KWH).alias("self_consumed_kwh"),
+        F.sum(netting.export_kwh).cast(_KWH).alias("export_kwh"),
+    )
+    counts = valid.groupBy("grid_zone").agg(
         F.size(F.collect_set("meter_id")).alias("active_meters"),
         F.count("*").cast("int").alias("readings_count"),
     )
+    daily = energy.join(counts, on="grid_zone", how="inner")
 
     # Peak window: the busiest 15 simulated minutes of the day, per zone. Computed here
     # rather than read from zone_metrics_rt, which is the incomplete view.
-    windows = per_reading.groupBy(
-        "grid_zone", F.window(F.col("event_ts"), "15 minutes").alias("w")
-    ).agg(F.sum("consumption_kwh").cast(_KWH).alias("window_kwh"))
+    windows = valid.groupBy("grid_zone", F.window(F.col("event_ts"), "15 minutes").alias("w")).agg(
+        F.sum("consumption_kwh").cast(_KWH).alias("window_kwh")
+    )
     peaks = windows.groupBy("grid_zone").agg(
         F.max_by(F.col("w.start"), F.col("window_kwh")).alias("peak_window_start"),
         F.max("window_kwh").alias("peak_consumption_kwh"),
@@ -168,18 +168,44 @@ def _household_total_kwh(sim_date: date) -> Decimal:
         return Decimal(row[0]) if row else Decimal(0)
 
 
-def _write(rows: list[tuple], columns: list[str]) -> int:
+def speed_window_cutoff(sim_date: date) -> datetime:
+    """Speed-view windows starting before this are deleted once `sim_date` is rolled up."""
+    start = sim_date - timedelta(days=_SPEED_WINDOW_RETENTION_DAYS)
+    return datetime.combine(start, datetime.min.time(), UTC)
+
+
+def _write(
+    rows: list[tuple], columns: list[str], run_id: uuid.UUID, sim_date: date, rows_in: int
+) -> int:
+    """The day's zone rows and this run's `success`, in one transaction (R24).
+
+    Also retires the speed view's old windows (R32). `zone_metrics_rt` gained about 480
+    rows per simulated day and was never pruned; once a day has its authoritative row
+    here, the provisional windows from well before it have nothing left to answer.
+    """
     placeholders = ", ".join(["%s"] * len(columns))
     updates = ", ".join(
         f"{c} = EXCLUDED.{c}" for c in columns if c not in ("grid_zone", "sim_date")
     )
     with connect(pg_connection_string()) as conn, conn.cursor() as cur:
+        ledger.supersede_success(cur, sim_date, _LEDGER_LAYER)
         cur.executemany(
             f"INSERT INTO zone_metrics_daily ({', '.join(columns)}) VALUES ({placeholders}) "
             f"ON CONFLICT (grid_zone, sim_date) DO UPDATE SET {updates}, computed_at = now()",
             rows,
         )
+        cur.execute(
+            "DELETE FROM zone_metrics_rt WHERE window_start < %s",
+            (speed_window_cutoff(sim_date),),
+        )
+        retired = cur.rowcount
+        ledger.complete_run(cur, run_id, rows_in, len(rows))
         conn.commit()
+    if retired:
+        log.info(
+            "retired old speed-view windows",
+            extra={"stage": "batch", "sim_date": sim_date.isoformat(), "rows_deleted": retired},
+        )
     return len(rows)
 
 
@@ -189,12 +215,16 @@ def run(sim_date: date) -> int:
     spark = build_session(f"voltstream-{_JOB}")
     spark.sparkContext.setLogLevel("WARN")
 
+    # Its own ledger row (R24): zone_metrics_daily.pipeline_run_id used to point at a run
+    # nobody recorded, and a failed rollup left no trace outside Airflow's log.
+    rows_in = 0
+    ledger.start_run(run_id, sim_date, _LEDGER_LAYER)
     try:
         raw = read_day(spark, sim_date)
         valid, _ = split_valid_invalid(
             deduplicate(raw),
-            known_household_ids=_known_household_ids(),
-            event_ts_bounds=_event_ts_bounds(),
+            known_household_ids=known_household_ids(),
+            event_ts_bounds=event_ts_bounds(),
         )
 
         rollup = zone_rollup(valid, sim_date, run_id).persist()
@@ -203,12 +233,13 @@ def run(sim_date: date) -> int:
             raise RuntimeError(f"no readings to roll up for {sim_date}")
 
         zone_total = sum((r[2] for r in rows), Decimal(0))
+        rows_in = sum(r[rollup.columns.index("readings_count")] for r in rows)
 
         # Cross-check before the write, not after: the point is to withhold a report that
         # does not add up, and a check that runs afterwards has already published it.
         cross_check(zone_total, _household_total_kwh(sim_date), sim_date)
 
-        written = _write(rows, rollup.columns)
+        written = _write(rows, rollup.columns, run_id, sim_date, rows_in)
 
         duration = time.monotonic() - started
         batch_duration_seconds.labels(job=_JOB).observe(duration)
@@ -227,6 +258,13 @@ def run(sim_date: date) -> int:
             },
         )
         return written
+    except Exception:
+        ledger.fail_run(run_id, rows_in)
+        log.exception(
+            "zone rollup failed",
+            extra={"stage": "batch", "sim_date": sim_date.isoformat(), "run_id": str(run_id)},
+        )
+        raise
     finally:
         spark.stop()
 

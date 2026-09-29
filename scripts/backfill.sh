@@ -10,7 +10,7 @@
 #   2. restate the day -> the wrong bills;
 #   3. restore the file;
 #   4. restate again -> the corrected bills;
-#   5. print the three versions side by side, and the run ledger.
+#   5. print the three versions side by side, the run ledger and every run's bills.
 #
 # block_1_rate, not the block_2_rate D2 first suggested: no simulated household reaches
 # block 2 in a day, so a block-2 edit would change no bill at all (backlog R01, D2).
@@ -188,6 +188,18 @@ else
 fi
 if [ "${RETRIED}" -gt 0 ]; then
     say "  ${RETRIED} failed attempt(s) above were retried by Airflow within their run; see its log"
+fi
+
+section "Bills of every run for ${DAY} (household_bill_history)"
+# household_bill_daily holds the current bills only; every run's are kept here (D6, R25),
+# so the wrong bills stay on record next to the run that produced them.
+HISTORY="$(psql_value "SELECT r.orchestrator_run_id, r.status, count(*), sum(h.final_bill) FROM household_bill_history h JOIN pipeline_runs r ON r.run_id = h.pipeline_run_id WHERE h.sim_date = '${DAY}' GROUP BY r.run_id, r.orchestrator_run_id, r.status, r.started_at ORDER BY r.started_at")"
+echo "${HISTORY}" | awk -F'|' '{ printf "  %-32s %-11s %3s bills, total %s\n", $1, $2, $3, $4 }'
+KEPT="$(echo "${HISTORY}" | grep -c .)"
+if [ "${KEPT}" -ge 3 ]; then
+    pass "all ${KEPT} runs' bills are on record, not only the current run's"
+else
+    fail "household_bill_history holds ${KEPT} run(s) for ${DAY}; expected at least 3"
 fi
 
 say "the Airflow UI shows all three runs for ${DAY}: http://localhost:$(env_value AIRFLOW_HOST_PORT 8080)/"

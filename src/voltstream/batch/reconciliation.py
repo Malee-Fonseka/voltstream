@@ -34,18 +34,14 @@ LambdaDivergenceHigh on a household whose estimate was fine.
 from __future__ import annotations
 
 import argparse
-import csv
-import io
 import sys
 import time
 from datetime import date
 from decimal import ROUND_HALF_UP, Decimal
 from typing import NamedTuple
 
-from pydantic import ValidationError
-
 from voltstream.config import get_config
-from voltstream.contracts.reference import TariffRecord
+from voltstream.contracts.reference import TariffRecord, parse_tariff_csv
 from voltstream.core.money import DIVERGENCE_PCT, pct_divergence, round_money
 from voltstream.core.netting import net
 from voltstream.core.tariff import BlockBoundary, TariffRates, compute_bill
@@ -102,44 +98,6 @@ class DaySummary(NamedTuple):
     # How much of the batch layer's energy the speed layer did not see, as a percentage.
     # Same sign convention as T094's gap: positive means the speed layer saw less.
     speed_kwh_shortfall_pct: Decimal
-
-
-# --------------------------------------------------------------------------------------
-# Today's tariff
-# --------------------------------------------------------------------------------------
-
-
-def parse_tariff_csv(data: bytes, sim_date: date) -> dict[str, TariffRecord]:
-    """The day's tariff file as validated records, keyed by household.
-
-    Every row goes through `TariffRecord`, so a hand-edited restatement file with a
-    negative rate or a subsidy above 100 % fails here, naming the line, rather than
-    producing a counterfactual nobody can explain.
-
-    The effective-dated rule is the billing job's (T113): per household, the latest row
-    with `effective_date <= sim_date`. Two rows tied on that date are an error — the
-    billing job would have picked one of them arbitrarily, and there is no way to know
-    which.
-    """
-    applicable: dict[str, TariffRecord] = {}
-    reader = csv.DictReader(io.StringIO(data.decode("utf-8")))
-    for line_no, raw in enumerate(reader, start=2):  # line 1 is the header
-        try:
-            record = TariffRecord.model_validate(raw)
-        except ValidationError as exc:
-            raise ValueError(f"tariff file for {sim_date}, line {line_no}: {exc}") from exc
-
-        if record.effective_date > sim_date:
-            continue
-        current = applicable.get(record.household_id)
-        if current is None or record.effective_date > current.effective_date:
-            applicable[record.household_id] = record
-        elif record.effective_date == current.effective_date:
-            raise ValueError(
-                f"tariff file for {sim_date}, line {line_no}: a second row for "
-                f"{record.household_id} effective {record.effective_date}"
-            )
-    return applicable
 
 
 def _rates(record: TariffRecord) -> TariffRates:

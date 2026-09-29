@@ -40,25 +40,17 @@ _TARIFF_NAME = re.compile(r"tariff_(\d{4}-\d{2}-\d{2})\.csv$")
 def list_pending_days() -> list[dict]:
     """Every tariff file in the landing zone, as trigger arguments.
 
-    Returns every *complete* day, not only new ones. Deciding what is "new" would need
+    Returns every day with a tariff, not only new ones. Deciding what is "new" would need
     state that can drift from the bucket; letting the trigger operator skip runs that
     already exist keeps the bucket itself as the only source of truth. It also means a day
     whose run was deleted gets picked up again, which is the behaviour you want.
+
+    A tariff file's arrival *is* the signal that its day is over: the reference dropper
+    writes `tariff_D.csv` at the simulated midnight that closes D (§8.3, R03). The billing
+    DAG then waits out the late-data grace from that moment before rescanning the day.
     """
     keys = S3Hook(aws_conn_id=AWS_CONN_ID).list_keys(bucket_name=BUCKET, prefix=PREFIX) or []
-    days = sorted({m.group(1) for key in keys if (m := _TARIFF_NAME.search(key))})
-
-    # **The newest day is deliberately excluded.** The reference dropper writes
-    # `tariff_D.csv` at the *start* of simulated day D, not at its end, so the presence of
-    # that file says the day has begun — not that it is over. Billing on arrival meant
-    # rescanning a partition the archiver was still writing into: the billing job and the
-    # zone rollup read it a minute apart and saw 216 kWh and 337 kWh of the same day. The
-    # cross-check gate caught it, which is what that gate is for.
-    #
-    # A day is complete once the *next* day's tariff exists. That is a fact about the
-    # simulated clock rather than a timer, so it stays correct if the stack is paused,
-    # slow, or replayed.
-    complete = days[:-1]
+    complete = sorted({m.group(1) for key in keys if (m := _TARIFF_NAME.search(key))})
 
     # **A day with no readings is not billed (R04).** The dropper seeds a tariff for the
     # day before the first one (T075), so the speed layer can price day one against

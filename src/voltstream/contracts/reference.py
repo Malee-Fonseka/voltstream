@@ -9,11 +9,14 @@ only the block *boundaries*; every rate is a per-household, per-day value here i
 
 from __future__ import annotations
 
+import csv
+import io
+from collections.abc import Iterable, Mapping
 from datetime import date
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 
 class TariffRecord(BaseModel):
@@ -40,6 +43,48 @@ class TariffRecord(BaseModel):
     # Deliberately NOT validated: block_1_rate <= block_2_rate <= block_3_rate (D2) —
     # monotonicity and continuity of the bill hold for any non-negative rate schedule,
     # and constraining the ordering would only make the restatement demo less flexible.
+
+
+TARIFF_COLUMNS = tuple(TariffRecord.model_fields)
+
+
+def applicable_tariffs(
+    rows: Iterable[Mapping[str, object]], sim_date: date
+) -> dict[str, TariffRecord]:
+    """A tariff file's rows as validated records, keyed by household.
+
+    Every row goes through `TariffRecord`, so a hand-edited restatement file with a
+    negative rate or a subsidy above 100 % fails here, naming the line, rather than
+    producing a bill nobody can explain. `subsidy_flag` is read the contract's way:
+    `true`, `1` and `True` all mean subsidised (R22).
+
+    The effective-dated rule (T113, §10.2): per household, the latest row with
+    `effective_date <= sim_date`. Two rows tied on that date are an error, since picking
+    one of them would be arbitrary.
+    """
+    applicable: dict[str, TariffRecord] = {}
+    for line_no, raw in enumerate(rows, start=2):  # line 1 is the header
+        try:
+            record = TariffRecord.model_validate(dict(raw))
+        except ValidationError as exc:
+            raise ValueError(f"tariff file for {sim_date}, line {line_no}: {exc}") from exc
+
+        if record.effective_date > sim_date:
+            continue
+        current = applicable.get(record.household_id)
+        if current is None or record.effective_date > current.effective_date:
+            applicable[record.household_id] = record
+        elif record.effective_date == current.effective_date:
+            raise ValueError(
+                f"tariff file for {sim_date}, line {line_no}: a second row for "
+                f"{record.household_id} effective {record.effective_date}"
+            )
+    return applicable
+
+
+def parse_tariff_csv(data: bytes, sim_date: date) -> dict[str, TariffRecord]:
+    """`applicable_tariffs` over the bytes of a tariff file."""
+    return applicable_tariffs(csv.DictReader(io.StringIO(data.decode("utf-8"))), sim_date)
 
 
 class WeatherForecast(BaseModel):

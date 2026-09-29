@@ -373,20 +373,31 @@ def get_run_summary(sim_date: date) -> list[RunSummary]:
         return [RunSummary(*r) for r in cur.fetchall()]
 
 
-def get_rejected_for_day(sim_date: date) -> list[RejectedSummary]:
-    """Rejections attributable to a simulated day.
+def reject_stage_for(finalised: bool) -> str:
+    """Whose rejects describe a day: the batch layer's once it is billed, else the speed's."""
+    return "batch" if finalised else "speed"
+
+
+def get_rejected_for_day(sim_date: date, stage: str) -> list[RejectedSummary]:
+    """One layer's rejections attributable to a simulated day.
+
+    One layer, not both (R23): the two validate the same readings, so counting both
+    reported every bad reading twice. Use `reject_stage_for(finalised)`. The batch layer's
+    figures are the day's authoritative ones — deduplicated, and replaced on every run.
+    The speed layer validates before it deduplicates, so its count also includes the
+    injected duplicates of bad readings.
 
     Matched on the payload's `event_ts` rather than `rejected_at`: a record rejected by
     the batch layer is rejected when the job runs, which can be a different real day from
     the simulated one it belongs to. Counting by wall clock would attribute a restatement
-    of last week's data to today.
+    of last week's data to today. `daily_billing.finalise` deletes by the same expression.
     """
     with transaction() as cur:
         cur.execute(
             "SELECT reason, count(*) FROM rejected_records "
-            "WHERE (raw_payload ->> 'event_ts')::timestamptz::date = %s "
+            "WHERE stage = %s AND (raw_payload ->> 'event_ts')::timestamptz::date = %s "
             "GROUP BY reason ORDER BY count(*) DESC",
-            (sim_date,),
+            (stage, sim_date),
         )
         return [RejectedSummary(reason, total) for reason, total in cur.fetchall()]
 

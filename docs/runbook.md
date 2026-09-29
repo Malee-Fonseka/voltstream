@@ -72,8 +72,8 @@ It ends by printing where to look:
 | ~2 min | Grafana → pipeline health | Scrape targets down 0. Readings produced and consumed overlap (~24/s, both layers). Consumer lag ~0. Rejects ~2 %, under the dashed 5 % line. Latency under the dashed 1-minute line |
 | ~2 min | Grafana → grid operations | Load, solar and renewable ratio by zone moving; the ratio crosses the dashed 15 % line |
 | every simulated night | Grafana → "Alerts firing now" | LowRenewableContribution for all 5 zones, gone by mid-morning. **Expected, not a fault** |
-| ~6–7 min | Airflow → daily_billing | First run: all 8 tasks green. No run for 2025-12-31, the seed day |
-| ~10–13 min | Grafana → Lambda divergence | The first complete day reconciled: divergence around 1.5–2 % |
+| ~7–8 min | Airflow → daily_billing | First run: all 8 tasks green, after a 90-second late-data grace behind the tariff that lands at simulated midnight. No run for 2025-12-31, the seed day |
+| ~11–14 min | Grafana → Lambda divergence | The first complete day reconciled: divergence around 1.5–2 % |
 
 Then `.\scripts\voltstream.ps1 check` should report **0 failed**. Run it outside a billing
 run: while Spark's batch containers run, the laptop can be slow enough that a health call

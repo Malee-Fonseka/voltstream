@@ -21,7 +21,7 @@ and not handled here.
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -221,6 +221,26 @@ def _assert_reason_coverage(handled: set[str]) -> None:
             f"streaming/sources.py does not handle rejection reason(s): {sorted(missing)}. "
             "Add a Column expression for each, in the same order as core/validation.py."
         )
+
+
+def known_household_ids() -> frozenset[str]:
+    """The seeded household roster, HH-0001 onwards, that readings are validated against.
+
+    One definition for every layer that calls `split_valid_invalid` (R26): the speed
+    layer and the billing job each had a copy, and the rollup imported a private one.
+    """
+    households = get_config().simulation.households
+    return frozenset(f"HH-{i:04d}" for i in range(1, households + 1))
+
+
+def event_ts_bounds() -> tuple[datetime, datetime]:
+    """The plausible range for `event_ts`: a year before the simulated epoch to 50 after.
+
+    Generous on purpose, because the simulated clock can be anchored anywhere. Its job is
+    to catch a garbage timestamp, not to second-guess the clock.
+    """
+    epoch = get_config().simulation.epoch_sim
+    return (epoch - timedelta(days=365), epoch + timedelta(days=365 * 50))
 
 
 def split_valid_invalid(

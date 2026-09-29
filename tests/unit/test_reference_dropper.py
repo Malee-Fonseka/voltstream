@@ -1,7 +1,8 @@
-"""Unit tests for the reference dropper's daily tariff (T074, R01).
+"""Unit tests for the reference dropper's daily tariff (T074, R01, R03).
 
-No object store: `_tariff_rows` is the pure part of the dropper, and the rule it applies
-is what the speed layer's stale-tariff divergence depends on.
+No object store: `_tariff_rows` and `closed_days_owed` are the pure parts of the dropper.
+The first is the rule the speed layer's stale-tariff divergence depends on; the second
+decides which closed days get a tariff when the dropper starts.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from voltstream.core.netting import net
 from voltstream.core.tariff import TariffRates, compute_bill
 from voltstream.simulators.households import household_roster
 from voltstream.simulators.profiles import consumption_kwh, solar_kwh
-from voltstream.simulators.reference_dropper import _tariff_rows
+from voltstream.simulators.reference_dropper import _tariff_rows, closed_days_owed
 
 _DAY = date(2026, 1, 2)
 _YESTERDAY = _DAY - timedelta(days=1)
@@ -95,3 +96,37 @@ def test_yesterdays_tariff_prices_every_simulated_household_differently() -> Non
             unchanged.append(hid)
 
     assert unchanged == [], f"yesterday's tariff prices these exactly like today's: {unchanged}"
+
+
+# ---------------------------------------------------------------------------------------
+# R03: tariff_D is written when D closes, so startup owes every day closed since the last.
+# ---------------------------------------------------------------------------------------
+
+
+def test_a_fresh_stack_is_owed_only_yesterdays_tariff() -> None:
+    """The T075 seed: the speed layer costs day one against it."""
+    assert closed_days_owed(set(), _DAY) == [_YESTERDAY]
+
+
+def test_a_restart_the_same_day_owes_nothing() -> None:
+    assert closed_days_owed({_YESTERDAY - timedelta(days=1), _YESTERDAY}, _DAY) == []
+
+
+def test_a_restart_after_a_stop_owes_every_day_that_closed_meanwhile() -> None:
+    """Stopped during day 5 and started on day 8: days 5, 6 and 7 all closed unbilled."""
+    day5 = date(2026, 1, 5)
+    owed = closed_days_owed({date(2026, 1, 3), date(2026, 1, 4)}, date(2026, 1, 8))
+    assert owed == [day5, day5 + timedelta(days=1), day5 + timedelta(days=2)]
+
+
+def test_todays_tariff_is_never_owed() -> None:
+    """Today has not closed; a file for it would get it billed while it is still running."""
+    assert _DAY not in closed_days_owed(set(), _DAY)
+    assert closed_days_owed({_DAY}, _DAY) == [_YESTERDAY], "a file dated today is not a closed day"
+
+
+def test_catching_up_stops_at_a_week() -> None:
+    owed = closed_days_owed({date(2025, 1, 1)}, _DAY)
+    assert owed[0] == _DAY - timedelta(days=7)
+    assert owed[-1] == _YESTERDAY
+    assert len(owed) == 7

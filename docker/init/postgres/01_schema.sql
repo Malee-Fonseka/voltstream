@@ -92,6 +92,18 @@ CREATE TABLE IF NOT EXISTS household_bill_daily (
 );
 
 -- ============================================================================
+-- household_bill_history — every billing run's bills, append-only (D6, R25).
+-- household_bill_daily holds the current bill and is replaced on a restatement; this
+-- keeps each version, so the audit trail D6 promises exists: the original bill, the wrong
+-- one, the corrected one, and through pipeline_run_id the run and status of each. Same
+-- columns as household_bill_daily by construction.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS household_bill_history (
+    LIKE household_bill_daily INCLUDING DEFAULTS,
+    PRIMARY KEY (pipeline_run_id, household_id)
+);
+
+-- ============================================================================
 -- zone_metrics_daily — BATCH VIEW: authoritative per-zone daily aggregate (T037). §6.1's
 -- layer diagram lists this table but §6.4 never defined it; daily_zone_rollup.py (T124)
 -- writes to it and the reconciliation cross-check (T125) reads it.

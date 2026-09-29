@@ -11,7 +11,7 @@ import yaml
 from pydantic import ValidationError
 
 import voltstream.config as config_module
-from voltstream.config import get_config
+from voltstream.config import TariffConfig, get_config
 from voltstream.core.tariff import BlockBoundary
 
 _REPO_CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
@@ -127,3 +127,66 @@ def test_get_config_cache_clear_forces_reload(monkeypatch: pytest.MonkeyPatch) -
 
     assert first is not second
     assert second.simulation.households == 3
+
+
+# ---------------------------------------------------------------------------------------
+# R14: D2's load-time validation of tariff.blocks.
+# ---------------------------------------------------------------------------------------
+
+
+def _tariff_with(blocks: list[tuple[str, int | None]]) -> dict:
+    tariff = get_config().tariff.model_dump()
+    tariff["blocks"] = [{"name": n, "up_to_kwh": up} for n, up in blocks]
+    return tariff
+
+
+@pytest.mark.parametrize(
+    ("blocks", "rule"),
+    [
+        ([("block_1", 120), ("block_2", 60), ("block_3", None)], "increasing"),
+        ([("block_1", 60), ("block_2", 60), ("block_3", None)], "increasing"),
+        ([("block_1", 0), ("block_2", 60), ("block_3", None)], "positive"),
+        ([("block_1", 60), ("block_2", 120), ("block_3", 200)], "unbounded"),
+        ([("block_1", 60), ("block_2", None), ("block_3", None)], "unbounded"),
+        ([("block_1", None), ("block_2", 60), ("block_3", 120)], "unbounded"),
+        ([("block_1", 60), ("block_2", None)], "3 blocks"),
+    ],
+)
+def test_a_malformed_block_structure_fails_at_load(
+    blocks: list[tuple[str, int | None]], rule: str
+) -> None:
+    with pytest.raises(ValidationError, match=rule):
+        TariffConfig.model_validate(_tariff_with(blocks))
+
+
+def test_the_shipped_block_structure_is_valid() -> None:
+    shipped = [("block_1", 60), ("block_2", 120), ("block_3", None)]
+    TariffConfig.model_validate(_tariff_with(shipped))
+
+
+def test_host_side_processes_take_the_password_env_already_holds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`.env` sets POSTGRES_PASSWORD; `make test-all` on the host had no password at all."""
+    monkeypatch.setenv("POSTGRES_PASSWORD", "from-dotenv")
+    assert get_config().postgres.password == "from-dotenv"
+
+
+def test_the_explicit_password_variable_still_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("POSTGRES_PASSWORD", "from-dotenv")
+    monkeypatch.setenv("VOLTSTREAM__POSTGRES__PASSWORD", "explicit")
+    assert get_config().postgres.password == "explicit"
+
+
+def test_env_example_and_base_yaml_name_the_same_topics_and_buckets() -> None:
+    """The init jobs create topics and buckets from .env; Python reads base.yaml (R30)."""
+    from dotenv import dotenv_values
+
+    env = dotenv_values(_REPO_CONFIG_DIR.parent / ".env.example")
+    cfg = get_config()
+    assert (env["KAFKA_TOPIC"], env["KAFKA_DLQ_TOPIC"]) == (cfg.kafka.topic, cfg.kafka.dlq_topic)
+    assert (env["MINIO_BUCKET_RAW"], env["MINIO_BUCKET_LANDING"], env["MINIO_BUCKET_ARCHIVE"]) == (
+        cfg.minio.bucket_raw,
+        cfg.minio.bucket_landing,
+        cfg.minio.bucket_archive,
+    )

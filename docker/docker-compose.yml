@@ -45,6 +45,10 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # Where kafka_data is mounted. The image's default is /tmp/kraft-combined-logs, inside
+      # the container: topics then vanished on `make down && make up` while the Spark
+      # checkpoints on their own volumes survived, pointing at offsets that no longer exist.
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
     ports:
       - "${KAFKA_HOST_PORT:-29092}:29092"
     volumes:
@@ -418,6 +422,11 @@ services:
       VOLTSTREAM_NETWORK: voltstream
       VOLTSTREAM_ANCHOR_REAL: ${VOLTSTREAM_ANCHOR_REAL:-}
       DOCKER_HOST: tcp://docker-socket-proxy:2375
+      # The DAG hands these to the containers it launches (R36). Without them it fell back
+      # to the defaults, and a non-default password in .env failed every batch task.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-voltstream}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-voltstream}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-voltstream-dev}
     ports:
       - "${AIRFLOW_HOST_PORT:-8080}:8080"
     volumes:

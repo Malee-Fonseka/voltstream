@@ -66,6 +66,21 @@ def test_every_infrastructure_service_has_a_healthcheck() -> None:
         assert "healthcheck" in _BASE["services"][service], service
 
 
+def test_kafka_writes_its_log_to_the_mounted_volume() -> None:
+    """The image's default log dir is inside the container, so topics did not survive a
+    recreate while the Spark checkpoints did."""
+    kafka = _BASE["services"]["kafka"]
+    mounted = {v.split(":")[1] for v in kafka["volumes"] if v.startswith("kafka_data:")}
+    assert kafka["environment"]["KAFKA_LOG_DIRS"] in mounted
+
+
+def test_airflow_can_hand_the_real_credentials_to_its_tasks() -> None:
+    """R36: the DAG reads these from its own environment for every container it starts."""
+    env = _BASE["services"]["airflow"]["environment"]
+    for name in ("POSTGRES_PASSWORD", "MINIO_ROOT_USER", "MINIO_ROOT_PASSWORD"):
+        assert env.get(name, "").startswith(f"${{{name}:-"), name
+
+
 # --------------------------------------------------------------------------------------
 # T178 — the dev override
 # --------------------------------------------------------------------------------------

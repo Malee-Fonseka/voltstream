@@ -239,6 +239,7 @@ def _purge() -> None:
     """Every trace of the fixture day, in Postgres and in the object store."""
     with _connect() as conn, conn.cursor() as cur:
         cur.execute("DELETE FROM household_bill_daily WHERE sim_date = %s", (_DAY,))
+        cur.execute("DELETE FROM household_bill_history WHERE sim_date = %s", (_DAY,))
         cur.execute("DELETE FROM pipeline_runs WHERE sim_date = %s", (_DAY,))
         conn.commit()
     for path in (
@@ -328,3 +329,27 @@ def test_a_changed_block_rate_changes_that_bill_and_no_other(
         ("superseded", "t172-run-2"),
         ("success", "t172-run-3"),
     ]
+
+
+def test_every_runs_bill_and_tariff_stay_on_record(
+    billed_day: dict[str, dict[str, object]],
+) -> None:
+    """R25, D6: the audit trail shows each run's bill and which run produced it, and each
+    run's archived tariff, though only the last run's bills are current."""
+    with _connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT r.orchestrator_run_id, r.status, h.final_bill, h.pipeline_run_id "
+            "FROM household_bill_history h JOIN pipeline_runs r ON r.run_id = h.pipeline_run_id "
+            "WHERE h.sim_date = %s AND h.household_id = 'HH-0001' ORDER BY r.started_at",
+            (_DAY,),
+        )
+        history = cur.fetchall()
+    assert [row[:3] for row in history] == [
+        ("t172-run-1", "superseded", Decimal("720.17")),
+        ("t172-run-2", "superseded", Decimal("720.17")),
+        ("t172-run-3", "success", Decimal("780.17")),
+    ]
+
+    archived = _mc("ls", f"local/voltstream-archive/tariff/sim_date={_DAY}/").stdout.decode()
+    for _, _, _, run_id in history:
+        assert f"run_id={run_id}" in archived, f"no archived tariff for run {run_id}"

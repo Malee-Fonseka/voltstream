@@ -8,9 +8,9 @@ The Postgres pool is opened and closed by the lifespan rather than on first use.
 lazily would make the first request after startup pay the connection cost and, worse,
 would let the container report healthy before it could serve anything.
 
-`/metrics` is mounted by the instrumentator onto this same port, using the shared registry
-from `voltstream.metrics`. The API does not call `start_metrics_server()` — that is for
-processes with no HTTP server of their own.
+`/metrics` is a plain route on this same port, serving the shared registry from
+`voltstream.metrics` (see `create_app` for why not the instrumentator). The API does not
+call `start_metrics_server()` — that is for processes with no HTTP server of their own.
 """
 
 from __future__ import annotations

@@ -1,4 +1,4 @@
-"""Unit tests for storage.postgres.connect (R38).
+"""Unit tests for storage.postgres: connect (R38), transaction and healthcheck (R31).
 
 psycopg.connect is replaced, so nothing here needs a database. What is pinned: a transient
 failure to connect is retried with backoff, the last failure still surfaces, nothing but a
@@ -8,10 +8,13 @@ connection failure is retried, and no code opens a connection any other way.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import psycopg
+import psycopg_pool
 import pytest
 
 from voltstream.storage import postgres
@@ -91,3 +94,68 @@ def test_no_module_opens_a_connection_without_the_retry() -> None:
             for m in re.finditer(r"psycopg\.connect\(", text)
         ]
     assert bare == []
+
+
+# ---------------------------------------------------------------------------------------
+# R31: only an outage is DatabaseUnavailable, and the readiness probe fails fast.
+# ---------------------------------------------------------------------------------------
+
+
+class _FakeCursor:
+    def __enter__(self) -> _FakeCursor:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+class _FakeConnection:
+    def cursor(self) -> _FakeCursor:
+        return _FakeCursor()
+
+    def execute(self, sql: str) -> Any:
+        return self
+
+    def fetchone(self) -> tuple[int]:
+        return (1,)
+
+
+class _FakePool:
+    def __init__(self, error: BaseException | None = None) -> None:
+        self.error = error
+        self.timeouts: list[float | None] = []
+
+    @contextmanager
+    def connection(self, timeout: float | None = None) -> Iterator[_FakeConnection]:
+        self.timeouts.append(timeout)
+        if self.error is not None:
+            raise self.error
+        yield _FakeConnection()
+
+
+def test_an_outage_is_database_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(postgres, "_pool", _FakePool(psycopg_pool.PoolTimeout("no connection")))
+    with pytest.raises(postgres.DatabaseUnavailable), postgres.transaction():
+        pass
+
+
+def test_a_wrong_query_keeps_its_own_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A SQL typo used to surface as DatabaseUnavailable, as if Postgres were down."""
+    monkeypatch.setattr(postgres, "_pool", _FakePool())
+    with pytest.raises(psycopg.errors.UndefinedColumn), postgres.transaction():
+        raise psycopg.errors.UndefinedColumn('column "totl" does not exist')
+
+
+def test_the_readiness_probe_waits_seconds_not_the_pools_thirty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = _FakePool(psycopg_pool.PoolTimeout("no connection"))
+    monkeypatch.setattr(postgres, "_pool", pool)
+    assert postgres.healthcheck() is False
+    assert pool.timeouts == [postgres._HEALTHCHECK_TIMEOUT_SECONDS]
+    assert postgres._HEALTHCHECK_TIMEOUT_SECONDS < 5, "inside the compose healthcheck timeout"
+
+
+def test_the_readiness_probe_passes_when_postgres_answers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(postgres, "_pool", _FakePool())
+    assert postgres.healthcheck() is True

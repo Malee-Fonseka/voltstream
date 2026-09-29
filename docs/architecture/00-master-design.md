@@ -849,7 +849,21 @@ voltstream-checkpoints/               ← Spark checkpoints (see §8.5)
 
 ### 6.4 Postgres schema (essentials)
 
+The authoritative DDL is `docker/init/postgres/01_schema.sql` and `02_indexes.sql`; this
+is the shape of it.
+
 ```sql
+-- DIMENSION: the 50 simulated households, seeded once (T038)
+CREATE TABLE households (
+    household_id  TEXT PRIMARY KEY,
+    meter_id      TEXT NOT NULL UNIQUE,
+    grid_zone     TEXT NOT NULL,
+    billing_tier  TEXT NOT NULL,
+    subsidy_flag  BOOLEAN NOT NULL,
+    has_solar     BOOLEAN NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- SPEED VIEW: zone metrics, upserted every micro-batch
 CREATE TABLE zone_metrics_rt (
     grid_zone            TEXT        NOT NULL,
@@ -863,6 +877,8 @@ CREATE TABLE zone_metrics_rt (
     PRIMARY KEY (grid_zone, window_start)
 );
 CREATE INDEX idx_zone_metrics_rt_window ON zone_metrics_rt (window_start DESC);
+-- The newest window per zone, for /zones/load (R32)
+CREATE INDEX idx_zone_metrics_rt_zone_window ON zone_metrics_rt (grid_zone, window_start DESC);
 
 -- SPEED VIEW: per-household running total, provisional
 CREATE TABLE household_running_rt (
@@ -902,6 +918,30 @@ CREATE TABLE household_bill_daily (
     PRIMARY KEY (household_id, sim_date)
 );
 
+-- Every billing run's bills, append-only: the audit trail of restatements (D6, R25)
+CREATE TABLE household_bill_history (
+    LIKE household_bill_daily INCLUDING DEFAULTS,
+    PRIMARY KEY (pipeline_run_id, household_id)
+);
+
+-- BATCH VIEW: authoritative per-zone daily totals, from the master dataset (T037)
+CREATE TABLE zone_metrics_daily (
+    grid_zone             TEXT          NOT NULL,
+    sim_date              DATE          NOT NULL,
+    total_consumption_kwh NUMERIC(12,4) NOT NULL,
+    total_solar_kwh       NUMERIC(12,4) NOT NULL,
+    self_consumed_kwh     NUMERIC(12,4) NOT NULL,  -- sum of the households' bills (R24)
+    export_kwh            NUMERIC(12,4) NOT NULL,
+    renewable_ratio       NUMERIC(5,4)  NOT NULL,
+    peak_window_start     TIMESTAMPTZ   NOT NULL,
+    peak_consumption_kwh  NUMERIC(12,4) NOT NULL,
+    active_meters         INTEGER       NOT NULL,
+    readings_count        INTEGER       NOT NULL,
+    pipeline_run_id       UUID          NOT NULL,  -- lineage
+    computed_at           TIMESTAMPTZ   NOT NULL DEFAULT now(),
+    PRIMARY KEY (grid_zone, sim_date)
+);
+
 -- Dead-letter records: evidence for observability marks
 CREATE TABLE rejected_records (
     id            BIGSERIAL PRIMARY KEY,
@@ -918,11 +958,12 @@ CREATE TABLE pipeline_runs (
     run_id          UUID PRIMARY KEY,
     sim_date        DATE NOT NULL,
     layer           TEXT NOT NULL,        -- 'batch_billing' | 'batch_rollup'
-    status          TEXT NOT NULL,        -- 'running' | 'success' | 'failed'
+    status          TEXT NOT NULL,        -- 'running' | 'success' | 'failed' | 'superseded'
     rows_in         BIGINT,
     rows_out        BIGINT,
     started_at      TIMESTAMPTZ NOT NULL,
-    finished_at     TIMESTAMPTZ
+    finished_at     TIMESTAMPTZ,
+    orchestrator_run_id TEXT              -- the Airflow run that produced it (T122)
 );
 CREATE UNIQUE INDEX idx_runs_date_layer_success
     ON pipeline_runs (sim_date, layer) WHERE status = 'success';

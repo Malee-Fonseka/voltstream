@@ -46,14 +46,16 @@ from pyspark.sql.types import DecimalType
 from voltstream.config import get_config
 from voltstream.core.keys import DEDUP_COLUMNS
 from voltstream.core.spark_expr import compute_bill_expr
-from voltstream.core.tariff import BlockBoundary
 from voltstream.logging_setup import get_logger
 from voltstream.metrics import events_consumed_total, start_metrics_server, zone_renewable_ratio
 from voltstream.storage.objectstore import landing_tariff_path
+from voltstream.streaming.reference import read_tariff
 from voltstream.streaming.session import build_session, checkpoint_path
 from voltstream.streaming.sinks import observe_e2e_latency, upsert_batch, write_rejected
 from voltstream.streaming.sources import (
     KafkaLagListener,
+    event_ts_bounds,
+    known_household_ids,
     read_meter_stream,
     split_valid_invalid,
 )
@@ -74,23 +76,6 @@ _RATIO = DecimalType(5, 4)
 # Tariff frames, cached per effective date. The speed layer re-reads only when the
 # simulated day rolls over, which at this time scale is once every 5 real minutes.
 _tariff_cache: dict[date, DataFrame] = {}
-
-
-def _boundaries() -> list[BlockBoundary]:
-    """Block boundaries from config — structure only, never rates (D2).
-
-    Config holds the boundaries as ints (60, 120); tariff arithmetic is Decimal
-    throughout, so they are converted here rather than left to mix with Decimal kWh
-    values further in. `Decimal(int)` is exact, so nothing is lost.
-
-    ponytail: the batch job (Phase 9) needs the same conversion. Lift this into a shared
-    helper at that point rather than copying it — two copies is how the two layers start
-    disagreeing about where a block ends.
-    """
-    return [
-        BlockBoundary(b.name, None if b.up_to_kwh is None else Decimal(b.up_to_kwh))
-        for b in get_config().tariff.blocks
-    ]
 
 
 def _watermark_sim_minutes() -> str:
@@ -263,31 +248,20 @@ def household_aggregation(valid_df: DataFrame) -> DataFrame:
 
 
 def _tariff_for(spark: SparkSession, effective: date) -> DataFrame | None:
-    """Yesterday's tariff file, cached. Returns None when it is not there yet."""
+    """Yesterday's tariff file, cached. Returns None when it is not there yet.
+
+    Read by `streaming.reference.read_tariff`, the billing job's reader too (R22), so both
+    layers price a household with the same validated rates and the same subsidy flag.
+    """
     if effective in _tariff_cache:
         return _tariff_cache[effective]
 
     path = landing_tariff_path(effective)
     try:
-        frame = (
-            spark.read.option("header", "true")
-            .option("inferSchema", "false")
-            .csv(path)
-            .select(
-                F.col("household_id"),
-                F.col("billing_tier"),
-                (F.col("subsidy_flag") == F.lit("true")).alias("subsidy_flag"),
-                F.col("subsidy_pct").cast(DecimalType(5, 2)).alias("subsidy_pct"),
-                F.col("fixed_charge").cast(DecimalType(12, 2)).alias("fixed_charge"),
-                F.col("block_1_rate").cast(DecimalType(12, 2)).alias("block_1_rate"),
-                F.col("block_2_rate").cast(DecimalType(12, 2)).alias("block_2_rate"),
-                F.col("block_3_rate").cast(DecimalType(12, 2)).alias("block_3_rate"),
-                F.col("export_rate").cast(DecimalType(12, 2)).alias("export_rate"),
-            )
-        )
+        frame = read_tariff(spark, effective, path)
         frame.cache()
-        frame.count()  # force the read now, inside the try, so a missing file is caught here
-    except Exception as exc:  # noqa: BLE001 - any read failure means "not available yet"
+        frame.count()
+    except Exception as exc:  # noqa: BLE001 - missing (not dropped yet) or invalid: no bill
         log.warning(
             "tariff file not available",
             extra={"stage": "speed-household", "path": path, "detail": str(exc)[:200]},
@@ -323,7 +297,8 @@ def with_provisional_bill(totals_df: DataFrame, tariff_df: DataFrame, effective:
         subsidy_flag_col=F.col("subsidy_flag"),
         subsidy_pct_col=F.col("subsidy_pct"),
         export_rate_col=F.col("export_rate"),
-        boundaries=_boundaries(),
+        # Structure only, never rates (D2); the billing job reads the same (R26).
+        boundaries=get_config().tariff.boundaries(),
     )
 
     return joined.select(
@@ -388,12 +363,6 @@ def _write_household_batch(batch_df: DataFrame, batch_id: int, *, spark: SparkSe
 # --------------------------------------------------------------------------------------
 
 
-def _known_household_ids(spark: SparkSession) -> frozenset[str]:
-    """The seeded household dimension, read once at startup."""
-    config = get_config()
-    return frozenset(f"HH-{i:04d}" for i in range(1, config.simulation.households + 1))
-
-
 def _write_validation_batch(
     batch_df: DataFrame,
     batch_id: int,
@@ -448,14 +417,8 @@ def start(await_termination: bool = True) -> list[StreamingQuery]:
         KafkaLagListener({q: _LAYER for q in (_ZONE_JOB, _HOUSEHOLD_JOB, _VALIDATION_JOB)})
     )
 
-    known_households = _known_household_ids(spark)
-    # event_ts is simulated time; the plausible range is generous because the simulated
-    # clock can be anchored anywhere. Its job is to catch a garbage timestamp, not to
-    # second-guess the clock.
-    bounds = (
-        config.simulation.epoch_sim - timedelta(days=365),
-        config.simulation.epoch_sim + timedelta(days=365 * 50),
-    )
+    known_households = known_household_ids()
+    bounds = event_ts_bounds()
 
     # One source per query. Each gets its own Spark-generated consumer group and, more to
     # the point, its own checkpoint — which is where offsets actually live and what makes

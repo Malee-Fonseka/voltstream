@@ -56,7 +56,7 @@ make demo
 ```
 
 `make demo` brings the stack up, waits on health checks rather than sleeping, runs one
-simulated day, and prints where to look. First run builds two images and takes a while;
+simulated day, and prints where to look. First run builds three images and takes a while;
 later runs start in under a minute.
 
 Then:
@@ -102,13 +102,20 @@ into the future. Bringing the stack up with raw `docker compose` skips that — 
 | `raw-archiver` | 8011 | Kafka → Parquet, no transformation whatsoever |
 | `speed-layer` | 8012 | Windowed zone metrics and the provisional bill |
 | `api` | 8000 | Serving API and OpenAPI docs |
+| `airflow` | 8080 | Orchestration: a watcher bills each simulated day as its tariff lands, and each billing run starts Spark in its own container |
+| `docker-socket-proxy` | — | Lets Airflow start those containers without access to the Docker socket itself |
+| `prometheus` | 9090 | Scrapes the services' metrics and evaluates the five alert rules |
+| `alertmanager` | 9093 | Routes firing alerts back to the API's webhook |
+| `pushgateway` | 9091 | Holds the metrics of batch containers that exit before a scrape |
+| `sql-exporter` | — | Serving-layer facts as metrics: data age per zone, last billing success (D9) |
+| `grafana` | 3000 | Pipeline health, grid operations and Lambda divergence dashboards |
 
 ## Where to look
 
 | Looking for | Start here |
 |---|---|
-| Lambda vs Kappa, and why | [00-master-design.md](docs/architecture/00-master-design.md) §3 |
-| Decisions the design left open | [05-open-decisions.md](docs/architecture/05-open-decisions.md) D1–D7 |
+| Lambda vs Kappa, and why | [00-master-design.md](docs/architecture/00-master-design.md) §4 |
+| Decisions the design left open | [05-open-decisions.md](docs/architecture/05-open-decisions.md) D1–D9 |
 | Billing logic, shared by both layers | [src/voltstream/core/](src/voltstream/core/) |
 | That the two layers agree | [tests/consistency/test_pure_vs_spark.py](tests/consistency/test_pure_vs_spark.py) |
 | Ingestion | [simulators/](src/voltstream/simulators/), [streaming/sources.py](src/voltstream/streaming/sources.py) |

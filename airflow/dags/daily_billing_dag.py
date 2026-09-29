@@ -194,7 +194,12 @@ with DAG(
               count(*) > 0                                           AS day_has_bills,
               count(*) FILTER (WHERE final_bill IS NULL)        = 0 AS no_null_bills,
               count(*) FILTER (WHERE tier_breakdown IS NULL)    = 0 AS no_null_breakdown,
-              count(*) FILTER (WHERE readings_count <= 0)       = 0 AS every_bill_has_readings,
+              -- A household with no valid readings all day is billed its fixed charge
+              -- (R35), so one bill at zero readings is legitimate. A day where most are
+              -- is not: that is a meter feed that stopped, not an idle household.
+              count(*) FILTER (WHERE readings_count < 0)        = 0 AS no_negative_counts,
+              count(*) FILTER (WHERE readings_count > 0) > count(*) / 2
+                                                                  AS most_bills_have_readings,
               count(*) FILTER (WHERE abs(final_bill) > 1000000) = 0 AS no_absurd_bills,
               count(*) FILTER (WHERE tariff_effective_date > DATE '{{ params.sim_date }}')
                                                                 = 0 AS no_future_tariff
