@@ -238,10 +238,8 @@ Time is compressed so a full day can be demonstrated in a session:
 starts at 2026-01-01 00:00 UTC when the stack starts, so day 1 is partial and 2026-01-02
 is the first complete day. Each of 50 meters in 5 zones emits every 2 real seconds, 150
 readings per simulated day, about 7{,}500 events per day in total. All windowing uses
-simulated time; only latency metrics use the wall clock. A single module,
-\texttt{simclock.py}, does the conversion, and every duration in
-\texttt{config/base.yaml} carries a \texttt{\_sim\_minutes} or \texttt{\_real\_seconds}
-suffix, so it is always clear which one is meant.
+simulated time; only latency metrics use the wall clock. A single clock module does the conversion, and every duration in the configuration file
+is labelled as simulated or real, so it is always clear which one is meant.
 
 % =====================================================================
 \section{Architecture Decision: Lambda versus Kappa}
@@ -306,10 +304,10 @@ than a bounded nightly job.
 codepaths and can silently diverge; for example, a speed layer ending the first tariff
 block at 60\,kWh and a batch layer ending it at 61\,kWh would give different bills near
 the boundary. To avoid this, all netting, tariff, rounding, key and
-validation logic lives in one pure module, \texttt{voltstream/core/} (no I/O, 100\% test
-coverage enforced in CI), imported by both jobs. The logic exists twice only where it must,
-as scalar \texttt{Decimal} functions for the API and as Spark \texttt{Column} expressions for
-the Spark jobs, and \texttt{tests/consistency/test\_pure\_vs\_spark.py} runs both on 5{,}000
+validation logic lives in one shared module with no I/O (100\% test coverage enforced in CI), used by
+both jobs. The logic exists twice only where it must,
+as plain Python functions for the API and as Spark expressions for the Spark jobs, and a
+consistency test runs both on 5{,}000
 random inputs plus sweeps of every block boundary and asserts identical output to the cent.
 Divergence in logic is therefore a failing test; divergence in inputs (a stale tariff,
 dropped late readings) is intended and is measured at run time
@@ -335,24 +333,24 @@ Kappa's single codebase becomes the better trade.
   \node[srcbox] (prod) at (0,2.3) {\textbf{Meter producer}\\50 meters, 1 reading\\per 2 real s, faults};
   \node[srcbox] (drop) at (0,-1.2) {\textbf{Reference dropper}\\tariff + weather CSV\\once per sim day};
 
-  \node[ingbox] (dlq) at (3.6,4.45) {\texttt{meter.readings.dlq}\\dead letters};
-  \node[ingbox] (kafka) at (3.6,2.3) {\textbf{Kafka (KRaft)}\\\texttt{meter.readings}\\3 partitions};
+  \node[ingbox] (dlq) at (3.6,4.45) {\textbf{Dead-letter topic}\\rejected records};
+  \node[ingbox] (kafka) at (3.6,2.3) {\textbf{Kafka}\\readings topic\\3 partitions};
   \node[ingbox] (land) at (3.6,-1.2) {\textbf{Landing zone}\\object store\\daily CSV files};
 
   \node[sbox] (speed) at (7.2,3.4) {\textbf{Speed layer}\\Spark Streaming\\validate, dedup,\\15-min windows};
   \node[bbox] (arch) at (7.2,1.2) {\textbf{Raw archiver}\\Spark Streaming,\\no transformation};
   \node[bbox] (batch) at (7.2,-1.2) {\textbf{Batch layer}\\Airflow $\rightarrow$ Spark:\\dedup, bill, reconcile};
 
-  \node[sbox] (pgs) at (10.8,3.4) {\textbf{PostgreSQL}\\speed views\\\texttt{*\_rt} tables};
+  \node[sbox] (pgs) at (10.8,3.4) {\textbf{PostgreSQL}\\speed views\\(live windows, estimates)};
   \node[bbox] (master) at (10.8,1.2) {\textbf{Master dataset}\\Parquet on\\object store,\\by sim date / hour};
   \node[bbox] (pgb) at (10.8,-1.2) {\textbf{PostgreSQL}\\batch views, bills,\\run ledger};
 
   \node[servbox] (dash) at (14.4,3.4) {\textbf{Dashboard}\\live grid, bills,\\daily report};
-  \node[servbox] (api) at (14.4,1.2) {\textbf{FastAPI}\\merge function\\\texttt{/api/v1/\dots}};
+  \node[servbox] (api) at (14.4,1.2) {\textbf{FastAPI}\\serving API\\and merge function};
   \node[servbox] (rep) at (14.4,-1.2) {\textbf{Daily report}\\Markdown file\\per closed day};
 
   \node[box, dashed, text width=4.2cm, fill=yellow!12] (core) at (7.2,-3.8)
-      {\texttt{voltstream.core}: netting, tariff, validation,\\keys (pure, used by both layers)};
+      {\textbf{Shared billing module}\\netting, tariff, validation\\(used by both layers)};
 
   \draw[arr] (prod) -- (kafka);
   \draw[arr] (drop) -- (land);
@@ -373,7 +371,7 @@ Kappa's single codebase becomes the better trade.
 \caption{End-to-end architecture across ingestion, processing, storage and serving.
 Amber is the speed path (process, then store); teal is the batch path (store, then
 process). Both consume the same Kafka topic independently, each with its own checkpointed
-offsets. The dashed \texttt{core} module is imported by both processing layers.}
+offsets. The dashed shared billing module is used by both processing layers.}
 \label{fig:lambda}
 \end{figure}
 
@@ -397,13 +395,13 @@ and which day's tariff priced it.
 \begin{figure}[H]
 \centering
 \begin{tikzpicture}[node distance=0.5cm and 0.9cm]
-  \node[servbox, text width=3.0cm] (req) {\texttt{GET /households/\{id\}/bill}\\\texttt{?date=D}};
+  \node[servbox, text width=3.0cm] (req) {\textbf{Bill request}\\household, day $D$};
   \node[draw, diamond, fill=yellow!15, line width=0.8pt, aspect=2.4, align=center, font=\scriptsize, inner sep=1pt, right=of req] (dec)
-       {successful run for\\$D$ in \texttt{pipeline\_runs}?};
+       {is day $D$\\billed? (run ledger)};
   \node[bbox, text width=3.6cm, above right=0.1cm and 1.0cm of dec] (b)
-       {\texttt{household\_bill\_daily}\\\texttt{source="batch"}, \texttt{provisional=false}\\tariff of day $D$};
+       {\textbf{Final bill}\\from the batch layer\\priced with day $D$'s tariff};
   \node[sbox, text width=3.6cm, below right=0.1cm and 1.0cm of dec] (s)
-       {\texttt{household\_running\_rt}\\\texttt{source="speed"}, \texttt{provisional=true}\\tariff of day $D-1$};
+       {\textbf{Provisional estimate}\\from the speed layer\\priced with day $D{-}1$'s tariff};
   \draw[arr] (req) -- (dec);
   \draw[barr] (dec.north) |- node[lbl, pos=0.3, left]{yes} (b.west);
   \draw[sarr] (dec.south) |- node[lbl, pos=0.3, left]{no} (s.west);
@@ -415,7 +413,7 @@ and the two labelled return paths.}
 
 \paragraph{Key transformations.} All windowing uses \textbf{event time} with a watermark,
 because readings arrive out of order and arrival-time windows would put them in the wrong
-window. \textbf{Solar netting} (\texttt{core/netting.py}) runs before tariff evaluation:
+window. \textbf{Solar netting} runs before tariff evaluation:
 \begin{equation*}
   \mathit{self} = \min(\mathit{solar}, \mathit{consumption}),\quad
   \mathit{import} = \mathit{consumption} - \mathit{self},\quad
@@ -425,7 +423,7 @@ and $\mathit{total} = \mathit{energy\_charge} + \mathit{fixed\_charge} -
 \mathit{subsidy} - \mathit{export\_credit}$, where the energy charge prices the import block
 by block and money is rounded half-up to 2 decimals identically in both layers. Kafka is
 at-least-once, so both layers \textbf{deduplicate} on $(\mathit{meter\_id},
-\mathit{event\_ts})$, defined once in \texttt{core/keys.py}. The Kafka message key is
+\mathit{event\_ts})$, defined once in the shared module. The Kafka message key is
 \texttt{household\_id}, which keeps each household's readings ordered within a partition.
 
 % =====================================================================
@@ -598,11 +596,10 @@ two steps, so a crash between them re-reads a small range. We measured 334 dupli
 of 14{,}012 rows after a kill, with no missing events; batch deduplication removes them.
 
 \paragraph{Speed layer.} A second, independent Spark stream validates each record with
-\texttt{core/validation.py}, deduplicates, groups readings into 15-simulated-minute
+the shared validation rules, deduplicates, groups readings into 15-simulated-minute
 tumbling windows per zone under a 30-simulated-minute watermark, keeps a running total per
 household, and upserts into PostgreSQL every 10 real seconds using \texttt{foreachBatch} in
-update mode. The provisional bill applies \texttt{core/spark\_expr.py} with yesterday's
-tariff. Two effects of time compression matter here. First, the 10-second trigger equals 48
+update mode. The provisional bill uses the shared billing logic with yesterday's tariff. Two effects of time compression matter here. First, the 10-second trigger equals 48
 \emph{simulated} minutes, longer than the watermark, so the trigger rather than the
 watermark decides which late readings are dropped (measured in
 Section~\ref{sec:res-recon}). Second, in update mode results are emitted every trigger, so
@@ -685,7 +682,7 @@ dashboard.
 
 The code is a typed Python 3.11 package organised by layer (\texttt{simulators},
 \texttt{streaming}, \texttt{batch}, \texttt{storage}, \texttt{api}, shared \texttt{core} and
-\texttt{contracts}). All settings live in \texttt{config/base.yaml}, validated at start-up.
+\texttt{contracts}). All settings live in one configuration file, validated at start-up.
 There are 281 tests (unit, property-based, consistency and integration), \texttt{promtool}
 tests for the alert rules, and a test that fails if alert thresholds or metric names drift
 from the code. GitHub Actions CI runs linting, type checks, the tests with the 100\%
@@ -715,7 +712,7 @@ where it is stuck. Figure~\ref{fig:observability} shows how each stage is instru
   \node[obox, right=3.6cm of arch] (prom) {\textbf{Prometheus}\\scrape 15\,s\\5 alert rules};
   \node[obox, right=of prom] (am) {\textbf{Alertmanager}\\route, group, inhibit};
   \node[obox, above=of am] (graf) {\textbf{Grafana}\\3 dashboards};
-  \node[servbox, below=of am] (hook) {API webhook\\$\rightarrow$ JSON log line\\\texttt{stage: alert}};
+  \node[servbox, below=of am] (hook) {API webhook\\$\rightarrow$ alert\\log line};
 
   \foreach \n in {prod,speed,arch,api} \draw[arr, obsc] (\n.east) -- (prom.west);
   \draw[arr, obsc] (bat.east) -| node[lbl, pos=0.2, above]{push on exit} (pgw.south);
@@ -784,7 +781,7 @@ for requests with an \texttt{X-Trace-Id} header. Any record's path and timing ca
 searching for one ID.
 
 \paragraph{Alerts and health checks.} Five Prometheus rules (Table~\ref{tab:alerts}) are
-stored in the repository, with thresholds checked against \texttt{base.yaml} by a test.
+stored in the repository, with thresholds checked against the configuration by a test.
 Alertmanager routes critical and warning alerts separately, and \texttt{MeterDataStale}
 for a zone suppresses that zone's \texttt{LowRenewableContribution}, since missing data
 explains missing solar. The API also has \texttt{/health/live}, \texttt{/health/ready}
@@ -823,8 +820,7 @@ fires.
 
 For 2026-01-02 (the first complete day) the batch layer read 7{,}029 rows and wrote 50
 bills, and the whole eight-task DAG took 59\,s. Every bill satisfies the total formula. The
-last DAG task writes a Markdown report per day
-(\texttt{reports/report\_2026-01-02.md}) with zone totals (consumption, solar,
+last DAG task writes a Markdown report for each day with zone totals (consumption, solar,
 self-consumed, exported, renewable share), billing totals, rejected records by reason, the
 speed-vs-batch divergence and the run ledger. The same content is served by
 \texttt{/api/v1/reports/daily} and shown in the dashboard's Daily report tab
@@ -1118,7 +1114,7 @@ Prometheus Authors, \emph{Prometheus Documentation}. \url{https://prometheus.io/
 \centering
 \begin{minipage}[t]{0.47\textwidth}
 \centering
-\captionof{table}{Synthetic tariff (defaults in \texttt{base.yaml}).}
+\captionof{table}{Synthetic tariff (configuration defaults).}
 \label{tab:tariffvals}
 \small
 \begin{tabularx}{\linewidth}{L{2.6cm} X}
