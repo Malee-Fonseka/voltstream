@@ -221,11 +221,11 @@ endpoint, the dashboard and a Markdown report file per closed day
 \textbf{ID} & \textbf{Requirement} & \textbf{Rationale} & \textbf{Measured} \\
 \midrule
 N1 & Speed-layer latency below 60\,s & Grid ramping decision window & Mean 6.3\,s; none over 60\,s \\
-N2 & Batch done within 10 real min of day close & Demonstrable in a session & DAG 59\,s after a 90\,s grace \\
+N2 & Batch done within 10 real min of day close & Demonstrable in a session & Billing DAG ran in 59\,s \\
 N3 & No data loss on a single-component failure & Kafka retention plus master dataset & 0 lost after killing either Spark job \\
 N4 & Unbounded restatement horizon & Disputes outlast bus retention & Day restated from Parquet \\
 N5 & Reproducible from a clean clone & Assessment requirement & One command (Appendix B) \\
-N6 & Every pipeline stage observable & Failures must be detectable & 8 metrics, 5 alerts, 3 dashboards \\
+N6 & Every pipeline stage observable & Failures must be detectable & 10 metrics, 5 alerts, 3 dashboards \\
 \bottomrule
 \end{tabularx}
 \end{table}
@@ -233,13 +233,14 @@ N6 & Every pipeline stage observable & Failures must be detectable & 8 metrics, 
 \subsection{Simulated Clock}
 \label{sec:simclock}
 
-Time is compressed so a full day can be demonstrated in a session:
-\textbf{1 simulated day = 5 real minutes} ($\mathrm{TIME\_SCALE} = 288$). Simulated time
-starts at 2026-01-01 00:00 UTC when the stack starts, so day 1 is partial and 2026-01-02
-is the first complete day. Each of 50 meters in 5 zones emits every 2 real seconds, 150
-readings per simulated day, about 7{,}500 events per day in total. All windowing uses
-simulated time; only latency metrics use the wall clock. A single clock module does the conversion, and every duration in the configuration file
-is labelled as simulated or real, so it is always clear which one is meant.
+A real day would be far too long to demonstrate, so time runs faster:
+\textbf{one simulated day passes in 5 real minutes}, 288 times faster than real time.
+Simulated time starts at 2026-01-01 00:00 UTC when the system starts, so day 1 is partial
+and 2026-01-02 is the first complete day. Each of the 50 meters (in 5 zones) sends a
+reading every 2 real seconds, which is 150 readings per simulated day and about 7{,}500 in
+total. All data is grouped by simulated time; only latency is measured on the real clock.
+One module does the conversion, and every duration in the configuration is labelled as
+simulated or real, so the two are never mixed up.
 
 % =====================================================================
 \section{Architecture Decision: Lambda versus Kappa}
@@ -251,7 +252,7 @@ recomputes exact results from all history, a speed layer that computes approxima
 from recent data, and a serving layer that merges them. \textbf{Kappa} \cite{kreps} runs a
 single streaming path and corrects results by replaying the log through the same code.
 \textbf{We chose Lambda.} Table~\ref{tab:archeval} evaluates both against the four
-criteria in the brief.
+criteria named in the marking rubric: latency, replay, cost and consistency.
 
 \begin{table}[!htbp]
 \centering
@@ -305,10 +306,11 @@ codepaths and can silently diverge; for example, a speed layer ending the first 
 block at 60\,kWh and a batch layer ending it at 61\,kWh would give different bills near
 the boundary. To avoid this, all netting, tariff, rounding, key and
 validation logic lives in one shared module with no I/O (100\% test coverage enforced in CI), used by
-both jobs. The logic exists twice only where it must,
-as plain Python functions for the API and as Spark expressions for the Spark jobs, and a
-consistency test runs both on 5{,}000
-random inputs plus sweeps of every block boundary and asserts identical output to the cent.
+both jobs. The logic has to exist in two forms, because the API
+computes estimates without Spark while the Spark jobs need Spark's own expressions. To prove
+the two forms agree, a consistency test runs both on 5{,}000 random inputs, and on values
+either side of every tariff block boundary, and checks that they give the same bill to the
+cent.
 Divergence in logic is therefore a failing test; divergence in inputs (a stale tariff,
 dropped late readings) is intended and is measured at run time
 (Section~\ref{sec:res-recon}).
@@ -369,8 +371,8 @@ Kappa's single codebase becomes the better trade.
   \draw[arr, dashed, gray] (core) -- (batch);
 \end{tikzpicture}}
 \caption{End-to-end architecture across ingestion, processing, storage and serving.
-Amber is the speed path (process, then store); teal is the batch path (store, then
-process). Both consume the same Kafka topic independently, each with its own checkpointed
+Box colours mark the layer (blue sources, indigo ingestion, pink serving); amber is the
+speed path (process, then store) and teal the batch path (store, then process). Both consume the same Kafka topic independently, each with its own checkpointed
 offsets. The dashed shared billing module is used by both processing layers.}
 \label{fig:lambda}
 \end{figure}
@@ -384,11 +386,10 @@ with \emph{yesterday's} tariff because today's does not exist yet. The \emph{bat
 built when a day's tariff file arrives: the whole day is read, validated, deduplicated,
 joined with that day's tariff and billed, then reconciled against the speed view.
 
-\paragraph{The merge function.} \texttt{GET /api/v1/households/\{id\}/bill?date=D} returns
-the batch bill (\texttt{source="batch"}, \texttt{provisional=false}) if the run ledger
-\texttt{pipeline\_runs} has a successful billing run for \texttt{D}, and otherwise the speed
-estimate (\texttt{source="speed"}, \texttt{provisional=true}), as in
-Figure~\ref{fig:merge}. The batch view always wins because it saw the late readings the
+\paragraph{The merge function.} When a household's bill is requested for a day, the API
+checks the \emph{run ledger}, a table recording every billing run. If the batch layer has
+already billed that day, the API returns the final bill; otherwise it returns the speed
+layer's provisional estimate (Figure~\ref{fig:merge}). The batch view always wins because it saw the late readings the
 speed layer dropped and used the correct tariff. Every response says which view served it
 and which day's tariff priced it.
 
@@ -411,9 +412,10 @@ and the two labelled return paths.}
 \label{fig:merge}
 \end{figure}
 
-\paragraph{Key transformations.} All windowing uses \textbf{event time} with a watermark,
-because readings arrive out of order and arrival-time windows would put them in the wrong
-window. \textbf{Solar netting} runs before tariff evaluation:
+\paragraph{Key transformations.} Readings are grouped into time windows by \textbf{event
+time}, the time the meter took the reading, not the time it arrived, because readings can
+arrive out of order. A \emph{watermark} sets how long the speed layer waits for late
+readings before closing a window. \textbf{Solar netting} runs before tariff evaluation:
 \begin{equation*}
   \mathit{self} = \min(\mathit{solar}, \mathit{consumption}),\quad
   \mathit{import} = \mathit{consumption} - \mathit{self},\quad
@@ -447,7 +449,7 @@ Ingestion & Apache Kafka 3 (KRaft) & A replayable log is a precondition for Lamb
 reads by two consumers give the two-branch fan-out & RabbitMQ; direct DB writes \\
 \addlinespace
 Stream \& batch & Spark 3.5 Structured Streaming and batch & One API for both layers enables
-the shared \texttt{core/} module; native event-time watermarks & Storm; Flink \\
+one shared billing module; native event-time watermarks & Storm; Flink \\
 \addlinespace
 Master dataset & Parquet on S3-compatible object store & Columnar, compressed, immutable;
 partition-pruned full-day rescans; storage separate from compute & HDFS; raw CSV/JSON \\
@@ -470,15 +472,14 @@ Kubernetes \\
 \end{tabularx}
 \end{table}
 
-\paragraph{Kafka.} Kafka is a log, not a queue: reading does not delete, so a speed-layer
-bug can be fixed by resetting the offset, the producer is decoupled from consumer outages,
-and the speed layer and archiver read the same topic independently. Spark tracks these
-offsets in its own checkpoints rather than Kafka consumer groups; we confirmed that killing
-one consumer left the other untouched. Three partitions bound parallelism, and the default
+\paragraph{Kafka.} Kafka \cite{kafka} is a log, not a queue: reading does not delete a
+message. So a speed-layer bug can be fixed by re-reading old messages, the producer keeps
+working when a consumer is down, and the speed layer and archiver read the same topic
+independently; we confirmed that killing one reader left the other untouched. Three partitions bound parallelism, and the default
 seven-day retention is the constraint behind Section~\ref{sec:arch}. RabbitMQ deletes on
 acknowledgement, so it offers neither replay nor independent readers.
 
-\paragraph{Spark.} Because Spark's batch and streaming APIs are the same, one billing module
+\paragraph{Spark.} Because Spark's \cite{spark} batch and streaming APIs are the same, one billing module
 serves both layers, which deals with Lambda's biggest risk directly. Spark
 also supports event-time watermarks natively. Storm has lower latency but no event-time
 windowing and no batch API; since we only need latency in seconds, that advantage did not help us.
@@ -487,21 +488,21 @@ in Python, and Spark already meets the latency target (6.3\,s against 60\,s).
 
 \paragraph{Parquet on object storage.} Lambda needs all raw data kept: if a bill is wrong
 because of a logic error (for example \texttt{>} instead of \texttt{>=} at a block
-boundary), the fix is to correct the code and recompute from raw readings, which is only
-possible if they were kept. Parquet gives column pruning, compression, real types and
+boundary), the fix is to correct the code and recompute from the raw
+readings. Parquet gives column pruning, compression, real types and
 predicate pushdown, and date/hour partitioning lets the daily job read only its own day. We
 use a local S3-compatible store so graders need no cloud account; the code uses only the
 S3 API, so moving to AWS S3 is a configuration change. Because MinIO stopped publishing
-images, the stack runs \texttt{pgsty/silo}, a MinIO-compatible fork (decision D8). HDFS
+images, the stack runs \texttt{pgsty/silo}, a MinIO-compatible fork. HDFS
 was rejected as too heavy at this scale.
 
 \paragraph{PostgreSQL.} Our reads are point lookups by household and date, recent-window
 aggregations by zone, and joins between bills, the run ledger and households: small
 relational results. PostgreSQL gives joins, transactions (a billing run lands completely or
-not at all), \texttt{JSONB} for the block breakdown and idempotent upserts. Cassandra is
-built for write volumes we do not have and cannot join.
+not at all), JSON columns for the block breakdown and safe repeated writes. Cassandra is
+built for write volumes we do not have, and it does not support joins.
 
-\paragraph{Airflow.} Airflow schedules on real time, so ``once per simulated day'' cannot be
+\paragraph{Airflow.} Airflow \cite{airflow} schedules on real time, so ``once per simulated day'' cannot be
 a cron expression. A \texttt{tariff\_watcher} DAG polls the landing zone every real minute
 and triggers \texttt{daily\_billing} once per tariff file, with a run id taken from the file's
 date (\texttt{billing\_\_2026-01-02}), so a repeat is skipped. A restatement is another run
@@ -509,8 +510,8 @@ for the same date (\texttt{billing\_\_2026-01-02\_\_r1}). DAGs only start Spark 
 results; they contain no business logic. Cron has no dependencies, retries, history or
 re-runs.
 
-\paragraph{Prometheus, Alertmanager, Grafana.} Services expose \texttt{/metrics} and
-Prometheus scrapes them; batch containers exit too early to be scraped, so they push to a
+\paragraph{Prometheus, Alertmanager, Grafana.} Services expose their metrics and
+Prometheus \cite{prometheus} collects them every 15 seconds; batch containers exit too early to be scraped, so they push to a
 Pushgateway. Alert rules live in the repository and are unit-tested with
 \texttt{promtool}, and Grafana dashboards are provisioned from files.
 
@@ -577,12 +578,14 @@ household's load and solar for the current simulated time (solar is zero from 18
 The \textbf{reference dropper} writes one tariff CSV (per household: tier, subsidy flag,
 three block rates, fixed charge, export rate, effective date) and one weather CSV per
 simulated day into the object-storage landing zone. Tariff rates change by $\pm$0.50 per
-day, so using yesterday's tariff has a visible effect. Both contracts are Pydantic models
-exported as JSON Schema, and every tariff row is validated before use.
+day, so using yesterday's tariff has a visible effect. The formats of the reading, tariff
+and weather records are fixed as schemas, and every tariff row is validated before use.
 
 To test robustness, the producer deliberately injects faults at configurable rates
 (Appendix A): duplicates, out-of-order events, null fields, negative kWh, unknown
-households and meter dropouts that buffer readings and send them late. Invalid records go
+households, and \emph{meter dropouts}, where a meter loses its connection, stores its
+readings and sends them late once it reconnects. \emph{Reordering} (readings arriving a
+little out of order) is injected separately. Invalid records go
 to the dead-letter topic \texttt{meter.readings.dlq} and the \texttt{rejected\_records}
 table with a reason. With all rates at zero the output equals the input, which a test
 asserts.
@@ -598,17 +601,20 @@ of 14{,}012 rows after a kill, with no missing events; batch deduplication remov
 \paragraph{Speed layer.} A second, independent Spark stream validates each record with
 the shared validation rules, deduplicates, groups readings into 15-simulated-minute
 tumbling windows per zone under a 30-simulated-minute watermark, keeps a running total per
-household, and upserts into PostgreSQL every 10 real seconds using \texttt{foreachBatch} in
-update mode. The provisional bill uses the shared billing logic with yesterday's tariff. Two effects of time compression matter here. First, the 10-second trigger equals 48
-\emph{simulated} minutes, longer than the watermark, so the trigger rather than the
-watermark decides which late readings are dropped (measured in
-Section~\ref{sec:res-recon}). Second, in update mode results are emitted every trigger, so
-the watermark adds no latency; it only controls when old state is discarded.
+household, and writes the results to PostgreSQL in small batches every 10 real seconds
+(the \emph{trigger}). The provisional bill uses the shared billing logic with yesterday's
+tariff.
+
+Time compression has two side effects here. First, 10 real seconds is 48 \emph{simulated}
+minutes, which is longer than the 30-minute watermark; so in practice the batch interval,
+not the watermark, decides which late readings are dropped (measured in
+Section~\ref{sec:res-recon}). Second, results are published after every batch, so the
+watermark does not delay them; it only decides when old windows are closed and forgotten.
 
 \paragraph{Batch layer.} The \texttt{daily\_billing} DAG has eight tasks: wait for the
 tariff; wait 90 real seconds for late data; run the Spark billing job (read the day's
 Parquet, validate, deduplicate, join the tariff, apply the shared netting and tariff
-functions, write bills and a \texttt{success} row in \texttt{pipeline\_runs}); check the row
+functions, write the bills and record the run in the run ledger); check the row
 count and that every bill satisfies the total formula; roll up exact daily zone totals and
 check they equal the household totals; reconcile; and generate the daily report.
 
@@ -681,12 +687,12 @@ dashboard.
 \subsection{Code Quality and Testing}
 
 The code is a typed Python 3.11 package organised by layer (\texttt{simulators},
-\texttt{streaming}, \texttt{batch}, \texttt{storage}, \texttt{api}, shared \texttt{core} and
-\texttt{contracts}). All settings live in one configuration file, validated at start-up.
+\texttt{streaming}, \texttt{batch}, \texttt{storage}, \texttt{api}, and a shared billing module).
+All settings live in one configuration file, validated at start-up.
 There are 281 tests (unit, property-based, consistency and integration), \texttt{promtool}
 tests for the alert rules, and a test that fails if alert thresholds or metric names drift
-from the code. GitHub Actions CI runs linting, type checks, the tests with the 100\%
-\texttt{core/} coverage gate and the alert checks on every push.
+from the code. GitHub Actions runs linting, type checks, the tests (requiring 100\% coverage
+of the shared billing module) and the alert checks on every push.
 
 % =====================================================================
 \section{Observability Design}
@@ -888,6 +894,11 @@ same pattern (final 237.38, difference 2.907\%, all tariff effect).
 \subsection{Speed-versus-Batch Reconciliation}
 \label{sec:res-recon}
 
+For each household, the difference between the speed estimate and the final bill is split
+into two parts: the \emph{tariff effect} (caused by using yesterday's prices) and the
+\emph{data effect} (caused by readings the speed layer missed). Table~\ref{tab:recon} shows
+the averages over all 50 households.
+
 \begin{table}[!htbp]
 \centering
 \caption{Measured split of the divergence, 50 households per day (day 1 is partial).}
@@ -904,15 +915,19 @@ same pattern (final 237.38, difference 2.907\%, all tariff effect).
 \end{tabularx}
 \end{table}
 
-The tariff effect is non-zero for every household and changes sign each day, as the tariff
-alternates up and down. The data effect is non-zero for 10--12 households a day, all
-negative: readings delayed by meter dropouts arrived after the watermark, so the speed layer
-missed them and the batch layer billed them. The mean gap (1.88\%) stays under the 5\%
-\texttt{LambdaDivergenceHigh} threshold (Figure~\ref{fig:obs-shots}a). At the 15-minute
-grain the live view missed 1.16\% of the day's energy, and still 1.00\% with dropouts turned
-off, so most of it is ordinary reordering. We had expected the watermark to absorb
-reordering; the measurement showed otherwise, because the 48-simulated-minute trigger is
-longer than the 30-minute watermark.
+The tariff effect appears for every household and changes sign each day, because the
+tariff goes up and down on alternate days. The data effect appears for only 10--12
+households a day. These are households whose meters dropped out: their stored readings
+arrived after the watermark, so the speed layer missed them but the batch layer billed them.
+
+On the second day the average gap was 1.88\%, well under the 5\% level at which the
+\texttt{LambdaDivergenceHigh} alert fires (Figure~\ref{fig:obs-shots}a).
+
+One result surprised us. In the live 15-minute view, 1.16\% of the day's energy was missing.
+With dropouts turned off it was still 1.00\%, so most of the loss comes from ordinary
+reordering. We had expected the watermark to absorb that. It did not, because at our time
+compression each 10-second batch covers 48 simulated minutes, longer than the 30-minute
+watermark.
 
 \subsection{Observability in Operation}
 \label{sec:res-alerts}
@@ -933,7 +948,7 @@ through Alertmanager's API, and then undone (Table~\ref{tab:alerts}).
 \texttt{LowRenewable\-Contribution} (warning) & Zone renewable ratio below 15\% for 3 windows (the brief's alert) & No fault needed: fired at dusk (19:40 sim) for all zones, cleared at 10:00 sim \\
 \texttt{HighRejectRate} (warning) & Rejects above 5\% of consumed records over 5 min & 15\% null fields injected: fired after 119\,s at 11.6\% (normal about 2\%) \\
 \texttt{BatchSLAMiss} (critical) & No successful billing within 10 real min of day close & Billing DAG paused: fired 21\,s after due; cleared 6\,s after billing resumed \\
-\texttt{LambdaDivergence\-High} (warning) & Mean speed-vs-batch gap above 5\% & Not reached live (the run stalled on memory); fired when the threshold was lowered to 1\% on the observed 1.68\% \\
+\texttt{LambdaDivergence\-High} (warning) & Mean speed-vs-batch gap above 5\% & Not reached live (the run stalled on memory); fired when the threshold was lowered to 1\%, on the 1.68\% gap of the latest reconciled day at that time \\
 \bottomrule
 \end{tabularx}
 \end{table}
@@ -1021,8 +1036,8 @@ same laptop.
 tariff), and the batch layer corrected it about 2.5 minutes after each day closed. The
 restatement drill tested the main reason we rejected Kappa: recomputing a past
 day from Parquet, independent of Kafka retention. Lambda's cost appeared as expected (two
-jobs, an orchestrator, reconciliation), but the shared \texttt{core/} module kept all
-divergence to inputs: no gap came from logic.
+jobs, an orchestrator, reconciliation), but the shared billing module kept all differences
+down to inputs: no gap came from the logic itself.
 
 \paragraph{Limitations.}
 \begin{itemize}
@@ -1045,11 +1060,11 @@ divergence to inputs: no gap came from logic.
         Tracing uses correlation IDs, not distributed spans.
 \end{itemize}
 
-\paragraph{At production scale} we would use Iceberg or Delta Lake over raw Parquet
+\paragraph{Production scale.} We would use Iceberg or Delta Lake over raw Parquet
 (transactions, compaction, time travel), a schema registry with Avro or Protobuf, change data
 capture instead of daily tariff files, replicated Kafka and Spark on Kubernetes, watermarks
 set from measured lateness, and alerts on exporter staleness. PostgreSQL would suit us up to
-roughly millions of aggregate rows per day, after which a columnar store such as ClickHouse
+roughly a few million aggregate rows per day, after which a columnar store such as ClickHouse
 fits better. Iceberg or Kafka tiered storage would also remove the retention constraint that
 decided Section~\ref{sec:arch}, making Kappa the better choice.
 
@@ -1174,8 +1189,8 @@ git clone https://github.com/Malee-Fonseka/voltstream.git && cd voltstream
 
 All three members contributed equally to the project. The work was split by
 implementation phase so that each member owned one part of the pipeline end to end, and
-every change was merged through pull requests reviewed by the others. The architecture
-decision was discussed and agreed by the whole group.
+work was merged into the main branch through pull requests. The architecture decision was
+discussed and agreed by the whole group.
 
 \begin{table}[!htbp]
 \centering
