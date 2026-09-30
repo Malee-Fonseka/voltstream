@@ -126,7 +126,6 @@
 % --- Table of Contents ---
 \clearpage
 \phantomsection
-\addcontentsline{toc}{section}{Contents}
 \tableofcontents
 \clearpage
 
@@ -156,7 +155,7 @@ solar.
 The brief's business question has two halves, \emph{current grid load and renewable
 contribution by zone} and \emph{each household's bill once the daily tariff is applied}.
 They belong to two consumers with opposing requirements (Table~\ref{tab:twoconsumers}),
-and this table drives the architecture decision.
+and most of our architecture decision follows from this table.
 
 \begin{table}[!htbp]
 \centering
@@ -229,7 +228,7 @@ readings per simulated day, about 7{,}500 events per day in total. All windowing
 simulated time; only latency metrics use the wall clock. A single module,
 \texttt{simclock.py}, does the conversion, and every duration in
 \texttt{config/base.yaml} carries a \texttt{\_sim\_minutes} or \texttt{\_real\_seconds}
-suffix so the two can never be confused.
+suffix, so it is always clear which one is meant.
 
 % =====================================================================
 \section{Architecture Decision: Lambda versus Kappa}
@@ -280,12 +279,12 @@ Lambda, decisively \\
 \end{tabularx}
 \end{table}
 
-\paragraph{The rejected alternative.} Kappa is a viable design here. Tariffs would be a
+\paragraph{The rejected alternative.} Kappa would also have worked here. Tariffs would be a
 compacted Kafka topic keyed by household, one Structured Streaming job would join them to
 readings, and corrections would replay from an earlier offset into a new table. Its
-advantages are real: one codebase (so the layers cannot diverge), one job to operate, and
+main advantages are one codebase (so the layers cannot diverge), one job to operate, and
 one mental model. We rejected it for three reasons: (1) restatement must be possible months
-later but retention is days, so its correction mechanism fails exactly when billing needs
+later but retention is days, so its correction mechanism is not available when billing needs
 it; (2) a finance audit trail should not depend on a message-bus retention setting; and
 (3) holding tiered per-household billing state for months is more expensive and fragile
 than a bounded nightly job.
@@ -293,7 +292,7 @@ than a bounded nightly job.
 \paragraph{Lambda's cost and how we contain it.} The same billing logic exists in two
 codepaths and can silently diverge; for example, a speed layer ending the first tariff
 block at 60\,kWh and a batch layer ending it at 61\,kWh would give different bills near
-the boundary. We contain this structurally. All netting, tariff, rounding, key and
+the boundary. To avoid this, all netting, tariff, rounding, key and
 validation logic lives in one pure module, \texttt{voltstream/core/} (no I/O, 100\% test
 coverage enforced in CI), imported by both jobs. The logic exists twice only where it must,
 as scalar \texttt{Decimal} functions for the API and as Spark \texttt{Column} expressions for
@@ -339,8 +338,8 @@ Kappa's single codebase becomes the better trade.
   \node[box] (api) at (14.4,1.2) {\textbf{FastAPI}\\merge function\\\texttt{/api/v1/\dots}};
   \node[box] (rep) at (14.4,-1.2) {\textbf{Daily report}\\Markdown file\\per closed day};
 
-  \node[box, dashed, text width=4.2cm, fill=gray!5] (core) at (7.2,-3.1)
-      {\texttt{voltstream.core}: netting, tariff, validation,\\keys --- pure, imported by both layers};
+  \node[box, dashed, text width=4.2cm, fill=gray!5] (core) at (7.2,-3.8)
+      {\texttt{voltstream.core}: netting, tariff, validation,\\keys (pure, used by both layers)};
 
   \draw[arr] (prod) -- (kafka);
   \draw[arr] (drop) -- (land);
@@ -469,9 +468,9 @@ seven-day retention is the constraint behind Section~\ref{sec:arch}. RabbitMQ de
 acknowledgement, so it offers neither replay nor independent readers.
 
 \paragraph{Spark.} Because Spark's batch and streaming APIs are the same, one billing module
-serves both layers, which removes Lambda's main risk rather than just managing it. Spark
+serves both layers, which deals with Lambda's biggest risk directly. Spark
 also supports event-time watermarks natively. Storm has lower latency but no event-time
-windowing and no batch API; our requirement is seconds, so its advantage does not matter.
+windowing and no batch API; since we only need latency in seconds, that advantage did not help us.
 Flink is a stronger pure streaming engine, but it lacks an equally simple shared batch path
 in Python, and Spark already meets the latency target (6.3\,s against 60\,s).
 
@@ -737,7 +736,7 @@ alert}, so alerts appear in the same log stream.
 \paragraph{Metrics.} Table~\ref{tab:metrics} lists what is measured and why. The latency
 histogram runs from the Kafka record timestamp to the commit of the view the dashboard reads,
 so the latency requirement is measured, not assumed. \texttt{lambda\_divergence} lets the
-system monitor its own architectural weakness. The two \texttt{pg\_} gauges exist because the
+system watch for the main weakness of Lambda, the two layers drifting apart. The two \texttt{pg\_} gauges exist because the
 renewable ratio is 0 every night (so a flat value cannot reveal a dead feed) and only the run
 ledger knows when billing last succeeded.
 
@@ -968,14 +967,14 @@ lost no events and left no offset gaps; the 334 duplicates were removed by batch
 deduplication. Killing the speed layer for 60\,s made the live view 56\,s stale while the
 archiver kept writing (1{,}526 readings); the speed layer caught up 22\,s after restart, the
 previous day's final bill stayed at 237.38, and the day of the crash was billed in full.
-Losing the speed layer costs freshness, not correctness.
+So when the speed layer fails, the live view goes stale for a while, but no bill is affected.
 
 \paragraph{Restating a day.} \texttt{voltstream.ps1 backfill} corrupted the 2026-01-02 tariff
 (block 1 rate $+45.00$), re-billed the day, restored the file and re-billed again. The day's
 total went from 18{,}737.41 to 44{,}876.57 and back to the cent. The ledger shows
 \texttt{superseded}, \texttt{superseded}, \texttt{success}, each with its own Airflow run,
 and \texttt{household\_bill\_history} keeps all three versions. Bills are recomputed from the
-master dataset, never patched.
+master dataset rather than edited in place.
 
 \subsection{Measured Latency}
 \label{sec:res-latency}
@@ -1009,9 +1008,9 @@ same laptop.
 \label{sec:discussion}
 % =====================================================================
 
-\paragraph{Did the decision hold?} Yes. The provisional bill had to be wrong (yesterday's
+\paragraph{Was Lambda the right choice?} We think so. The provisional bill had to be wrong (yesterday's
 tariff), and the batch layer corrected it about 2.5 minutes after each day closed. The
-restatement drill exercised exactly the capability that ruled out Kappa: recomputing a past
+restatement drill tested the main reason we rejected Kappa: recomputing a past
 day from Parquet, independent of Kafka retention. Lambda's cost appeared as expected (two
 jobs, an orchestrator, reconciliation), but the shared \texttt{core/} module kept all
 divergence to inputs: no gap came from logic.
