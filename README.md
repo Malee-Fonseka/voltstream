@@ -8,8 +8,7 @@
 ![Docker Compose](https://img.shields.io/badge/run-docker%20compose-2496ED)
 
 **Real-time grid monitoring and exact daily billing from one smart-meter stream.**
-A Lambda-architecture data platform built for EC8203 Applied Big Data Engineering
-(University of Ruhuna), Use Case 3: *Smart Grid Energy Monitoring & Billing*.
+A Lambda-architecture data platform built for _Smart Grid Energy Monitoring & Billing_.
 
 ![Live grid dashboard](images/screenshots/dashboard.png)
 
@@ -55,7 +54,7 @@ A Lambda architecture serves both from one Kafka stream:
   from the immutable Parquet master dataset, applies that day's tariff and writes the final bill.
 - The **API merges the two**: batch if the day is finalised, otherwise speed, and every
   response says which. The dashboard badge flips from **Provisional** to **Final**.
-- **Reconciliation** explains the gap, split into a *tariff effect* and a *data effect*.
+- **Reconciliation** explains the gap, split into a _tariff effect_ and a _data effect_.
 
 Both layers import one shared billing module (`src/voltstream/core/`), and a consistency
 test proves the pure-Python and Spark versions give identical bills.
@@ -81,25 +80,25 @@ This builds the images, starts all 18 containers and waits for their health chec
 build: several minutes; later starts: about a minute). `.env` is created from
 `.env.example` automatically; nothing needs editing.
 
-| What | URL | Login |
-|---|---|---|
-| **Dashboard** | <http://localhost:8000/> | none |
-| API reference (OpenAPI) | <http://localhost:8000/docs> | none |
-| Grafana | <http://localhost:3000/> | none |
-| Airflow | <http://localhost:8080/> | `admin`; password printed by `.\scripts\voltstream.ps1 status` |
-| Prometheus / Alertmanager | <http://localhost:9090/> / <http://localhost:9093/> | none |
-| MinIO console | <http://localhost:9001/> | `voltstream` / `voltstream-dev` |
+| What                      | URL                                                 | Login                                                          |
+| ------------------------- | --------------------------------------------------- | -------------------------------------------------------------- |
+| **Dashboard**             | <http://localhost:8000/>                            | none                                                           |
+| API reference (OpenAPI)   | <http://localhost:8000/docs>                        | none                                                           |
+| Grafana                   | <http://localhost:3000/>                            | none                                                           |
+| Airflow                   | <http://localhost:8080/>                            | `admin`; password printed by `.\scripts\voltstream.ps1 status` |
+| Prometheus / Alertmanager | <http://localhost:9090/> / <http://localhost:9093/> | none                                                           |
+| MinIO console             | <http://localhost:9001/>                            | `voltstream` / `voltstream-dev`                                |
 
 **What to expect:** live zone data within 20 s; day 1 billed about 8 minutes after start;
 **day 2 (2026-01-02), the first complete day, billed and reconciled after about 13
 minutes**. Then run `.\scripts\voltstream.ps1 check`; it should end with **0 failed**.
 `LowRenewableContribution` firing every simulated night is expected (no sun).
 
-| Windows | Linux / WSL | Effect |
-|---|---|---|
-| `.\scripts\voltstream.ps1 stop` | `make down` | Stop, keep data |
-| `.\scripts\voltstream.ps1 start` | `docker compose --env-file .env -f docker/docker-compose.yml up -d --wait` | Resume on the same clock |
-| `.\scripts\voltstream.ps1 clean` | `make clean` | Delete containers and data |
+| Windows                          | Linux / WSL                                                                | Effect                     |
+| -------------------------------- | -------------------------------------------------------------------------- | -------------------------- |
+| `.\scripts\voltstream.ps1 stop`  | `make down`                                                                | Stop, keep data            |
+| `.\scripts\voltstream.ps1 start` | `docker compose --env-file .env -f docker/docker-compose.yml up -d --wait` | Resume on the same clock   |
+| `.\scripts\voltstream.ps1 clean` | `make clean`                                                               | Delete containers and data |
 
 <details>
 <summary>Windows tips: giving Docker more memory, script permissions</summary>
@@ -114,6 +113,7 @@ memory=10GB
 
 then run `wsl --shutdown` and restart Docker Desktop. If PowerShell refuses to run the
 script: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+
 </details>
 
 ---
@@ -128,8 +128,8 @@ teal means batch layer / final. Every chart has a table view (▦).
 - **Household bills**: one household's bill for one day, from whichever layer can answer,
   with the bill breakdown, energy flow, block tariff, estimate vs final and lineage.
 
-| While the day is open: **Provisional (speed)** | After billing: **Final (batch)** |
-|---|---|
+| While the day is open: **Provisional (speed)**                          | After billing: **Final (batch)**                            |
+| ----------------------------------------------------------------------- | ----------------------------------------------------------- |
 | ![Provisional bill](images/screenshots/dashboard-bills-provisional.png) | ![Final bill](images/screenshots/dashboard-bills-final.png) |
 
 - **Daily report**: everything known about one day: zone totals, rejected records by
@@ -144,30 +144,29 @@ teal means batch layer / final. Every chart has a table view (▦).
 ## 4. Reproduce the results
 
 Each script runs unattended and **undoes its own changes**, even on Ctrl+C. Let at least one
-day be billed first (about 8 minutes after start). Step-by-step walkthroughs, timings and
-what to say in a demo are in [docs/runbook.md](docs/runbook.md).
+day be billed first (about 8 minutes after start).
 
-| Scenario | Windows (`.\scripts\voltstream.ps1 …`) | Linux | Shows | Time |
-|---|---|---|---|---|
-| Provisional → final | `demo` | `make demo` | The merge function flipping a bill from speed to batch | ~7 min |
-| All five alerts | `faults` | `make faults` | Each alert fires under its fault, then clears | ~30 min |
-| One alert | `faults -Scenario stale` (`rejects`, `sla`, `renewable`, `divergence`) | `make faults s=stale` | A single alert | 3–17 min |
-| Crash the speed layer | `killtest` | `make kill-test` | Losing the speed layer costs freshness, never correctness | 7–10 min |
-| Restate a day | `backfill -Date 2026-01-02` | `make backfill d=2026-01-02` | A corrupted tariff fixed by recomputing, with history kept | 6–8 min |
+| Scenario              | Windows (`.\scripts\voltstream.ps1 …`)                                 | Linux                        | Shows                                                      | Time     |
+| --------------------- | ---------------------------------------------------------------------- | ---------------------------- | ---------------------------------------------------------- | -------- |
+| Provisional → final   | `demo`                                                                 | `make demo`                  | The merge function flipping a bill from speed to batch     | ~7 min   |
+| All five alerts       | `faults`                                                               | `make faults`                | Each alert fires under its fault, then clears              | ~30 min  |
+| One alert             | `faults -Scenario stale` (`rejects`, `sla`, `renewable`, `divergence`) | `make faults s=stale`        | A single alert                                             | 3–17 min |
+| Crash the speed layer | `killtest`                                                             | `make kill-test`             | Losing the speed layer costs freshness, never correctness  | 7–10 min |
+| Restate a day         | `backfill -Date 2026-01-02`                                            | `make backfill d=2026-01-02` | A corrupted tariff fixed by recomputing, with history kept | 6–8 min  |
 
-| Alert | Fault | Fires after |
-|---|---|---|
-| `MeterDataStale` (critical) | Meter producer stopped | ~3 min |
-| `HighRejectRate` (warning) | 15% of readings invalid | ~2 min |
-| `BatchSLAMiss` (critical) | Billing DAG paused | 15 min after last billing |
-| `LowRenewableContribution` (warning) | None: every simulated night | at dusk |
-| `LambdaDivergenceHigh` (warning) | 60% of readings very late | 8–13 min (needs ~10 GB) |
+| Alert                                | Fault                       | Fires after               |
+| ------------------------------------ | --------------------------- | ------------------------- |
+| `MeterDataStale` (critical)          | Meter producer stopped      | ~3 min                    |
+| `HighRejectRate` (warning)           | 15% of readings invalid     | ~2 min                    |
+| `BatchSLAMiss` (critical)            | Billing DAG paused          | 15 min after last billing |
+| `LowRenewableContribution` (warning) | None: every simulated night | at dusk                   |
+| `LambdaDivergenceHigh` (warning)     | 60% of readings very late   | 8–13 min (needs ~10 GB)   |
 
-| Grafana: pipeline health | Prometheus: the five rules |
-|---|---|
+| Grafana: pipeline health                                                 | Prometheus: the five rules                                             |
+| ------------------------------------------------------------------------ | ---------------------------------------------------------------------- |
 | ![Pipeline health](images/screenshots/stale-grafana-pipeline-health.png) | ![Prometheus alerts](images/screenshots/rejects-prometheus-alerts.png) |
-| **Alertmanager** | **Grafana: Lambda divergence** |
-| ![Alertmanager](images/screenshots/stale-alertmanager.png) | ![Lambda divergence](images/screenshots/grafana-lambda-divergence.png) |
+| **Alertmanager**                                                         | **Grafana: Lambda divergence**                                         |
+| ![Alertmanager](images/screenshots/stale-alertmanager.png)               | ![Lambda divergence](images/screenshots/grafana-lambda-divergence.png) |
 
 The batch layer in Airflow, `daily_billing`, with all eight tasks green:
 
@@ -202,38 +201,36 @@ push.
 
 ## 6. Troubleshooting
 
-| Symptom | Fix |
-|---|---|
-| Start times out / a service is unhealthy | `.\scripts\voltstream.ps1 status`, then `logs -Service <name>`. Usually Docker has too little memory |
-| Simulated dates far in the future | The clock anchor in `.env` is stale: `clean`, then `run`. Never start with a bare `docker compose up` |
-| After the laptop sleeps, `BatchSLAMiss` fires | Expected (hours asleep are weeks simulated); clears after the next billing run |
-| `check` fails during a billing run | The laptop was briefly overloaded; re-run a minute later |
-| An alert in Grafana is missing in Alertmanager | It is inhibited by another alert; tick *Inhibited* |
-
-More, with causes: [docs/runbook.md](docs/runbook.md) §8.
+| Symptom                                        | Fix                                                                                                   |
+| ---------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Start times out / a service is unhealthy       | `.\scripts\voltstream.ps1 status`, then `logs -Service <name>`. Usually Docker has too little memory  |
+| Simulated dates far in the future              | The clock anchor in `.env` is stale: `clean`, then `run`. Never start with a bare `docker compose up` |
+| After the laptop sleeps, `BatchSLAMiss` fires  | Expected (hours asleep are weeks simulated); clears after the next billing run                        |
+| `check` fails during a billing run             | The laptop was briefly overloaded; re-run a minute later                                              |
+| An alert in Grafana is missing in Alertmanager | It is inhibited by another alert; tick _Inhibited_                                                    |
 
 ---
 
 ## 7. Reference
 
-| Service | Port | Role |
-|---|---|---|
-| `kafka` | 29092 | Event log, 3 partitions, ~7 day retention |
-| `postgres` | 5432 | Serving layer: speed and batch views |
-| `minio` | 9000 / 9001 | Master dataset and landing zone (`pgsty/silo`, a MinIO-compatible fork) |
-| `meter-producer`, `reference-dropper` | — | The two simulated sources |
-| `raw-archiver`, `speed-layer` | 8011, 8012 | Kafka → Parquet; live windows and provisional bills |
-| `api` | 8000 | Serving API, merge function, dashboard |
-| `airflow` (+ `docker-socket-proxy`) | 8080 | Bills each day as its tariff lands |
-| `prometheus`, `alertmanager`, `pushgateway`, `sql-exporter`, `grafana` | 9090, 9093, 9091, —, 3000 | Monitoring and alerting |
+| Service                                                                | Port                      | Role                                                                    |
+| ---------------------------------------------------------------------- | ------------------------- | ----------------------------------------------------------------------- |
+| `kafka`                                                                | 29092                     | Event log, 3 partitions, ~7 day retention                               |
+| `postgres`                                                             | 5432                      | Serving layer: speed and batch views                                    |
+| `minio`                                                                | 9000 / 9001               | Master dataset and landing zone (`pgsty/silo`, a MinIO-compatible fork) |
+| `meter-producer`, `reference-dropper`                                  | —                         | The two simulated sources                                               |
+| `raw-archiver`, `speed-layer`                                          | 8011, 8012                | Kafka → Parquet; live windows and provisional bills                     |
+| `api`                                                                  | 8000                      | Serving API, merge function, dashboard                                  |
+| `airflow` (+ `docker-socket-proxy`)                                    | 8080                      | Bills each day as its tariff lands                                      |
+| `prometheus`, `alertmanager`, `pushgateway`, `sql-exporter`, `grafana` | 9090, 9093, 9091, —, 3000 | Monitoring and alerting                                                 |
 
-| Looking for | Start here |
-|---|---|
-| Shared billing logic / layer agreement test | [src/voltstream/core/](src/voltstream/core/), [test_pure_vs_spark.py](tests/consistency/test_pure_vs_spark.py) |
-| Sources and ingestion | [simulators/](src/voltstream/simulators/), [streaming/](src/voltstream/streaming/) |
-| Batch layer | [batch/](src/voltstream/batch/), [airflow/dags/](airflow/dags/) |
-| Serving and the merge function | [api/routers/households.py](src/voltstream/api/routers/households.py) |
-| Observability | [metrics.py](src/voltstream/metrics.py), [config/prometheus/](config/prometheus/), [config/grafana/](config/grafana/) |
+| Looking for                                 | Start here                                                                                                            |
+| ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| Shared billing logic / layer agreement test | [src/voltstream/core/](src/voltstream/core/), [test_pure_vs_spark.py](tests/consistency/test_pure_vs_spark.py)        |
+| Sources and ingestion                       | [simulators/](src/voltstream/simulators/), [streaming/](src/voltstream/streaming/)                                    |
+| Batch layer                                 | [batch/](src/voltstream/batch/), [airflow/dags/](airflow/dags/)                                                       |
+| Serving and the merge function              | [api/routers/households.py](src/voltstream/api/routers/households.py)                                                 |
+| Observability                               | [metrics.py](src/voltstream/metrics.py), [config/prometheus/](config/prometheus/), [config/grafana/](config/grafana/) |
 
 **Deliberately simplified:** 50 households, single-broker Kafka, single-node Spark, no
 schema registry, secrets in `.env`. Time compression speeds up event time but not processing
