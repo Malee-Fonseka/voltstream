@@ -108,7 +108,7 @@
     \begin{tabular}{rr}
         \large \textbf{EG/2021/4511} & \large \textbf{Fernando S.A.U.} \\
         \large \textbf{EG/2021/4516} & \large \textbf{Fonseka C. M.} \\
-        \large \textbf{EG/2021/4525} & \large \textbf{} \\
+        \large \textbf{EG/2021/4525} & \large \textbf{Bandara S.} \\
     \end{tabular}\\[1cm]
     {\large \textbf{Computer Engineering (CE)}} \\[0.4cm]
 
@@ -512,24 +512,24 @@ the provisional-to-final transition observable from the API itself.
 \label{fig:merge-img}
 \end{figure}
 
-\begin{figure}[H]
-\centering
-\begin{tikzpicture}[node distance=0.5cm and 0.9cm]
-  \node[box, text width=3.0cm] (req) {\texttt{GET /households/\{id\}/bill}\\\texttt{?date=D}};
-  \node[draw, diamond, aspect=2.4, align=center, font=\scriptsize, inner sep=1pt, right=of req] (dec)
-       {successful run for\\$D$ in \texttt{pipeline\_runs}?};
-  \node[bbox, text width=3.6cm, above right=0.1cm and 1.0cm of dec] (b)
-       {\texttt{household\_bill\_daily}\\\texttt{source="batch"}, \texttt{provisional=false}\\tariff of day $D$};
-  \node[sbox, text width=3.6cm, below right=0.1cm and 1.0cm of dec] (s)
-       {\texttt{household\_running\_rt}\\\texttt{source="speed"}, \texttt{provisional=true}\\tariff of day $D-1$};
-  \draw[arr] (req) -- (dec);
-  \draw[barr] (dec.north) |- node[lbl, pos=0.3, left]{yes} (b.west);
-  \draw[sarr] (dec.south) |- node[lbl, pos=0.3, left]{no} (s.west);
-\end{tikzpicture}
-\caption{The merge function as implemented: the finalisation check against the run ledger,
-and the two labelled return paths.}
-\label{fig:merge}
-\end{figure}
+% \begin{figure}[H]
+% \centering
+% \begin{tikzpicture}[node distance=0.5cm and 0.9cm]
+%   \node[box, text width=3.0cm] (req) {\texttt{GET /households/\{id\}/bill}\\\texttt{?date=D}};
+%   \node[draw, diamond, aspect=2.4, align=center, font=\scriptsize, inner sep=1pt, right=of req] (dec)
+%        {successful run for\\$D$ in \texttt{pipeline\_runs}?};
+%   \node[bbox, text width=3.6cm, above right=0.1cm and 1.0cm of dec] (b)
+%        {\texttt{household\_bill\_daily}\\\texttt{source="batch"}, \texttt{provisional=false}\\tariff of day $D$};
+%   \node[sbox, text width=3.6cm, below right=0.1cm and 1.0cm of dec] (s)
+%        {\texttt{household\_running\_rt}\\\texttt{source="speed"}, \texttt{provisional=true}\\tariff of day $D-1$};
+%   \draw[arr] (req) -- (dec);
+%   \draw[barr] (dec.north) |- node[lbl, pos=0.3, left]{yes} (b.west);
+%   \draw[sarr] (dec.south) |- node[lbl, pos=0.3, left]{no} (s.west);
+% \end{tikzpicture}
+% \caption{The merge function as implemented: the finalisation check against the run ledger,
+% and the two labelled return paths.}
+% \label{fig:merge}
+% \end{figure}
 
 \subsection{Domain Modelling Decisions}
 
@@ -1767,16 +1767,38 @@ and Java 17, no Docker): \texttt{make test}; with the coverage gate: \texttt{mak
 \addcontentsline{toc}{section}{Appendix C: Statement of Individual Contributions}
 \section*{Appendix C: Statement of Individual Contributions}
 
+All three members contributed equally to the project. The work was split by
+implementation phase so that each member owned one part of the pipeline end to end, and
+every change was merged through pull requests reviewed by the others. The architecture
+decision was discussed and agreed by the whole group.
+
 \begin{table}[H]
 \centering
 \small
-\begin{tabularx}{\textwidth}{L{3.0cm} L{3.2cm} X}
+\begin{tabularx}{\textwidth}{L{2.4cm} L{2.6cm} X L{1.2cm}}
 \toprule
-\textbf{Registration} & \textbf{Name} & \textbf{Contribution} \\
+\textbf{Registration} & \textbf{Name} & \textbf{Contribution} & \textbf{Share} \\
 \midrule
-EG/2021/4511 & Fernando S.A.U. & \textit{[to be completed by the group]} \\
-EG/2021/4516 & Fonseka C. M.   & \textit{[to be completed by the group]} \\
-EG/2021/4525 & \textit{[name]} & \textit{[to be completed by the group]} \\
+EG/2021/4511 & Fernando S.A.U. &
+Raw archiver and master dataset; speed layer; storage layer and serving API; batch
+billing layer and its Airflow DAGs; merge function and daily report generator; archiver
+restart and batch integration tests; architecture diagrams and this report. &
+33.3\,\% \\
+\addlinespace
+EG/2021/4516 & Fonseka C. M. &
+Project set-up and task plan; architecture design and decision log (Lambda vs Kappa,
+D1--D9); reconciliation; observability stack (Prometheus, Alertmanager, Grafana,
+\texttt{sql-exporter}); fault-injection, demo and restatement scripts; dashboard; CI and
+reproducibility; README, runbook and debugging. &
+33.3\,\% \\
+\addlinespace
+EG/2021/4525 & Bandara S. &
+Cross-cutting modules (configuration, simulated clock, structured logging, metrics
+registry); data contracts and JSON Schema export; infrastructure bring-up (Kafka topics,
+PostgreSQL schema, object-store buckets); the shared \texttt{core/} module (netting,
+tariff, validation, keys) with its property and consistency tests; meter and reference
+simulators with fault injection. &
+33.3\,\% \\
 \bottomrule
 \end{tabularx}
 \end{table}
