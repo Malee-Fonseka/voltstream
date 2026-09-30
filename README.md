@@ -61,9 +61,7 @@ Both layers import one shared billing module (`src/voltstream/core/`), and a con
 test proves the pure-Python and Spark versions give identical bills.
 
 **Simulated time:** one simulated day = **5 real minutes** (288× faster), starting at
-2026-01-01 00:00 when the stack starts. The full design argument is in
-[docs/architecture/00-master-design.md](docs/architecture/00-master-design.md) and the
-report in [docs/report/](docs/report/).
+2026-01-01 00:00 when the stack starts.
 
 ---
 
@@ -231,15 +229,12 @@ More, with causes: [docs/runbook.md](docs/runbook.md) §8.
 
 | Looking for | Start here |
 |---|---|
-| Lambda vs Kappa, and why | [00-master-design.md](docs/architecture/00-master-design.md) |
 | Shared billing logic / layer agreement test | [src/voltstream/core/](src/voltstream/core/), [test_pure_vs_spark.py](tests/consistency/test_pure_vs_spark.py) |
 | Sources and ingestion | [simulators/](src/voltstream/simulators/), [streaming/](src/voltstream/streaming/) |
 | Batch layer | [batch/](src/voltstream/batch/), [airflow/dags/](airflow/dags/) |
 | Serving and the merge function | [api/routers/households.py](src/voltstream/api/routers/households.py) |
-| Observability | [04-observability.md](docs/architecture/04-observability.md) |
-| Assumptions and measured limitations | [docs/assumptions.md](docs/assumptions.md) |
+| Observability | [metrics.py](src/voltstream/metrics.py), [config/prometheus/](config/prometheus/), [config/grafana/](config/grafana/) |
 
 **Deliberately simplified:** 50 households, single-broker Kafka, single-node Spark, no
 schema registry, secrets in `.env`. Time compression speeds up event time but not processing
 time, so the live 15-minute view misses about 1% of energy that the batch layer still bills.
-Details in [docs/assumptions.md](docs/assumptions.md).
