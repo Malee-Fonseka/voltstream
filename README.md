@@ -1,9 +1,32 @@
-# Voltstream
+# ⚡ Voltstream
 
 [![ci](https://github.com/Malee-Fonseka/voltstream/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Malee-Fonseka/voltstream/actions/workflows/ci.yml)
+![Python 3.11](https://img.shields.io/badge/python-3.11-blue)
+![Kafka](https://img.shields.io/badge/Kafka-3.8-black)
+![Spark](https://img.shields.io/badge/Spark-3.5-orange)
+![Airflow](https://img.shields.io/badge/Airflow-3-017CEE)
+![Docker Compose](https://img.shields.io/badge/run-docker%20compose-2496ED)
 
-A Lambda-architecture data platform for smart-grid monitoring and billing, built for
-EC8203 Applied Big Data Engineering.
+**Real-time grid monitoring and exact daily billing from one smart-meter stream.**
+A Lambda-architecture data platform built for EC8203 Applied Big Data Engineering
+(University of Ruhuna), Use Case 3: *Smart Grid Energy Monitoring & Billing*.
+
+![Live grid dashboard](images/screenshots/dashboard.png)
+
+<table>
+<tr>
+<td width="33%"><b>⚡ Live in seconds</b><br>Grid load and solar share per zone, about 6 s behind the meters.</td>
+<td width="33%"><b>🧾 Exact bills, daily</b><br>The batch layer re-bills each closed day from the raw data with that day's tariff.</td>
+<td width="33%"><b>🔔 Watched end to end</b><br>JSON logs, 10 metrics, 5 alert rules and 3 Grafana dashboards.</td>
+</tr>
+</table>
+
+```powershell
+git clone https://github.com/Malee-Fonseka/voltstream.git
+cd voltstream
+.\scripts\voltstream.ps1 run      # Linux / WSL: make up
+# then open http://localhost:8000
+```
 
 ## Contents
 
@@ -32,13 +55,9 @@ questions with opposite needs:
 
 A Lambda architecture serves both from one stream:
 
-```
-                         ┌─→ SPEED LAYER (Spark Streaming) ──→ Postgres: live views  ─┐
- meter simulators ─→ Kafka                                                             ├─→ API (merge) ─→ dashboard
-                         └─→ raw archiver ─→ MinIO (Parquet) ─→ BATCH LAYER ─→ Postgres: final bills ─┘
-                                               ↑                (Airflow + Spark)
- tariff dropper ─── one tariff file per day ───┘
-```
+<p align="center">
+  <img src="images/architecture/lambda-architecture-report.png" alt="Voltstream Lambda architecture" width="900">
+</p>
 
 - The **speed layer** answers in seconds. It is deliberately approximate: it prices bills
   with yesterday's tariff (today's does not exist yet) and drops very late readings.
@@ -223,7 +242,8 @@ Every chart shows exact values on hover, and every chart card has a **table** bu
 
 ### Tab 1 — Live grid (speed layer)
 
-What the grid is doing right now, from the speed layer's 15-minute windows.
+What the grid is doing right now, from the speed layer's 15-minute windows (screenshot at
+the top of this page).
 
 | Element | What it shows |
 |---|---|
@@ -239,6 +259,10 @@ What the grid is doing right now, from the speed layer's 15-minute windows.
 ### Tab 2 — Household bills (the merge function)
 
 One household's bill for one simulated day, from whichever layer can answer.
+
+| While the day is open: **Provisional (speed)** | After the batch layer closes it: **Final (batch)** |
+|---|---|
+| ![Provisional bill](images/screenshots/dashboard-bills-provisional.png) | ![Final bill](images/screenshots/dashboard-bills-final.png) |
 
 | Element | What it shows |
 |---|---|
@@ -256,6 +280,8 @@ One household's bill for one simulated day, from whichever layer can answer.
 ### Tab 3 — Daily report
 
 Everything known about one simulated day, from both layers and the run ledger.
+
+![Daily report](images/screenshots/dashboard-report.png)
 
 | Element | What it shows |
 |---|---|
@@ -355,6 +381,12 @@ alert actually fires in Alertmanager**, then undoes the fault.
 | `BatchSLAMiss` | critical | Billing DAG paused | 15 min after the last billing | `sla` |
 | `LowRenewableContribution` | warning | None: happens every simulated night | at dusk | `renewable` |
 | `LambdaDivergenceHigh` | warning | 60% of readings sent 3–5 simulated hours late | 8–13 min | `divergence` |
+
+| Grafana: pipeline health (5 alerts firing at simulated night) | Prometheus: the five rules and their state |
+|---|---|
+| ![Pipeline health](images/screenshots/stale-grafana-pipeline-health.png) | ![Prometheus alerts](images/screenshots/rejects-prometheus-alerts.png) |
+| **Alertmanager: `LowRenewableContribution` for all five zones** | **Grafana: Lambda divergence (speed estimate vs final bill)** |
+| ![Alertmanager](images/screenshots/stale-alertmanager.png) | ![Lambda divergence](images/screenshots/grafana-lambda-divergence.png) |
 
 **Where to watch any of them:**
 
@@ -515,9 +547,11 @@ In a bill, `"source": "speed", "provisional": true` means an estimate; `"source"
 | Tool | What to open |
 |---|---|
 | **Grafana** | *pipeline health* (throughput, lag, rejects, latency, alerts), *grid operations* (load and renewables by zone), *Lambda divergence* (estimate vs final over time) |
-| **Airflow** | `tariff_watcher` (checks for new tariff files every real minute) and `daily_billing` → Graph: the billing, rollup, reconciliation and report tasks |
+| **Airflow** | `tariff_watcher` (checks for new tariff files every real minute) and `daily_billing` → Graph: the billing, rollup, reconciliation and report tasks (below) |
 | **MinIO console** | `voltstream-raw/meter_readings/sim_date=…/hour=…` (the master dataset), `voltstream-landing/tariff/` (daily tariff files), `voltstream-archive/reports/` (daily report files) |
 | **Prometheus** | `/alerts` for the five rules and their state, `/targets` for what is scraped |
+
+![Airflow daily_billing DAG: all eight tasks green](images/screenshots/airflow-daily-billing.png)
 
 ---
 
