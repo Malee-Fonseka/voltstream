@@ -157,7 +157,7 @@ system.
 
 Supply must match demand continuously, and rooftop solar is generation the utility cannot
 control: cloud over a zone can cut it within a minute, leaving a shortfall that slower
-plant must cover. \emph{Renewable contribution by zone, right now} is therefore an
+power stations must cover. \emph{Renewable contribution by zone, right now} is therefore an
 operational signal that is only useful if it arrives quickly. At the same time, the
 billing department bills the same households from the same readings, combining block
 tariffs, tier-dependent fixed charges, subsidy discounts and net metering of exported
@@ -183,7 +183,7 @@ Question & Grid load and renewable mix by zone & Household bill once daily tarif
 Latency & Seconds & End of simulated day \\
 A 2\% error & Harmless; does not change a ramping decision & Legally actionable \\
 Late data & May be ignored & Must be included \\
-Restatement & Never & Months later, on demand \\
+Restatement (re-billing a past day) & Never & Months later, on demand \\
 Auditability & Not required & Full lineage to source readings \\
 \bottomrule
 \end{tabularx}
@@ -221,9 +221,9 @@ endpoint, the dashboard and a Markdown report file per closed day
 \textbf{ID} & \textbf{Requirement} & \textbf{Rationale} & \textbf{Measured} \\
 \midrule
 N1 & Speed-layer latency below 60\,s & Grid ramping decision window & Mean 6.3\,s; none over 60\,s \\
-N2 & Batch done within 10 real min of day close & Demonstrable in a session & Billing DAG ran in 59\,s \\
-N3 & No data loss on a single-component failure & Kafka retention plus master dataset & 0 lost after killing either Spark job \\
-N4 & Unbounded restatement horizon & Disputes outlast bus retention & Day restated from Parquet \\
+N2 & Batch done within 10 real min of day close & Demonstrable in a session & Billing workflow ran in 59\,s \\
+N3 & No data loss on a single-component failure & Kafka keeps messages for days; a permanent raw copy is kept & 0 lost after killing either Spark job \\
+N4 & Past days can be re-billed at any time & Disputes outlast Kafka's retention & Day re-billed from the raw copy \\
 N5 & Reproducible from a clean clone & Assessment requirement & One command (Appendix B) \\
 N6 & Every pipeline stage observable & Failures must be detectable & 10 metrics, 5 alerts, 3 dashboards \\
 \bottomrule
@@ -241,6 +241,7 @@ reading every 2 real seconds, which is 150 readings per simulated day and about 
 total. All data is grouped by simulated time; only latency is measured on the real clock.
 One module does the conversion, and every duration in the configuration is labelled as
 simulated or real, so the two are never mixed up.
+
 
 % =====================================================================
 \section{Architecture Decision: Lambda versus Kappa}
@@ -265,14 +266,14 @@ criteria named in the marking rubric: latency, replay, cost and consistency.
 \midrule
 Latency &
 The consumers differ by about two orders of magnitude (seconds versus hours). One path
-has to be tuned for one of them: long watermarks and full-day state make the operations
-view late, while tuning for speed makes billing wrong. &
+has to be tuned for one of them: waiting long for late data makes the operations view
+late, while not waiting makes billing wrong. &
 Lambda \\
 \addlinespace
 Replay &
-Billing disputes and tariff corrections can arrive \emph{months} later, but Kafka
-retention is \emph{days}. Kappa's correction mechanism, replay from an old offset, is
-unavailable beyond retention. Lambda's batch layer replays from object storage, which
+Billing disputes and tariff corrections can arrive \emph{months} later, but Kafka's
+\emph{retention} (how long it keeps messages) is \emph{days}. Kappa corrects results by
+re-reading old messages from Kafka, which is impossible once they have expired. Lambda's batch layer replays from object storage, which
 has no limit. &
 Lambda \\
 \addlinespace
@@ -284,7 +285,7 @@ Lambda, narrowly \\
 \addlinespace
 Consistency &
 Billing needs an immutable, auditable record independent of the message bus, with
-lineage back to source readings. Lambda's master dataset provides it; in Kappa the only
+lineage back to source readings. Lambda's \emph{master dataset}, a permanent copy of every raw reading, provides it; in Kappa the only
 ground truth is a log governed by a retention policy. &
 Lambda, decisively \\
 \bottomrule
@@ -292,7 +293,7 @@ Lambda, decisively \\
 \end{table}
 
 \paragraph{The rejected alternative.} Kappa would also have worked here. Tariffs would be a
-compacted Kafka topic keyed by household, one Structured Streaming job would join them to
+Kafka topic that keeps only the latest tariff per household, one Structured Streaming job would join them to
 readings, and corrections would replay from an earlier offset into a new table. Its
 main advantages are one codebase (so the layers cannot diverge), one job to operate, and
 one mental model. We rejected it for three reasons: (1) restatement must be possible months
@@ -305,8 +306,8 @@ than a bounded nightly job.
 codepaths and can silently diverge; for example, a speed layer ending the first tariff
 block at 60\,kWh and a batch layer ending it at 61\,kWh would give different bills near
 the boundary. To avoid this, all netting, tariff, rounding, key and
-validation logic lives in one shared module with no I/O (100\% test coverage enforced in CI), used by
-both jobs. The logic has to exist in two forms, because the API
+validation logic lives in one shared module that does only calculations (every line of it is
+tested automatically), used by both jobs. The logic has to exist in two forms, because the API
 computes estimates without Spark while the Spark jobs need Spark's own expressions. To prove
 the two forms agree, a consistency test runs both on 5{,}000 random inputs, and on values
 either side of every tariff block boundary, and checks that they give the same bill to the
@@ -378,7 +379,7 @@ offsets. The dashed shared billing module is used by both processing layers.}
 \end{figure}
 
 \paragraph{The three views.} The \emph{master dataset} is every raw event, unmodified, as
-Parquet on object storage, partitioned by simulated date and hour. It is never updated in
+Parquet files (a compressed, column-oriented format) on object storage, partitioned by simulated date and hour. It is never updated in
 place, and the archiver does no filtering, so any bug can be fixed by recomputing from it.
 The \emph{speed view} holds 15-simulated-minute event-time windows per zone (consumption,
 solar, renewable ratio, active meters) and a running provisional bill per household, priced
@@ -423,8 +424,8 @@ readings before closing a window. \textbf{Solar netting} runs before tariff eval
 \end{equation*}
 and $\mathit{total} = \mathit{energy\_charge} + \mathit{fixed\_charge} -
 \mathit{subsidy} - \mathit{export\_credit}$, where the energy charge prices the import block
-by block and money is rounded half-up to 2 decimals identically in both layers. Kafka is
-at-least-once, so both layers \textbf{deduplicate} on $(\mathit{meter\_id},
+by block and money is rounded half-up to 2 decimals identically in both layers. Kafka may
+deliver the same reading twice, so both layers \textbf{deduplicate} on $(\mathit{meter\_id},
 \mathit{event\_ts})$, defined once in the shared module. The Kafka message key is
 \texttt{household\_id}, which keeps each household's readings ordered within a partition.
 
@@ -503,7 +504,7 @@ not at all), JSON columns for the block breakdown and safe repeated writes. Cass
 built for write volumes we do not have, and it does not support joins.
 
 \paragraph{Airflow.} Airflow \cite{airflow} schedules on real time, so ``once per simulated day'' cannot be
-a cron expression. A \texttt{tariff\_watcher} DAG polls the landing zone every real minute
+a cron expression. A \texttt{tariff\_watcher} DAG (an Airflow workflow) polls the landing zone every real minute
 and triggers \texttt{daily\_billing} once per tariff file, with a run id taken from the file's
 date (\texttt{billing\_\_2026-01-02}), so a repeat is skipped. A restatement is another run
 for the same date (\texttt{billing\_\_2026-01-02\_\_r1}). DAGs only start Spark containers and verify
@@ -511,7 +512,7 @@ results; they contain no business logic. Cron has no dependencies, retries, hist
 re-runs.
 
 \paragraph{Prometheus, Alertmanager, Grafana.} Services expose their metrics and
-Prometheus \cite{prometheus} collects them every 15 seconds; batch containers exit too early to be scraped, so they push to a
+Prometheus \cite{prometheus} collects (\emph{scrapes}) them every 15 seconds; batch containers exit too early to be scraped, so they push to a
 Pushgateway. Alert rules live in the repository and are unit-tested with
 \texttt{promtool}, and Grafana dashboards are provisioned from files.
 
@@ -986,7 +987,7 @@ dead-letter messages exactly, and one \texttt{trace\_id} was found in both.
 \label{sec:res-resilience}
 \label{sec:res-restate}
 
-\paragraph{Crashing each path.} Killing the raw archiver (\texttt{SIGKILL}, 20\,s outage)
+\paragraph{Crashing each path.} Killing the raw archiver abruptly (\texttt{SIGKILL}, 20\,s outage)
 lost no events and left no offset gaps; the 334 duplicates were removed by batch
 deduplication. Killing the speed layer for 60\,s made the live view 56\,s stale while the
 archiver kept writing (1{,}526 readings); the speed layer caught up 22\,s after restart, the
@@ -1006,7 +1007,7 @@ master dataset rather than edited in place.
 \begin{table}[!htbp]
 \centering
 \caption{End-to-end latency over 20 minutes of normal running (including billing runs and a
-producer outage); API reads timed with 40 requests each.}
+producer outage); API reads timed with 40 requests each. p50 and p95 are the times that 50\% and 95\% of readings stayed under.}
 \label{tab:latency}
 \small
 \begin{tabularx}{\textwidth}{L{4.8cm} L{2.6cm} X}
@@ -1016,7 +1017,7 @@ producer outage); API reads timed with 40 requests each.}
 Kafka $\rightarrow$ zone view (speed) & about 40\,s & mean \textbf{6.3\,s}, p50 5.1\,s, p95 14.3\,s; none of about 2{,}300 over 60\,s \\
 Kafka $\rightarrow$ Parquet (archiver) & - & mean 3.0\,s, p50 1.0\,s, p95 13.3\,s \\
 Trigger wait & about 10\,s & 0--10\,s, 5\,s on average: the main term \\
-Watermark wait & about 30\,s & 0\,s in update mode (our estimate was wrong) \\
+Watermark wait & about 30\,s & 0\,s, because results are published every batch (our estimate was wrong) \\
 API reads (zones, bill) & 20--50\,ms & p50 14.7\,ms and 8.7\,ms \\
 \bottomrule
 \end{tabularx}
