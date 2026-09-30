@@ -23,7 +23,7 @@
 \usepackage{caption}
 \usepackage{amsmath}
 \usepackage{tikz}
-\usetikzlibrary{positioning,arrows.meta,shapes.geometric,fit,backgrounds,calc}
+\usetikzlibrary{positioning,arrows.meta,shapes.geometric,fit,backgrounds,calc,shadows}
 
 % ---- Formatting ----
 \setstretch{1.12}
@@ -66,17 +66,30 @@
 \definecolor{batchc}{HTML}{0F766E}
 \definecolor{infrac}{HTML}{475569}
 \definecolor{obsc}{HTML}{7C3AED}
+\definecolor{srcc}{HTML}{2563EB}   % sources: blue
+\definecolor{ingc}{HTML}{4F46E5}   % ingestion: indigo
+\definecolor{servc}{HTML}{DB2777}  % serving: pink
+\definecolor{figbg}{HTML}{DDE6F3}  % shared figure background
+\definecolor{figframe}{HTML}{94A3B8}
 \tikzset{
-  box/.style={draw, rounded corners=2pt, align=center, font=\scriptsize,
-              minimum height=0.95cm, text width=2.6cm, fill=white, line width=0.6pt},
-  sbox/.style={box, draw=speedc, fill=speedc!8},
-  bbox/.style={box, draw=batchc, fill=batchc!8},
-  ibox/.style={box, draw=infrac, fill=infrac!6},
-  obox/.style={box, draw=obsc, fill=obsc!7},
+  every picture/.append style={
+    show background rectangle,
+    inner frame xsep=10pt, inner frame ysep=8pt,
+    background rectangle/.style={fill=figbg, draw=figframe, rounded corners=6pt, line width=0.6pt}},
+  box/.style={draw, rounded corners=3pt, align=center, font=\scriptsize,
+              minimum height=0.95cm, text width=2.6cm, fill=white, line width=0.8pt,
+              drop shadow={opacity=0.18, shadow xshift=0.6pt, shadow yshift=-0.6pt}},
+  sbox/.style={box, draw=speedc, fill=speedc!16},
+  bbox/.style={box, draw=batchc, fill=batchc!16},
+  ibox/.style={box, draw=infrac, fill=infrac!12},
+  obox/.style={box, draw=obsc, fill=obsc!14},
+  srcbox/.style={box, draw=srcc, fill=srcc!14},
+  ingbox/.style={box, draw=ingc, fill=ingc!13},
+  servbox/.style={box, draw=servc, fill=servc!12},
   arr/.style={-{Stealth[length=2.2mm]}, line width=0.6pt},
   sarr/.style={arr, draw=speedc},
   barr/.style={arr, draw=batchc},
-  lbl/.style={font=\tiny, fill=white, inner sep=1pt},
+  lbl/.style={font=\tiny, fill=figbg, inner sep=1pt},
 }
 
 % ---- Screenshots ----
@@ -319,12 +332,12 @@ Kappa's single codebase becomes the better trade.
   \foreach \x/\t in {0/Sources, 3.6/Ingestion, 7.2/Processing, 10.8/Storage, 14.4/Serving}
     \node[font=\footnotesize\bfseries, text=infrac] at (\x,5.4) {\t};
 
-  \node[ibox] (prod) at (0,2.3) {\textbf{Meter producer}\\50 meters, 1 reading\\per 2 real s, faults};
-  \node[ibox] (drop) at (0,-1.2) {\textbf{Reference dropper}\\tariff + weather CSV\\once per sim day};
+  \node[srcbox] (prod) at (0,2.3) {\textbf{Meter producer}\\50 meters, 1 reading\\per 2 real s, faults};
+  \node[srcbox] (drop) at (0,-1.2) {\textbf{Reference dropper}\\tariff + weather CSV\\once per sim day};
 
-  \node[ibox] (dlq) at (3.6,4.45) {\texttt{meter.readings.dlq}\\dead letters};
-  \node[ibox] (kafka) at (3.6,2.3) {\textbf{Kafka (KRaft)}\\\texttt{meter.readings}\\3 partitions};
-  \node[ibox] (land) at (3.6,-1.2) {\textbf{Landing zone}\\object store\\daily CSV files};
+  \node[ingbox] (dlq) at (3.6,4.45) {\texttt{meter.readings.dlq}\\dead letters};
+  \node[ingbox] (kafka) at (3.6,2.3) {\textbf{Kafka (KRaft)}\\\texttt{meter.readings}\\3 partitions};
+  \node[ingbox] (land) at (3.6,-1.2) {\textbf{Landing zone}\\object store\\daily CSV files};
 
   \node[sbox] (speed) at (7.2,3.4) {\textbf{Speed layer}\\Spark Streaming\\validate, dedup,\\15-min windows};
   \node[bbox] (arch) at (7.2,1.2) {\textbf{Raw archiver}\\Spark Streaming,\\no transformation};
@@ -334,11 +347,11 @@ Kappa's single codebase becomes the better trade.
   \node[bbox] (master) at (10.8,1.2) {\textbf{Master dataset}\\Parquet on\\object store,\\by sim date / hour};
   \node[bbox] (pgb) at (10.8,-1.2) {\textbf{PostgreSQL}\\batch views, bills,\\run ledger};
 
-  \node[box] (dash) at (14.4,3.4) {\textbf{Dashboard}\\live grid, bills,\\daily report};
-  \node[box] (api) at (14.4,1.2) {\textbf{FastAPI}\\merge function\\\texttt{/api/v1/\dots}};
-  \node[box] (rep) at (14.4,-1.2) {\textbf{Daily report}\\Markdown file\\per closed day};
+  \node[servbox] (dash) at (14.4,3.4) {\textbf{Dashboard}\\live grid, bills,\\daily report};
+  \node[servbox] (api) at (14.4,1.2) {\textbf{FastAPI}\\merge function\\\texttt{/api/v1/\dots}};
+  \node[servbox] (rep) at (14.4,-1.2) {\textbf{Daily report}\\Markdown file\\per closed day};
 
-  \node[box, dashed, text width=4.2cm, fill=gray!5] (core) at (7.2,-3.8)
+  \node[box, dashed, text width=4.2cm, fill=yellow!12] (core) at (7.2,-3.8)
       {\texttt{voltstream.core}: netting, tariff, validation,\\keys (pure, used by both layers)};
 
   \draw[arr] (prod) -- (kafka);
@@ -384,8 +397,8 @@ and which day's tariff priced it.
 \begin{figure}[H]
 \centering
 \begin{tikzpicture}[node distance=0.5cm and 0.9cm]
-  \node[box, text width=3.0cm] (req) {\texttt{GET /households/\{id\}/bill}\\\texttt{?date=D}};
-  \node[draw, diamond, aspect=2.4, align=center, font=\scriptsize, inner sep=1pt, right=of req] (dec)
+  \node[servbox, text width=3.0cm] (req) {\texttt{GET /households/\{id\}/bill}\\\texttt{?date=D}};
+  \node[draw, diamond, fill=yellow!15, line width=0.8pt, aspect=2.4, align=center, font=\scriptsize, inner sep=1pt, right=of req] (dec)
        {successful run for\\$D$ in \texttt{pipeline\_runs}?};
   \node[bbox, text width=3.6cm, above right=0.1cm and 1.0cm of dec] (b)
        {\texttt{household\_bill\_daily}\\\texttt{source="batch"}, \texttt{provisional=false}\\tariff of day $D$};
@@ -521,7 +534,7 @@ the README asks for at least 8\,GB for Docker.
 \resizebox{\textwidth}{!}{%
 \begin{tikzpicture}[
   c/.style={draw, rounded corners=2pt, font=\scriptsize, align=center, minimum height=0.7cm,
-            text width=1.75cm, fill=white}]
+            text width=1.75cm, fill=infrac!8, line width=0.7pt}]
   \foreach \y/\t in {0/{Tier 1\\infrastructure}, -1.2/{Tier 2\\bootstrap, run once}, -2.4/{Tier 3\\application}, -3.6/{Tier 4\\orchestration, observability}}
     \node[font=\scriptsize\bfseries, align=right, anchor=east, text width=2.4cm] at (0.3,\y) {\t};
   \node[c] at (1.4,0) {kafka};
@@ -530,18 +543,18 @@ the README asks for at least 8\,GB for Docker.
   \node[c] at (1.4,-1.2) {kafka-init};
   \node[c] at (3.5,-1.2) {postgres-init};
   \node[c] at (5.6,-1.2) {minio-init};
-  \node[c, draw=infrac] at (1.4,-2.4) {meter-producer};
-  \node[c, draw=infrac] at (3.5,-2.4) {reference-dropper};
-  \node[c, draw=batchc] at (5.6,-2.4) {raw-archiver};
-  \node[c, draw=speedc] at (7.7,-2.4) {speed-layer};
+  \node[c, draw=infrac, fill=infrac!14] at (1.4,-2.4) {meter-producer};
+  \node[c, draw=infrac, fill=infrac!14] at (3.5,-2.4) {reference-dropper};
+  \node[c, draw=batchc, fill=batchc!14] at (5.6,-2.4) {raw-archiver};
+  \node[c, draw=speedc, fill=speedc!14] at (7.7,-2.4) {speed-layer};
   \node[c] at (9.8,-2.4) {api + dashboard};
-  \node[c, draw=batchc] at (1.4,-3.6) {airflow};
+  \node[c, draw=batchc, fill=batchc!14] at (1.4,-3.6) {airflow};
   \node[c] at (3.5,-3.6) {socket-proxy};
-  \node[c, draw=obsc] at (5.6,-3.6) {prometheus};
-  \node[c, draw=obsc] at (7.7,-3.6) {alertmanager};
-  \node[c, draw=obsc] at (9.8,-3.6) {pushgateway};
-  \node[c, draw=obsc] at (11.9,-3.6) {sql-exporter};
-  \node[c, draw=obsc] at (14.0,-3.6) {grafana};
+  \node[c, draw=obsc, fill=obsc!14] at (5.6,-3.6) {prometheus};
+  \node[c, draw=obsc, fill=obsc!14] at (7.7,-3.6) {alertmanager};
+  \node[c, draw=obsc, fill=obsc!14] at (9.8,-3.6) {pushgateway};
+  \node[c, draw=obsc, fill=obsc!14] at (11.9,-3.6) {sql-exporter};
+  \node[c, draw=obsc, fill=obsc!14] at (14.0,-3.6) {grafana};
   \node[c, dashed, text width=3.6cm] at (10.8,-0.6) {Spark batch containers,\\started per task by Airflow};
   \draw[-{Stealth[length=2mm]}, infrac, line width=0.8pt] (15.3,0.2) -- node[right, font=\tiny, align=left]{start\\order,\\health-\\gated} (15.3,-3.8);
 \end{tikzpicture}}
@@ -690,10 +703,10 @@ where it is stuck. Figure~\ref{fig:observability} shows how each stage is instru
 \centering
 \resizebox{0.8\textwidth}{!}{%
 \begin{tikzpicture}[node distance=0.35cm and 1.0cm]
-  \node[ibox] (prod) {meter-producer};
+  \node[srcbox] (prod) {meter-producer};
   \node[sbox, below=of prod] (speed) {speed-layer};
   \node[bbox, below=of speed] (arch) {raw-archiver};
-  \node[ibox, below=of arch] (api) {api};
+  \node[servbox, below=of arch] (api) {api};
   \node[bbox, below=of api] (bat) {batch containers\\(billing, rollup, reconcile)};
   \node[ibox, below=of bat] (pg) {PostgreSQL};
 
@@ -702,7 +715,7 @@ where it is stuck. Figure~\ref{fig:observability} shows how each stage is instru
   \node[obox, right=3.6cm of arch] (prom) {\textbf{Prometheus}\\scrape 15\,s\\5 alert rules};
   \node[obox, right=of prom] (am) {\textbf{Alertmanager}\\route, group, inhibit};
   \node[obox, above=of am] (graf) {\textbf{Grafana}\\3 dashboards};
-  \node[ibox, below=of am] (hook) {API webhook\\$\rightarrow$ JSON log line\\\texttt{stage: alert}};
+  \node[servbox, below=of am] (hook) {API webhook\\$\rightarrow$ JSON log line\\\texttt{stage: alert}};
 
   \foreach \n in {prod,speed,arch,api} \draw[arr, obsc] (\n.east) -- (prom.west);
   \draw[arr, obsc] (bat.east) -| node[lbl, pos=0.2, above]{push on exit} (pgw.south);
