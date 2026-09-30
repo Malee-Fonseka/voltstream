@@ -62,6 +62,41 @@ test proves the pure-Python and Spark versions give identical bills.
 **Simulated time:** one simulated day = **5 real minutes** (288× faster), starting at
 2026-01-01 00:00 when the stack starts.
 
+### Data flow, top to bottom
+
+The same pipeline drawn as a vertical flow, from the two sources down to the dashboard and
+daily report. (The speed layer's watermark is 30 *simulated* minutes, about 6 real seconds.)
+
+<p align="center">
+  <img src="images/architecture/lambda-architecture.png" alt="Voltstream data flow" width="560">
+</p>
+
+### The merge function
+
+Every bill request goes through one decision: has the batch layer finished this day?
+
+<p align="center">
+  <img src="images/architecture/merge-decision.png" alt="Merge decision" width="640">
+</p>
+
+### One simulated day
+
+The speed path runs continuously; at simulated midnight the batch path picks up the day's
+tariff, bills the closed day, and the merge switches it from provisional to final.
+
+<p align="center">
+  <img src="images/architecture/timeline.png" alt="Timeline of one simulated day" width="820">
+</p>
+
+### Deployment
+
+Containers start in four health-gated tiers under Docker Compose. Tier 4 also runs the
+Pushgateway, `sql-exporter` and a Docker socket proxy (18 containers in all).
+
+<p align="center">
+  <img src="images/architecture/deployment.png" alt="Deployment tiers" width="720">
+</p>
+
 ---
 
 ## 2. Quick start
