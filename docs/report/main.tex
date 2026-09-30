@@ -313,7 +313,7 @@ Kappa's single codebase becomes the better trade.
 \label{sec:solution}
 % =====================================================================
 
-\begin{figure}[!htbp]
+\begin{figure}[H]
 \centering
 \resizebox{\textwidth}{!}{%
 \begin{tikzpicture}
@@ -382,7 +382,7 @@ Figure~\ref{fig:merge}. The batch view always wins because it saw the late readi
 speed layer dropped and used the correct tariff. Every response says which view served it
 and which day's tariff priced it.
 
-\begin{figure}[!htbp]
+\begin{figure}[H]
 \centering
 \begin{tikzpicture}[node distance=0.5cm and 0.9cm]
   \node[box, text width=3.0cm] (req) {\texttt{GET /households/\{id\}/bill}\\\texttt{?date=D}};
@@ -517,7 +517,7 @@ Eighteen containers run in four health-gated tiers under Docker Compose
 create topics, schema and buckets, then exit. The stack uses 5.3--6.4\,GiB of memory, so
 the README asks for at least 8\,GB for Docker.
 
-\begin{figure}[!htbp]
+\begin{figure}[H]
 \centering
 \resizebox{\textwidth}{!}{%
 \begin{tikzpicture}[
@@ -608,7 +608,7 @@ batch bill is split into a \emph{tariff effect} (the speed layer's kWh priced at
 tariff, minus its estimate) and a \emph{data effect} (the batch bill minus that figure, i.e.\
 readings the speed layer missed). The two always add up to the total gap.
 
-\begin{figure}[!htbp]
+\begin{figure}[H]
 \centering
 \resizebox{\textwidth}{!}{%
 \begin{tikzpicture}[x=1.45cm]
@@ -687,7 +687,7 @@ from the code. GitHub Actions CI runs linting, type checks, the tests with the 1
 Observability should tell an operator whether data is flowing, whether it is correct, and
 where it is stuck. Figure~\ref{fig:observability} shows how each stage is instrumented.
 
-\begin{figure}[!htbp]
+\begin{figure}[H]
 \centering
 \resizebox{0.8\textwidth}{!}{%
 \begin{tikzpicture}[node distance=0.35cm and 1.0cm]
@@ -799,7 +799,7 @@ every 5 seconds and shows load, solar, renewable share and active meters per zon
 share drops to 0\% every simulated night, which is when \texttt{LowRenewableContribution}
 fires.
 
-\begin{figure}[!htbp]
+\begin{figure}[H]
 \centering
 \shot{dashboard}{Dashboard, Live grid tab}{6cm}
 \caption{Live grid (speed layer): current grid load and renewable contribution by zone.}
@@ -818,7 +818,7 @@ speed-vs-batch divergence and the run ledger. The same content is served by
 \texttt{/api/v1/reports/daily} and shown in the dashboard's Daily report tab
 (Figure~\ref{fig:report}).
 
-\begin{figure}[!htbp]
+\begin{figure}[H]
 \centering
 \begin{subfigure}{0.49\textwidth}
   \centering
@@ -861,7 +861,7 @@ The final bill was 6.72 (2.869\%) above the day-close estimate, almost all of it
 the 2026-01-02 tariff was higher than the one the speed layer used. A repeat run gave the
 same pattern (final 237.38, difference 2.907\%, all tariff effect).
 
-\begin{figure}[!htbp]
+\begin{figure}[H]
 \centering
 \begin{subfigure}{0.49\textwidth}
   \centering
@@ -933,7 +933,7 @@ through Alertmanager's API, and then undone (Table~\ref{tab:alerts}).
 Rejected records keep their identity: 53 rows in \texttt{rejected\_records} matched 53
 dead-letter messages exactly, and one \texttt{trace\_id} was found in both.
 
-\begin{figure}[!htbp]
+\begin{figure}[H]
 \centering
 \begin{subfigure}{0.49\textwidth}
   \centering
