@@ -148,27 +148,28 @@
 
 \subsection{Scope and Domain Problem}
 
-This report documents \textbf{voltstream}, an end-to-end data platform for Use Case 3 of
-the brief, \emph{Smart Grid Energy Monitoring and Billing}. It ingests continuous
-smart-meter readings and a once-daily tariff file, and serves a live zone dashboard and a
-daily per-household billing report. It is built on a \textbf{Lambda architecture}
-(Section~\ref{sec:arch}). Every number in the Results section was measured on the running
-system.
+This report describes \textbf{voltstream}, the data platform we built for Use Case 3 of the
+brief, \emph{Smart Grid Energy Monitoring and Billing}. The platform takes in a continuous
+stream of smart-meter readings and one tariff file per day, and produces two outputs: a live
+dashboard showing the grid by zone, and a daily bill for each household. It uses a
+\textbf{Lambda architecture}, for the reasons given in Section~\ref{sec:arch}. All the
+figures in the Results section were measured on the running system.
 
-Supply must match demand continuously, and rooftop solar is generation the utility cannot
-control: cloud over a zone can cut it within a minute, leaving a shortfall that slower
-power stations must cover. \emph{Renewable contribution by zone, right now} is therefore an
-operational signal that is only useful if it arrives quickly. At the same time, the
-billing department bills the same households from the same readings, combining block
-tariffs, tier-dependent fixed charges, subsidy discounts and net metering of exported
-solar.
+A power grid must balance supply and demand at every moment. Rooftop solar makes this
+harder, because the utility cannot control it: when a cloud passes over a zone, solar output
+can drop within a minute, and slower power stations have to make up the difference. Knowing
+the \emph{renewable contribution of each zone right now} is therefore only useful if the
+information arrives quickly. At the same time, the billing department has to bill the same
+households from the same readings. A bill combines block tariffs, a fixed charge that
+depends on the household's tier, subsidy discounts, and a credit for solar energy exported
+to the grid.
 
 \subsection{Interpreted Business Requirements}
 
-The brief's business question has two halves, \emph{current grid load and renewable
-contribution by zone} and \emph{each household's bill once the daily tariff is applied}.
-They belong to two consumers with opposing requirements (Table~\ref{tab:twoconsumers}),
-and most of our architecture decision follows from this table.
+The business question in the brief has two parts: \emph{what is the grid load and renewable
+contribution in each zone right now}, and \emph{what will each household's bill be once the
+daily tariff is applied}. These two parts serve two different users whose needs conflict
+(Table~\ref{tab:twoconsumers}), and this conflict drives most of our architecture decision.
 
 \begin{table}[!htbp]
 \centering
@@ -181,34 +182,35 @@ and most of our architecture decision follows from this table.
 \midrule
 Question & Grid load and renewable mix by zone & Household bill once daily tariff is applied \\
 Latency & Seconds & End of simulated day \\
-A 2\% error & Harmless; does not change a ramping decision & Legally actionable \\
+A 2\% error & Harmless; operators would act the same way & Legally actionable \\
 Late data & May be ignored & Must be included \\
 Restatement (re-billing a past day) & Never & Months later, on demand \\
-Auditability & Not required & Full lineage to source readings \\
+Auditability & Not required & Every bill must be traceable to its readings \\
 \bottomrule
 \end{tabularx}
 \end{table}
 
-The phrase \emph{once daily tariff data is applied} means the bill depends on data that
-does not exist until the day closes. That is a property of the business process, so no
-streaming technique removes it. The brief's suggested outputs map onto delivered
-components as follows: the real-time API is \texttt{GET /api/v1/zones/load} and the
-dashboard's Live grid (Section~\ref{sec:res-live}); the low-renewable alert is the
-\texttt{LowRenewableContribution} rule, plus four pipeline-health rules
-(Section~\ref{sec:alerts}); the daily billing and solar report is served by the merge
-endpoint, the dashboard and a Markdown report file per closed day
-(Section~\ref{sec:res-report}).
+The words \emph{once the daily tariff is applied} mean that the final bill depends on data
+that does not exist until the day has ended. This is part of the business process, so no
+streaming technique can avoid it. The outputs suggested in the brief map onto our system as
+follows. Real-time grid load by zone is served by the API endpoint
+\texttt{GET /api/v1/zones/load} and shown on the dashboard's Live grid
+(Section~\ref{sec:res-live}). The low-renewable alert is the
+\texttt{LowRenewableContribution} rule, supported by four further rules that watch the
+health of the pipeline (Section~\ref{sec:alerts}). The daily billing and solar report is
+available through the API, on the dashboard, and as a Markdown file written for every closed
+day (Section~\ref{sec:res-report}).
 
 \subsection{Functional and Non-Functional Requirements}
 
 \begin{enumerate}[label=\textbf{F\arabic*.},leftmargin=2.2em]
   \item Ingest continuous meter readings, and one tariff file (plus a weather file) per
         simulated day.
-  \item Retain every raw event immutably for reprocessing.
-  \item Compute per-zone load and renewable contribution over event-time windows.
+  \item Keep every raw reading permanently and unchanged, so it can be processed again.
+  \item Calculate each zone's load and renewable contribution over short time windows.
   \item Compute per-household daily bills with solar netting, block tariffs, fixed
         charges, subsidy and export credit.
-  \item Serve a live dashboard, a daily report and threshold-based alerts.
+  \item Provide a live dashboard, a daily report, and alerts when values cross a threshold.
 \end{enumerate}
 
 \begin{table}[!htbp]
@@ -220,8 +222,8 @@ endpoint, the dashboard and a Markdown report file per closed day
 \toprule
 \textbf{ID} & \textbf{Requirement} & \textbf{Rationale} & \textbf{Measured} \\
 \midrule
-N1 & Speed-layer latency below 60\,s & Grid ramping decision window & Mean 6.3\,s; none over 60\,s \\
-N2 & Batch done within 10 real min of day close & Demonstrable in a session & Billing workflow ran in 59\,s \\
+N1 & Speed-layer latency below 60\,s & Operators must react within a minute & Mean 6.3\,s; none over 60\,s \\
+N2 & Batch done within 10 real min of day close & Must fit in a live demonstration & Billing workflow ran in 59\,s \\
 N3 & No data loss on a single-component failure & Kafka keeps messages for days; a permanent raw copy is kept & 0 lost after killing either Spark job \\
 N4 & Past days can be re-billed at any time & Disputes outlast Kafka's retention & Day re-billed from the raw copy \\
 N5 & Reproducible from a clean clone & Assessment requirement & One command (Appendix B) \\
@@ -233,14 +235,15 @@ N6 & Every pipeline stage observable & Failures must be detectable & 10 metrics,
 \subsection{Simulated Clock}
 \label{sec:simclock}
 
-A real day would be far too long to demonstrate, so time runs faster:
-\textbf{one simulated day passes in 5 real minutes}, 288 times faster than real time.
-Simulated time starts at 2026-01-01 00:00 UTC when the system starts, so day 1 is partial
-and 2026-01-02 is the first complete day. Each of the 50 meters (in 5 zones) sends a
-reading every 2 real seconds, which is 150 readings per simulated day and about 7{,}500 in
-total. All data is grouped by simulated time; only latency is measured on the real clock.
-One module does the conversion, and every duration in the configuration is labelled as
-simulated or real, so the two are never mixed up.
+Demonstrating a full real day would take far too long, so the system runs on a faster clock:
+\textbf{one simulated day passes in 5 real minutes}, which is 288 times faster than real
+time. Simulated time starts at 2026-01-01 00:00 UTC when the system starts, so the first day
+is incomplete and 2026-01-02 is the first full day. Each of the 50 meters, spread over 5
+zones, sends a reading every 2 real seconds. This gives 150 readings per meter per simulated
+day, or about 7{,}500 readings in total. All data is grouped by simulated time, and only
+latency is measured with the real clock. A single module converts between the two clocks,
+and every duration in the configuration is labelled as either simulated or real, so they
+cannot be confused.
 
 
 % =====================================================================
@@ -248,12 +251,13 @@ simulated or real, so the two are never mixed up.
 \label{sec:arch}
 % =====================================================================
 
-\textbf{Lambda} \cite{marz} runs two paths over one immutable input: a batch layer that
-recomputes exact results from all history, a speed layer that computes approximate results
-from recent data, and a serving layer that merges them. \textbf{Kappa} \cite{kreps} runs a
-single streaming path and corrects results by replaying the log through the same code.
-\textbf{We chose Lambda.} Table~\ref{tab:archeval} evaluates both against the four
-criteria named in the marking rubric: latency, replay, cost and consistency.
+\textbf{Lambda} \cite{marz} processes the same input data along two paths. A batch layer
+periodically recalculates exact results from all the stored data, a speed layer calculates
+approximate results from recent data as it arrives, and a serving layer combines the two.
+\textbf{Kappa} \cite{kreps} uses a single streaming path and fixes mistakes by re-reading old
+data through the same code. \textbf{We chose Lambda.} Table~\ref{tab:archeval} compares the
+two against the four criteria named in the marking rubric: latency, replay, cost and
+consistency.
 
 \begin{table}[!htbp]
 \centering
@@ -265,61 +269,63 @@ criteria named in the marking rubric: latency, replay, cost and consistency.
 \textbf{Criterion} & \textbf{Analysis} & \textbf{Verdict} \\
 \midrule
 Latency &
-The consumers differ by about two orders of magnitude (seconds versus hours). One path
-has to be tuned for one of them: waiting long for late data makes the operations view
-late, while not waiting makes billing wrong. &
+The two users need answers at very different speeds: seconds for operations, hours for
+billing. A single path can only be tuned for one of them. If it waits long for late data,
+the operations view is late; if it does not wait, bills are wrong. &
 Lambda \\
 \addlinespace
 Replay &
 Billing disputes and tariff corrections can arrive \emph{months} later, but Kafka's
-\emph{retention} (how long it keeps messages) is \emph{days}. Kappa corrects results by
-re-reading old messages from Kafka, which is impossible once they have expired. Lambda's batch layer replays from object storage, which
-has no limit. &
+\emph{retention} (how long it keeps messages) is only \emph{days}. Kappa fixes results by
+re-reading old messages from Kafka, which is impossible once they have expired. Lambda's
+batch layer re-reads from object storage, which keeps data indefinitely. &
 Lambda \\
 \addlinespace
 Cost &
-Lambda pays for two codepaths and a nightly compute burst. Kappa pays for long retention
-or large long-lived per-household state, a cost that grows with households $\times$
-horizon. Both are cheap at our volume. &
+Lambda pays for two sets of code and a burst of computing once a day. Kappa pays for either
+very long retention or large amounts of per-household state held for months, a cost that
+grows with the number of households. At our scale both are cheap. &
 Lambda, narrowly \\
 \addlinespace
 Consistency &
-Billing needs an immutable, auditable record independent of the message bus, with
-lineage back to source readings. Lambda's \emph{master dataset}, a permanent copy of every raw reading, provides it; in Kappa the only
-ground truth is a log governed by a retention policy. &
+Billing needs a permanent, auditable record that does not depend on the message system, so
+that every bill can be traced to its readings. Lambda's \emph{master dataset}, a permanent
+copy of every raw reading, provides this. In Kappa the only record is Kafka's log, which is
+deleted according to a retention policy. &
 Lambda, decisively \\
 \bottomrule
 \end{tabularx}
 \end{table}
 
-\paragraph{The rejected alternative.} Kappa would also have worked here. Tariffs would be a
-Kafka topic that keeps only the latest tariff per household, one Structured Streaming job would join them to
-readings, and corrections would replay from an earlier offset into a new table. Its
-main advantages are one codebase (so the layers cannot diverge), one job to operate, and
-one mental model. We rejected it for three reasons: (1) restatement must be possible months
-later but retention is days, so its correction mechanism is not available when billing needs
-it; (2) a finance audit trail should not depend on a message-bus retention setting; and
-(3) holding tiered per-household billing state for months is more expensive and fragile
-than a bounded nightly job.
+\paragraph{The rejected alternative.} Kappa would also have worked here. Tariffs would be
+stored in a Kafka topic that keeps only the latest tariff for each household, a single Spark
+streaming job would join them to the readings, and corrections would be made by re-reading
+old messages into a new table. Its main advantages are a single codebase, so the two paths
+can never disagree, one job to run, and one design to understand. We rejected it for three
+reasons. First, bills may need to be recalculated months later, but Kafka keeps messages for
+only days, so Kappa's way of correcting results would not be available when billing needs
+it. Second, a financial audit trail should not depend on how long a message system is
+configured to keep data. Third, holding billing state for every household for months is more
+expensive and more fragile than running one bounded job each night.
 
-\paragraph{Lambda's cost and how we contain it.} The same billing logic exists in two
-codepaths and can silently diverge; for example, a speed layer ending the first tariff
-block at 60\,kWh and a batch layer ending it at 61\,kWh would give different bills near
-the boundary. To avoid this, all netting, tariff, rounding, key and
-validation logic lives in one shared module that does only calculations (every line of it is
-tested automatically), used by both jobs. The logic has to exist in two forms, because the API
-computes estimates without Spark while the Spark jobs need Spark's own expressions. To prove
-the two forms agree, a consistency test runs both on 5{,}000 random inputs, and on values
-either side of every tariff block boundary, and checks that they give the same bill to the
-cent.
-Divergence in logic is therefore a failing test; divergence in inputs (a stale tariff,
-dropped late readings) is intended and is measured at run time
+\paragraph{Lambda's cost and how we contain it.} With Lambda, the same billing logic exists
+in two places, and the two copies can drift apart without anyone noticing. For example, if
+the speed layer ended the first tariff block at 60\,kWh and the batch layer ended it at
+61\,kWh, households near that boundary would see two different bills. To prevent this, all
+the netting, tariff, rounding, key and validation logic lives in one shared module, which
+only performs calculations, is fully tested, and is used by both layers. The logic still has
+to exist in two forms, because the API calculates estimates without Spark while the Spark
+jobs need Spark's own expressions. To prove that the two forms agree, a consistency test runs
+both on 5{,}000 random inputs, and on values either side of every tariff block boundary, and
+checks that they produce the same bill to the cent. A difference in the logic would
+therefore fail a test. Differences in the inputs, such as a stale tariff or dropped late
+readings, are expected, and we measure them while the system runs
 (Section~\ref{sec:res-recon}).
 
-\paragraph{What would reverse the decision.} Lambda is justified only while the master
-dataset must outlive Kafka's retention. Kafka tiered storage, or a table format such as
-Apache Iceberg or Delta Lake, would give the log unbounded, queryable history; at that point
-Kappa's single codebase becomes the better trade.
+\paragraph{What would reverse the decision.} Lambda is only justified while the stored raw
+data has to outlive Kafka's retention. If Kafka's tiered storage, or a table format such as
+Apache Iceberg or Delta Lake, gave the log unlimited and queryable history, Kappa's single
+codebase would become the better choice.
 
 % =====================================================================
 \section{Solution Architecture}
@@ -371,28 +377,32 @@ Kappa's single codebase becomes the better trade.
   \draw[barr] (batch.south east) -- ++(0,-0.35) -| (rep.south);
   \draw[arr, dashed, gray] (core) -- (batch);
 \end{tikzpicture}}
-\caption{End-to-end architecture across ingestion, processing, storage and serving.
-Box colours mark the layer (blue sources, indigo ingestion, pink serving); amber is the
-speed path (process, then store) and teal the batch path (store, then process). Both consume the same Kafka topic independently, each with its own checkpointed
-offsets. The dashed shared billing module is used by both processing layers.}
+\caption{End-to-end architecture across the ingestion, processing, storage and serving
+layers. Box colours show the layer (blue for sources, indigo for ingestion, pink for
+serving). Amber marks the speed path, which processes data and then stores it; teal marks
+the batch path, which stores data and then processes it. Both paths read the same Kafka
+topic independently, each keeping track of its own position. The dashed shared billing
+module is used by both processing layers.}
 \label{fig:lambda}
 \end{figure}
 
-\paragraph{The three views.} The \emph{master dataset} is every raw event, unmodified, as
-Parquet files (a compressed, column-oriented format) on object storage, partitioned by simulated date and hour. It is never updated in
-place, and the archiver does no filtering, so any bug can be fixed by recomputing from it.
-The \emph{speed view} holds 15-simulated-minute event-time windows per zone (consumption,
-solar, renewable ratio, active meters) and a running provisional bill per household, priced
-with \emph{yesterday's} tariff because today's does not exist yet. The \emph{batch view} is
-built when a day's tariff file arrives: the whole day is read, validated, deduplicated,
-joined with that day's tariff and billed, then reconciled against the speed view.
+\paragraph{The three views.} The \emph{master dataset} contains every raw reading,
+unchanged, stored as Parquet files (a compressed, column-oriented format) on object storage
+and organised by simulated date and hour. It is never modified, and the archiver does not
+filter anything out, so any bug can be fixed later by recalculating from it. The \emph{speed
+view} holds 15-minute (simulated) windows for each zone, with consumption, solar generation,
+renewable ratio and active meters, together with a running provisional bill for each
+household. That bill uses \emph{yesterday's} tariff, because today's tariff does not exist
+yet. The \emph{batch view} is built when a day's tariff file arrives: the whole day is read,
+validated, cleaned of duplicates, joined with that day's tariff and billed, and the result
+is then compared with the speed view.
 
 \paragraph{The merge function.} When a household's bill is requested for a day, the API
 checks the \emph{run ledger}, a table recording every billing run. If the batch layer has
 already billed that day, the API returns the final bill; otherwise it returns the speed
-layer's provisional estimate (Figure~\ref{fig:merge}). The batch view always wins because it saw the late readings the
-speed layer dropped and used the correct tariff. Every response says which view served it
-and which day's tariff priced it.
+layer's provisional estimate (Figure~\ref{fig:merge}). The batch bill always takes priority,
+because it includes the late readings that the speed layer missed and uses the correct
+tariff. Every response states which layer produced it and which day's tariff was used.
 
 \begin{figure}[H]
 \centering
@@ -408,34 +418,36 @@ and which day's tariff priced it.
   \draw[barr] (dec.north) |- node[lbl, pos=0.3, left]{yes} (b.west);
   \draw[sarr] (dec.south) |- node[lbl, pos=0.3, left]{no} (s.west);
 \end{tikzpicture}
-\caption{The merge function as implemented: the finalisation check against the run ledger,
-and the two labelled return paths.}
+\caption{The merge function: the API checks the run ledger and returns either the final bill
+or the provisional estimate.}
 \label{fig:merge}
 \end{figure}
 
 \paragraph{Key transformations.} Readings are grouped into time windows by \textbf{event
-time}, the time the meter took the reading, not the time it arrived, because readings can
-arrive out of order. A \emph{watermark} sets how long the speed layer waits for late
-readings before closing a window. \textbf{Solar netting} runs before tariff evaluation:
+time}, which is when the meter took the reading, rather than when the reading arrived,
+because readings can arrive out of order. A \emph{watermark} sets how long the speed layer
+waits for late readings before it closes a window. \textbf{Solar netting} is applied before
+the tariff:
 \begin{equation*}
   \mathit{self} = \min(\mathit{solar}, \mathit{consumption}),\quad
   \mathit{import} = \mathit{consumption} - \mathit{self},\quad
   \mathit{export} = \mathit{solar} - \mathit{self},
 \end{equation*}
-and $\mathit{total} = \mathit{energy\_charge} + \mathit{fixed\_charge} -
-\mathit{subsidy} - \mathit{export\_credit}$, where the energy charge prices the import block
-by block and money is rounded half-up to 2 decimals identically in both layers. Kafka may
-deliver the same reading twice, so both layers \textbf{deduplicate} on $(\mathit{meter\_id},
-\mathit{event\_ts})$, defined once in the shared module. The Kafka message key is
-\texttt{household\_id}, which keeps each household's readings ordered within a partition.
+The bill is then $\mathit{total} = \mathit{energy\_charge} + \mathit{fixed\_charge} -
+\mathit{subsidy} - \mathit{export\_credit}$, where the energy charge prices the imported
+energy block by block, and money is rounded half-up to two decimal places in exactly the
+same way in both layers. Because Kafka may deliver the same reading twice, both layers
+\textbf{remove duplicates} using the meter ID and reading time, a rule defined once in the
+shared module. Kafka messages are keyed by household, so each household's readings stay in
+order.
 
 % =====================================================================
 \section{Technology Stack and Justification}
 \label{sec:stack}
 % =====================================================================
 
-Each choice is justified against the use case's constraints, with the rejected alternative
-(Table~\ref{tab:stack}).
+Table~\ref{tab:stack} lists each technology we chose, the requirement it meets and the
+alternative we rejected. The paragraphs below explain each choice.
 
 \begin{table}[!htbp]
 \centering
@@ -446,75 +458,84 @@ Each choice is justified against the use case's constraints, with the rejected a
 \toprule
 \textbf{Layer} & \textbf{Selected} & \textbf{Constraint satisfied} & \textbf{Rejected} \\
 \midrule
-Ingestion & Apache Kafka 3 (KRaft) & A replayable log is a precondition for Lambda; independent
-reads by two consumers give the two-branch fan-out & RabbitMQ; direct DB writes \\
+Ingestion & Apache Kafka 3 (KRaft) & Data can be re-read, which Lambda needs; two readers can
+consume the same stream independently & RabbitMQ; direct DB writes \\
 \addlinespace
-Stream \& batch & Spark 3.5 Structured Streaming and batch & One API for both layers enables
-one shared billing module; native event-time watermarks & Storm; Flink \\
+Stream \& batch & Spark 3.5 Structured Streaming and batch & The same API for both layers
+allows one shared billing module; built-in event-time windows & Storm; Flink \\
 \addlinespace
-Master dataset & Parquet on S3-compatible object store & Columnar, compressed, immutable;
-partition-pruned full-day rescans; storage separate from compute & HDFS; raw CSV/JSON \\
+Master dataset & Parquet on S3-compatible object store & Compressed column format that is
+never modified; a full day can be re-read quickly; storage is separate from computing &
+HDFS; raw CSV/JSON \\
 \addlinespace
-Serving store & PostgreSQL 16 & Joins, ACID writes for money, indexed point lookups; low
-post-aggregation volume & Cassandra; MongoDB \\
+Serving store & PostgreSQL 16 & Joins, safe transactions for money and fast lookups; our data
+volume after aggregation is small & Cassandra; MongoDB \\
 \addlinespace
-Orchestration & Apache Airflow 3 & Sensors, retries, run history and re-runnable per-date
-billing runs (the restatement mechanism) & cron \\
+Orchestration & Apache Airflow 3 & Waits for files, retries failures, keeps a run history and
+can re-run a single day (used for re-billing) & cron \\
 \addlinespace
-Observability & Prometheus, Alertmanager, Grafana & Pull scraping suits containers; alert
-rules are version-controlled and unit-tested & Bespoke log parsing \\
+Observability & Prometheus, Alertmanager, Grafana & Collecting metrics from containers is
+simple; alert rules are stored and tested with the code & Custom log parsing \\
 \addlinespace
-Serving API & FastAPI & Async, generated OpenAPI docs, schema validation at the boundary &
-Flask \\
+Serving API & FastAPI & Generates API documentation automatically and validates every
+request & Flask \\
 \addlinespace
-Deployment & Docker Compose & One-command reproducible stack, no cloud account needed &
-Kubernetes \\
+Deployment & Docker Compose & The whole system starts with one command, without a cloud
+account & Kubernetes \\
 \bottomrule
 \end{tabularx}
 \end{table}
 
-\paragraph{Kafka.} Kafka \cite{kafka} is a log, not a queue: reading does not delete a
-message. So a speed-layer bug can be fixed by re-reading old messages, the producer keeps
-working when a consumer is down, and the speed layer and archiver read the same topic
-independently; we confirmed that killing one reader left the other untouched. Three partitions bound parallelism, and the default
-seven-day retention is the constraint behind Section~\ref{sec:arch}. RabbitMQ deletes on
-acknowledgement, so it offers neither replay nor independent readers.
+\paragraph{Kafka.} Kafka \cite{kafka} is a log rather than a queue: reading a message does
+not delete it. This means a bug in the speed layer can be fixed by re-reading old messages,
+the producer keeps working when a reader is down, and the speed layer and the archiver can
+read the same topic independently. We confirmed that stopping one reader did not affect the
+other. The topic has three partitions, which limits how many readers can work in parallel,
+and Kafka's default seven-day retention is the limitation discussed in
+Section~\ref{sec:arch}. RabbitMQ was rejected because it deletes a message once it has been
+read, so it supports neither re-reading nor independent readers.
 
-\paragraph{Spark.} Because Spark's \cite{spark} batch and streaming APIs are the same, one billing module
-serves both layers, which deals with Lambda's biggest risk directly. Spark
-also supports event-time watermarks natively. Storm has lower latency but no event-time
-windowing and no batch API; since we only need latency in seconds, that advantage did not help us.
-Flink is a stronger pure streaming engine, but it lacks an equally simple shared batch path
-in Python, and Spark already meets the latency target (6.3\,s against 60\,s).
+\paragraph{Spark.} Spark \cite{spark} uses the same programming interface for batch and
+streaming jobs, so a single billing module can serve both layers. This directly addresses
+Lambda's biggest risk. Spark also supports event-time windows and watermarks natively. Storm
+offers lower latency, but it has no event-time windows and no batch interface, and since we
+only need answers within seconds, its extra speed would not help us. Flink is a stronger pure
+streaming engine, but it does not offer an equally simple way to share batch code in Python,
+and Spark already meets our latency target (6.3\,s against a 60\,s limit).
 
-\paragraph{Parquet on object storage.} Lambda needs all raw data kept: if a bill is wrong
-because of a logic error (for example \texttt{>} instead of \texttt{>=} at a block
-boundary), the fix is to correct the code and recompute from the raw
-readings. Parquet gives column pruning, compression, real types and
-predicate pushdown, and date/hour partitioning lets the daily job read only its own day. We
-use a local S3-compatible store so graders need no cloud account; the code uses only the
-S3 API, so moving to AWS S3 is a configuration change. Because MinIO stopped publishing
-images, the stack runs \texttt{pgsty/silo}, a MinIO-compatible fork. HDFS
-was rejected as too heavy at this scale.
+\paragraph{Parquet on object storage.} Lambda needs every raw reading to be kept. If a bill
+is wrong because of a logic error, such as using \texttt{>} instead of \texttt{>=} at a
+block boundary, the fix is to correct the code and recalculate from the raw readings.
+Parquet stores data by column, compresses it well, keeps proper data types and lets queries
+skip data they do not need, and organising the files by date and hour means the daily job
+reads only its own day. We use a local S3-compatible object store so that markers do not
+need a cloud account; because the code uses only the standard S3 interface, moving to AWS S3
+would only require a configuration change. Since MinIO stopped publishing its images, the
+system runs \texttt{pgsty/silo}, a MinIO-compatible replacement. HDFS was rejected as too
+heavy for a system of this size.
 
-\paragraph{PostgreSQL.} Our reads are point lookups by household and date, recent-window
-aggregations by zone, and joins between bills, the run ledger and households: small
-relational results. PostgreSQL gives joins, transactions (a billing run lands completely or
-not at all), JSON columns for the block breakdown and safe repeated writes. Cassandra is
-built for write volumes we do not have, and it does not support joins.
+\paragraph{PostgreSQL.} Our queries look up a household's bill for a date, total the recent
+readings for each zone, and join bills with the run ledger and household details, all of
+which return small, relational results. PostgreSQL supports joins, transactions (so a billing
+run is saved completely or not at all), JSON columns for the block breakdown, and writes that
+can safely be repeated. Cassandra is designed for much higher write volumes than ours, and it
+does not support joins.
 
-\paragraph{Airflow.} Airflow \cite{airflow} schedules on real time, so ``once per simulated day'' cannot be
-a cron expression. A \texttt{tariff\_watcher} DAG (an Airflow workflow) polls the landing zone every real minute
-and triggers \texttt{daily\_billing} once per tariff file, with a run id taken from the file's
-date (\texttt{billing\_\_2026-01-02}), so a repeat is skipped. A restatement is another run
-for the same date (\texttt{billing\_\_2026-01-02\_\_r1}). DAGs only start Spark containers and verify
-results; they contain no business logic. Cron has no dependencies, retries, history or
-re-runs.
+\paragraph{Airflow.} Airflow \cite{airflow} schedules work by real time, so ``once per
+simulated day'' cannot be written as a normal schedule. Instead, a small workflow (a
+\emph{DAG}) called \texttt{tariff\_watcher} checks the landing zone every real minute and
+starts the \texttt{daily\_billing} workflow once for each new tariff file. Each run is named
+after the file's date (\texttt{billing\_\_2026-01-02}), so the same day is never billed twice
+by accident, and re-billing a day simply starts another run for that date
+(\texttt{billing\_\_2026-01-02\_\_r1}). The workflows only start Spark jobs and check their
+results; they contain no billing logic. Cron was rejected because it has no task
+dependencies, retries, run history or re-runs.
 
-\paragraph{Prometheus, Alertmanager, Grafana.} Services expose their metrics and
-Prometheus \cite{prometheus} collects (\emph{scrapes}) them every 15 seconds; batch containers exit too early to be scraped, so they push to a
-Pushgateway. Alert rules live in the repository and are unit-tested with
-\texttt{promtool}, and Grafana dashboards are provisioned from files.
+\paragraph{Prometheus, Alertmanager and Grafana.} Each service publishes its metrics, and
+Prometheus \cite{prometheus} collects (\emph{scrapes}) them every 15 seconds. Batch jobs
+finish too quickly to be collected this way, so they push their metrics to a Pushgateway
+instead. The alert rules are stored in the repository and tested with \texttt{promtool}, and
+the Grafana dashboards are created automatically from files.
 
 % =====================================================================
 \section{Implementation}
@@ -523,11 +544,12 @@ Pushgateway. Alert rules live in the repository and are unit-tested with
 
 \subsection{Deployment}
 
-Eighteen containers run in four health-gated tiers under Docker Compose
-(Figure~\ref{fig:deployment}), started and verified with one command
-(\texttt{voltstream.ps1 run} on Windows, \texttt{make up} on Linux). Bootstrap containers
-create topics, schema and buckets, then exit. The stack uses 5.3--6.4\,GiB of memory, so
-the README asks for at least 8\,GB for Docker.
+The system runs as eighteen containers under Docker Compose, started in four tiers, where
+each tier waits until the previous one is healthy (Figure~\ref{fig:deployment}). A single
+command starts and checks everything (\texttt{voltstream.ps1 run} on Windows,
+\texttt{make up} on Linux). The bootstrap containers create the Kafka topics, database
+tables and storage buckets, and then exit. The whole system uses 5.3--6.4\,GiB of memory, so
+the README recommends giving Docker at least 8\,GB.
 
 \begin{figure}[H]
 \centering
@@ -558,16 +580,18 @@ the README asks for at least 8\,GB for Docker.
   \node[c, dashed, text width=3.6cm] at (10.8,-0.6) {Spark batch containers,\\started per task by Airflow};
   \draw[-{Stealth[length=2mm]}, infrac, line width=0.8pt] (15.3,0.2) -- node[right, font=\tiny, align=left]{start\\order,\\health-\\gated} (15.3,-3.8);
 \end{tikzpicture}}
-\caption{Deployment: 18 containers in four health-gated tiers (15 long-running, 3 bootstrap).
-Billing, rollup and reconciliation run in short-lived Spark containers started by Airflow.}
+\caption{Deployment: 18 containers in four tiers, each started once the previous tier is
+healthy (15 run continuously and 3 run once at start-up). Billing, rollup and reconciliation
+run in short-lived Spark containers started by Airflow.}
 \label{fig:deployment}
 \end{figure}
 
 \subsection{Data Sources and Ingestion}
 
-Two Python simulators provide the sources. The \textbf{meter producer} computes each
-household's load and solar for the current simulated time (solar is zero from 18:00 to
-06:00), adds noise and publishes to Kafka topic \texttt{meter.readings} every 2 seconds:
+Two Python programs simulate the data sources. The \textbf{meter producer} calculates each
+household's consumption and solar generation for the current simulated time (solar is zero
+between 18:00 and 06:00), adds random variation, and publishes a reading to the Kafka topic
+\texttt{meter.readings} every 2 seconds:
 
 \begin{lstlisting}[caption={A meter reading event, keyed by \texttt{household\_id}.},label={lst:event}]
 {"schema_version": "1.0", "event_id": "uuid4", "trace_id": "uuid4",
@@ -576,53 +600,57 @@ household's load and solar for the current simulated time (solar is zero from 18
  "consumption_kwh": 0.412, "solar_generation_kwh": 0.180, "voltage": 232.4, "producer_id": "sim-01"}
 \end{lstlisting}
 
-The \textbf{reference dropper} writes one tariff CSV (per household: tier, subsidy flag,
-three block rates, fixed charge, export rate, effective date) and one weather CSV per
-simulated day into the object-storage landing zone. Tariff rates change by $\pm$0.50 per
-day, so using yesterday's tariff has a visible effect. The formats of the reading, tariff
-and weather records are fixed as schemas, and every tariff row is validated before use.
+The \textbf{reference dropper} writes two files to the landing zone for each simulated day: a
+tariff file (for each household: tier, subsidy flag, three block rates, fixed charge, export
+rate and effective date) and a weather file. Tariff rates change by $\pm$0.50 each day, so
+using yesterday's tariff makes a visible difference. The formats of the readings, tariffs
+and weather records are fixed as schemas, and every tariff row is checked before it is used.
 
-To test robustness, the producer deliberately injects faults at configurable rates
-(Appendix A): duplicates, out-of-order events, null fields, negative kWh, unknown
-households, and \emph{meter dropouts}, where a meter loses its connection, stores its
-readings and sends them late once it reconnects. \emph{Reordering} (readings arriving a
-little out of order) is injected separately. Invalid records go
-to the dead-letter topic \texttt{meter.readings.dlq} and the \texttt{rejected\_records}
-table with a reason. With all rates at zero the output equals the input, which a test
-asserts.
+To test how robust the pipeline is, the producer deliberately introduces faults at
+configurable rates (Appendix A): duplicate readings, readings with missing fields or negative
+values, readings from unknown households, and \emph{meter dropouts}, where a meter loses its
+connection, stores its readings and sends them late once it reconnects. \emph{Reordering},
+where readings arrive slightly out of order, is introduced separately. Invalid readings are
+sent to a dead-letter topic (\texttt{meter.readings.dlq}) and recorded, with the reason, in
+the \texttt{rejected\_records} table. A test checks that when every fault rate is set to
+zero, the output is identical to the input.
 
 \subsection{Processing}
 
-\paragraph{Raw archiver.} A Spark stream that writes every Kafka record to Parquet,
-unchanged, partitioned by simulated date and hour, and resumes from its checkpoint after a
-restart. It guarantees \emph{no loss}, not exactly-once: Spark commits files and offsets in
-two steps, so a crash between them re-reads a small range. We measured 334 duplicates out
-of 14{,}012 rows after a kill, with no missing events; batch deduplication removes them.
+\paragraph{Raw archiver.} This Spark streaming job writes every Kafka message to Parquet
+without changing it, organised by simulated date and hour, and after a restart it continues
+from where it stopped. It guarantees that \emph{no data is lost}, but not that each reading
+is written exactly once: Spark saves the files and its reading position in two separate
+steps, so a crash between them causes a small range to be read again. After deliberately
+killing the archiver, we found 334 duplicate rows out of 14{,}012 and no missing readings;
+the batch layer removes such duplicates.
 
-\paragraph{Speed layer.} A second, independent Spark stream validates each record with
-the shared validation rules, deduplicates, groups readings into 15-simulated-minute
-tumbling windows per zone under a 30-simulated-minute watermark, keeps a running total per
-household, and writes the results to PostgreSQL in small batches every 10 real seconds
-(the \emph{trigger}). The provisional bill uses the shared billing logic with yesterday's
-tariff.
+\paragraph{Speed layer.} A second, independent Spark streaming job checks each reading with
+the shared validation rules, removes duplicates, and groups the readings into 15-minute
+(simulated) windows for each zone, using a 30-minute (simulated) watermark. It also keeps a
+running total for each household, and writes its results to PostgreSQL every 10 real
+seconds; this interval is called the \emph{trigger}. The provisional bill is calculated with
+the shared billing logic and yesterday's tariff.
 
-Time compression has two side effects here. First, 10 real seconds is 48 \emph{simulated}
-minutes, which is longer than the 30-minute watermark; so in practice the batch interval,
-not the watermark, decides which late readings are dropped (measured in
-Section~\ref{sec:res-recon}). Second, results are published after every batch, so the
-watermark does not delay them; it only decides when old windows are closed and forgotten.
+Running the clock 288 times faster has two side effects here. First, 10 real seconds equals
+48 simulated minutes, which is longer than the 30-minute watermark, so in practice it is the
+trigger interval, not the watermark, that decides which late readings are dropped (see
+Section~\ref{sec:res-recon}). Second, results are published after every trigger, so the
+watermark does not delay them; it only decides when old windows are closed.
 
-\paragraph{Batch layer.} The \texttt{daily\_billing} DAG has eight tasks: wait for the
-tariff; wait 90 real seconds for late data; run the Spark billing job (read the day's
-Parquet, validate, deduplicate, join the tariff, apply the shared netting and tariff
-functions, write the bills and record the run in the run ledger); check the row
-count and that every bill satisfies the total formula; roll up exact daily zone totals and
-check they equal the household totals; reconcile; and generate the daily report.
+\paragraph{Batch layer.} The \texttt{daily\_billing} workflow has eight tasks, which run in
+this order: wait for the day's tariff file; wait a further 90 real seconds for late
+readings; run the Spark billing job, which reads the day's Parquet files, validates them,
+removes duplicates, joins the tariff, applies the shared netting and tariff logic, writes the
+bills and records the run in the run ledger; check that the number of bills is correct; check
+that every bill adds up; calculate exact daily totals for each zone and check that they match
+the household totals; reconcile the two layers; and write the daily report.
 
-\paragraph{Reconciliation.} For each household the gap between the speed estimate and the
-batch bill is split into a \emph{tariff effect} (the speed layer's kWh priced at today's
-tariff, minus its estimate) and a \emph{data effect} (the batch bill minus that figure, i.e.\
-readings the speed layer missed). The two always add up to the total gap.
+\paragraph{Reconciliation.} For each household, the difference between the speed estimate and
+the final bill is split into two parts. The \emph{tariff effect} is the part caused by using
+yesterday's prices: the speed layer's energy priced at today's tariff, minus its estimate.
+The \emph{data effect} is the rest: the final bill minus that re-priced figure, which reflects
+readings the speed layer missed. The two parts always add up to the total difference.
 
 \begin{figure}[H]
 \centering
@@ -650,18 +678,19 @@ readings the speed layer missed). The two always add up to the total gap.
   \draw[-{Stealth}, batchc, thick] (7.0,1.2) -- (7.0,1.7);
   \node[font=\tiny, text=batchc, align=left, anchor=west] at (7.05,1.4) {merge flips $D$: speed $\rightarrow$ batch};
 \end{tikzpicture}}
-\caption{Measured timing of one simulated day. The two paths run concurrently; neither waits
-for the other, and neither failing loses data because raw events stay in Kafka and
-Parquet. The batch timings are those measured in the reference run.}
+\caption{Timing of one simulated day. The two paths run at the same time and neither waits
+for the other. If either fails, no data is lost, because the raw readings remain in Kafka and
+in Parquet. The batch timings are those measured in the reference run.}
 \label{fig:timeline}
 \end{figure}
 
 \subsection{Storage and Serving}
 
-The two views are kept in \emph{separate tables} (Table~\ref{tab:tables}), so neither layer
-overwrites the other and every row shows where it came from. The FastAPI service exposes
-zones, households, bills (the merge), bill deltas, daily reports, alert status and health
-endpoints, documented in the generated OpenAPI page at \texttt{/docs}, and serves the
+The speed and batch results are stored in \emph{separate tables} (Table~\ref{tab:tables}),
+so neither layer overwrites the other and every row shows which layer produced it. The
+FastAPI service provides endpoints for zones, households, bills (using the merge function),
+the difference between estimate and final bill, daily reports, alert status and health
+checks. It generates its own documentation page at \texttt{/docs} and also serves the
 dashboard.
 
 \begin{table}[!htbp]
@@ -687,21 +716,23 @@ dashboard.
 
 \subsection{Code Quality and Testing}
 
-The code is a typed Python 3.11 package organised by layer (\texttt{simulators},
-\texttt{streaming}, \texttt{batch}, \texttt{storage}, \texttt{api}, and a shared billing module).
-All settings live in one configuration file, validated at start-up.
-There are 281 tests (unit, property-based, consistency and integration), \texttt{promtool}
-tests for the alert rules, and a test that fails if alert thresholds or metric names drift
-from the code. GitHub Actions runs linting, type checks, the tests (requiring 100\% coverage
-of the shared billing module) and the alert checks on every push.
+The code is a typed Python 3.11 package with one folder per layer (\texttt{simulators},
+\texttt{streaming}, \texttt{batch}, \texttt{storage} and \texttt{api}) plus the shared
+billing module. All settings are kept in one configuration file, which is checked when the
+system starts. There are 281 automated tests (unit, property-based, consistency and
+integration), tests for the alert rules using \texttt{promtool}, and a test that fails if the
+alert thresholds or metric names no longer match the code. On every push, GitHub Actions
+checks code style and types, runs the tests, requires full test coverage of the shared
+billing module, and checks the alert rules.
 
 % =====================================================================
 \section{Observability Design}
 \label{sec:observability}
 % =====================================================================
 
-Observability should tell an operator whether data is flowing, whether it is correct, and
-where it is stuck. Figure~\ref{fig:observability} shows how each stage is instrumented.
+Good observability tells an operator three things: whether data is flowing, whether it is
+correct, and, if not, where it is stuck. Figure~\ref{fig:observability} shows how each part
+of the pipeline is monitored.
 
 \begin{figure}[H]
 \centering
@@ -737,25 +768,28 @@ dashboard banner. Every service also writes JSON logs.}
 \label{fig:observability}
 \end{figure}
 
-\paragraph{Structured logging.} Every service writes one JSON object per line with a fixed
-envelope, so a record can be followed across containers with one filter:
+\paragraph{Structured logging.} Every service writes its log as one JSON object per line,
+always with the same fields, so a single reading can be followed across containers with one
+search:
 
 \begin{lstlisting}[caption={A speed-layer log line.},label={lst:log}]
 {"ts": "2026-09-27T13:35:25.992Z", "level": "INFO", "service": "speed-layer", "stage": "speed-zone",
  "trace_id": "...", "sim_date": "2026-01-01", "msg": "zone windows upserted", "batch_id": 42, "rows_out": 15}
 \end{lstlisting}
 
-\texttt{service} and \texttt{stage} cover ingestion (\texttt{producer}), processing
-(\texttt{speed-zone}, \texttt{archive}, \texttt{billing}) and serving (\texttt{api}).
-Alertmanager sends notifications to an API webhook that logs them with \texttt{stage:
-alert}, so alerts appear in the same log stream.
+The \texttt{service} and \texttt{stage} fields show which part of the pipeline wrote each
+line: ingestion (\texttt{producer}), processing (\texttt{speed-zone}, \texttt{archive},
+\texttt{billing}) or serving (\texttt{api}). Alertmanager also sends its notifications to an
+API endpoint, which logs them with \texttt{stage: alert}, so alerts appear in the same log
+stream as everything else.
 
-\paragraph{Metrics.} Table~\ref{tab:metrics} lists what is measured and why. The latency
-histogram runs from the Kafka record timestamp to the commit of the view the dashboard reads,
-so the latency requirement is measured, not assumed. \texttt{lambda\_divergence} lets the
-system watch for the main weakness of Lambda, the two layers drifting apart. The two \texttt{pg\_} gauges exist because the
-renewable ratio is 0 every night (so a flat value cannot reveal a dead feed) and only the run
-ledger knows when billing last succeeded.
+\paragraph{Metrics.} Table~\ref{tab:metrics} lists what is measured and why. Latency is
+measured from the moment a reading enters Kafka to the moment the view read by the dashboard
+is updated, so the 60-second requirement is checked rather than assumed. The
+\texttt{lambda\_divergence} metric lets the system watch for Lambda's main weakness, the two
+layers drifting apart. The two \texttt{pg\_} metrics are read from the database for two
+reasons: the renewable ratio is zero every night, so an unchanging value cannot reveal a dead
+data feed, and only the run ledger knows when billing last succeeded.
 
 \begin{table}[!htbp]
 \centering
@@ -781,19 +815,22 @@ ledger knows when billing last succeeded.
 \end{tabularx}
 \end{table}
 
-\paragraph{Tracing.} Full distributed tracing through Spark executors was out of scope, so
-we use \textbf{correlation IDs}: a \texttt{trace\_id} created by the producer travels in the
-Kafka headers into Parquet, the dead-letter topic and every log line. The API does the same
-for requests with an \texttt{X-Trace-Id} header. Any record's path and timing can be found by
-searching for one ID.
+\paragraph{Tracing.} Full distributed tracing inside Spark was beyond the scope of this
+project, so we use \textbf{correlation IDs} instead. The producer gives each reading a
+\texttt{trace\_id}, which travels with it through Kafka into the Parquet files, the
+dead-letter topic and every log line. The API does the same for requests, using an
+\texttt{X-Trace-Id} header. Searching for one ID therefore shows a reading's full path and
+timing.
 
-\paragraph{Alerts and health checks.} Five Prometheus rules (Table~\ref{tab:alerts}) are
-stored in the repository, with thresholds checked against the configuration by a test.
-Alertmanager routes critical and warning alerts separately, and \texttt{MeterDataStale}
-for a zone suppresses that zone's \texttt{LowRenewableContribution}, since missing data
-explains missing solar. The API also has \texttt{/health/live}, \texttt{/health/ready}
-(PostgreSQL and object storage reachable) and \texttt{/api/v1/alerts/status}. Grafana has
-three dashboards: pipeline health, grid operations and Lambda divergence.
+\paragraph{Alerts and health checks.} There are five Prometheus alert rules
+(Table~\ref{tab:alerts}), stored in the repository, and a test checks that their thresholds
+match the configuration. Alertmanager handles critical and warning alerts separately, and it
+suppresses a zone's \texttt{LowRenewableContribution} alert while \texttt{MeterDataStale} is
+firing for that zone, because missing data would explain the missing solar. The API also
+provides health checks (\texttt{/health/live}, and \texttt{/health/ready}, which confirms that
+PostgreSQL and object storage are reachable) and an alert status endpoint
+(\texttt{/api/v1/alerts/status}). Grafana has three dashboards: pipeline health, grid
+operations and Lambda divergence.
 \label{sec:alerts}
 
 % =====================================================================
@@ -801,18 +838,20 @@ three dashboards: pipeline health, grid operations and Lambda divergence.
 \label{sec:results}
 % =====================================================================
 
-All results come from the full Compose stack on one Windows laptop (16 CPUs, about
-7.5\,GiB for Docker). The reference run (27 September 2026) was the first uninterrupted run
-with both paths live; fault drills were run the next day. The verification script
-(\texttt{voltstream.ps1 check}) reported 37 passed and 0 failed.
+All results were measured on the complete system running under Docker Compose on one Windows
+laptop (16 CPUs, with about 7.5\,GiB of memory available to Docker). The \emph{reference run}
+on 27 September 2026 was the first uninterrupted run with both paths working, and the fault
+tests were run the following day. The system's own end-to-end check
+(\texttt{voltstream.ps1 check}) reported 37 checks passed and none failed.
 
 \subsection{Real-Time Zone Monitoring}
 \label{sec:res-live}
 
-In 40 real seconds the newest zone window moved from 07:30 to 10:45 simulated (3\,h 15\,min,
-i.e.\ $288\times$). The Live grid (Figure~\ref{fig:live}) polls \texttt{/api/v1/zones/load}
-every 5 seconds and shows load, solar, renewable share and active meters per zone. Renewable
-share drops to 0\% every simulated night, which is when \texttt{LowRenewableContribution}
+In 40 real seconds, the newest zone window advanced from 07:30 to 10:45 in simulated time,
+which is 3 hours 15 minutes and confirms the 288-times speed-up. The Live grid
+(Figure~\ref{fig:live}) requests \texttt{/api/v1/zones/load} every 5 seconds and shows the
+load, solar generation, renewable share and active meters for each zone. The renewable share
+falls to 0\% every simulated night, which is when the \texttt{LowRenewableContribution} alert
 fires.
 
 \begin{figure}[H]
@@ -825,13 +864,13 @@ fires.
 \subsection{Daily Billing and Solar Report}
 \label{sec:res-report}
 
-For 2026-01-02 (the first complete day) the batch layer read 7{,}029 rows and wrote 50
-bills, and the whole eight-task DAG took 59\,s. Every bill satisfies the total formula. The
-last DAG task writes a Markdown report for each day with zone totals (consumption, solar,
-self-consumed, exported, renewable share), billing totals, rejected records by reason, the
-speed-vs-batch divergence and the run ledger. The same content is served by
-\texttt{/api/v1/reports/daily} and shown in the dashboard's Daily report tab
-(Figure~\ref{fig:report}).
+For 2026-01-02, the first complete day, the batch layer read 7{,}029 readings and produced 50
+bills, and the whole eight-task workflow took 59\,s. Every bill added up correctly. The last
+task of the workflow writes a Markdown report for the day, containing zone totals
+(consumption, solar, self-consumed, exported and renewable share), billing totals, rejected
+readings grouped by reason, the difference between the two layers, and the billing runs. The
+same information is available from \texttt{/api/v1/reports/daily} and on the dashboard's
+Daily report tab (Figure~\ref{fig:report}).
 
 \begin{figure}[H]
 \centering
@@ -852,8 +891,9 @@ speed-vs-batch divergence and the run ledger. The same content is served by
 \subsection{Provisional-to-Final Transition}
 \label{sec:res-merge}
 
-The same request for household HH-0001 on 2026-01-02 was made before and after billing
-(Table~\ref{tab:flip}, Figure~\ref{fig:bills}).
+We requested the bill for household HH-0001 for 2026-01-02 at three points: during the day,
+at the end of the day, and after the batch layer had billed it (Table~\ref{tab:flip},
+Figure~\ref{fig:bills}).
 
 \begin{table}[!htbp]
 \centering
@@ -872,9 +912,10 @@ Total & 200.53 & 227.49 & \textbf{234.21} \\
 \end{tabularx}
 \end{table}
 
-The final bill was 6.72 (2.869\%) above the day-close estimate, almost all of it because
-the 2026-01-02 tariff was higher than the one the speed layer used. A repeat run gave the
-same pattern (final 237.38, difference 2.907\%, all tariff effect).
+The final bill was 6.72 (2.869\%) higher than the estimate at the end of the day. Almost all
+of this difference came from the tariff: the 2026-01-02 tariff was higher than the one the
+speed layer had used. A repeat run showed the same pattern (final bill 237.38, a 2.907\%
+difference, all of it due to the tariff).
 
 \begin{figure}[H]
 \centering
@@ -902,7 +943,8 @@ the averages over all 50 households.
 
 \begin{table}[!htbp]
 \centering
-\caption{Measured split of the divergence, 50 households per day (day 1 is partial).}
+\caption{How the gap between estimate and final bill splits, averaged over 50 households per
+day (day 1 is incomplete).}
 \label{tab:recon}
 \small
 \begin{tabularx}{\textwidth}{L{2.0cm} X X X X X X}
@@ -933,8 +975,9 @@ watermark.
 \subsection{Observability in Operation}
 \label{sec:res-alerts}
 
-Each alert was triggered by a scripted fault (\texttt{voltstream.ps1 faults}), checked
-through Alertmanager's API, and then undone (Table~\ref{tab:alerts}).
+Each alert was tested by deliberately causing the fault it is meant to detect
+(\texttt{voltstream.ps1 faults}), confirming through Alertmanager that the alert fired, and
+then removing the fault (Table~\ref{tab:alerts}).
 
 \begin{table}[!htbp]
 \centering
@@ -946,7 +989,7 @@ through Alertmanager's API, and then undone (Table~\ref{tab:alerts}).
 \textbf{Rule (severity)} & \textbf{Condition} & \textbf{Induced fault and result} \\
 \midrule
 \texttt{MeterDataStale} (critical) & A zone's newest window older than 2 real min & Producer stopped: fired after 173--195\,s for all 5 zones; cleared 41--46\,s after restart \\
-\texttt{LowRenewable\-Contribution} (warning) & Zone renewable ratio below 15\% for 3 windows (the brief's alert) & No fault needed: fired at dusk (19:40 sim) for all zones, cleared at 10:00 sim \\
+\texttt{LowRenewable\-Contribution} (warning) & Zone renewable ratio below 15\% for 3 windows (the brief's alert) & No fault needed: fired at dusk (19:40 simulated) for all zones and cleared at 10:00 simulated \\
 \texttt{HighRejectRate} (warning) & Rejects above 5\% of consumed records over 5 min & 15\% null fields injected: fired after 119\,s at 11.6\% (normal about 2\%) \\
 \texttt{BatchSLAMiss} (critical) & No successful billing within 10 real min of day close & Billing DAG paused: fired 21\,s after due; cleared 6\,s after billing resumed \\
 \texttt{LambdaDivergence\-High} (warning) & Mean speed-vs-batch gap above 5\% & Not reached live (the run stalled on memory); fired when the threshold was lowered to 1\%, on the 1.68\% gap of the latest reconciled day at that time \\
@@ -954,8 +997,9 @@ through Alertmanager's API, and then undone (Table~\ref{tab:alerts}).
 \end{tabularx}
 \end{table}
 
-Rejected records keep their identity: 53 rows in \texttt{rejected\_records} matched 53
-dead-letter messages exactly, and one \texttt{trace\_id} was found in both.
+Rejected readings can be traced: the 53 rows in \texttt{rejected\_records} matched the 53
+messages in the dead-letter topic exactly, and the same \texttt{trace\_id} was found in both
+places.
 
 \begin{figure}[H]
 \centering
@@ -983,23 +1027,25 @@ dead-letter messages exactly, and one \texttt{trace\_id} was found in both.
 \label{fig:obs-shots}
 \end{figure}
 
-\subsection{Resilience and Restatement}
+\subsection{Resilience and Re-billing}
 \label{sec:res-resilience}
 \label{sec:res-restate}
 
-\paragraph{Crashing each path.} Killing the raw archiver abruptly (\texttt{SIGKILL}, 20\,s outage)
-lost no events and left no offset gaps; the 334 duplicates were removed by batch
-deduplication. Killing the speed layer for 60\,s made the live view 56\,s stale while the
-archiver kept writing (1{,}526 readings); the speed layer caught up 22\,s after restart, the
-previous day's final bill stayed at 237.38, and the day of the crash was billed in full.
-So when the speed layer fails, the live view goes stale for a while, but no bill is affected.
+\paragraph{Crashing each path.} We stopped the raw archiver abruptly (\texttt{SIGKILL}) for
+20\,s. No readings were lost and there were no gaps in Kafka; the 334 duplicates this caused
+were removed by the batch layer. We then stopped the speed layer for 60\,s. During that time
+the live view was 56\,s out of date, while the archiver continued to store readings (1{,}526
+of them). After restarting, the speed layer caught up within 22\,s, the previous day's final
+bill stayed at 237.38, and the day of the crash was still billed in full. In other words,
+when the speed layer fails, the live view is briefly out of date, but no bill is affected.
 
-\paragraph{Restating a day.} \texttt{voltstream.ps1 backfill} corrupted the 2026-01-02 tariff
-(block 1 rate $+45.00$), re-billed the day, restored the file and re-billed again. The day's
-total went from 18{,}737.41 to 44{,}876.57 and back to the cent. The ledger shows
-\texttt{superseded}, \texttt{superseded}, \texttt{success}, each with its own Airflow run,
-and \texttt{household\_bill\_history} keeps all three versions. Bills are recomputed from the
-master dataset rather than edited in place.
+\paragraph{Re-billing a day.} The \texttt{voltstream.ps1 backfill} script deliberately
+corrupted the tariff for 2026-01-02 (adding 45.00 to the block 1 rate), re-billed the day,
+restored the correct file and re-billed it again. The day's total went from 18{,}737.41 to
+44{,}876.57 and then back to exactly 18{,}737.41. The run ledger shows the three runs as
+\texttt{superseded}, \texttt{superseded} and \texttt{success}, each linked to its own Airflow
+run, and \texttt{household\_bill\_history} keeps all three versions of every bill. Bills are
+always recalculated from the stored raw data, never edited directly.
 
 \subsection{Measured Latency}
 \label{sec:res-latency}
@@ -1023,9 +1069,9 @@ API reads (zones, bill) & 20--50\,ms & p50 14.7\,ms and 8.7\,ms \\
 \end{tabularx}
 \end{table}
 
-The speed path met the 60\,s requirement on every observation, typically in about 5\,s. The
-slowest batches coincided with billing runs, when batch and streaming Spark competed for the
-same laptop.
+The speed path met the 60-second requirement for every reading, usually within about 5\,s.
+The slowest batches happened during billing runs, when the batch and streaming Spark jobs
+were competing for the same laptop.
 
 % =====================================================================
 \section{Discussion, Limitations and Production Scale}
@@ -1033,58 +1079,66 @@ same laptop.
 \label{sec:discussion}
 % =====================================================================
 
-\paragraph{Was Lambda the right choice?} We think so. The provisional bill had to be wrong (yesterday's
-tariff), and the batch layer corrected it about 2.5 minutes after each day closed. The
-restatement drill tested the main reason we rejected Kappa: recomputing a past
-day from Parquet, independent of Kafka retention. Lambda's cost appeared as expected (two
-jobs, an orchestrator, reconciliation), but the shared billing module kept all differences
-down to inputs: no gap came from the logic itself.
+\paragraph{Was Lambda the right choice?} We think so. The provisional bill was always going
+to differ from the final one, because it uses yesterday's tariff, and the batch layer
+replaced it with the correct bill about 2.5 minutes after each day closed. Re-billing a past
+day tested the main reason we rejected Kappa: we recomputed the day from the stored Parquet
+files, without relying on Kafka still holding the data. Lambda did cost more, as
+expected (two jobs, an orchestrator and a reconciliation step), but because both layers
+share one billing module, every difference between them came from their inputs, never
+from the billing logic.
 
 \paragraph{Limitations.}
 \begin{itemize}
-  \item \textbf{Time compression} speeds up event time but not processing time, so
-        watermark tuning is not realistic; it is why the trigger outgrew the watermark and
-        the live view misses about 1\% of energy. Raising the watermark above one trigger
-        would fix it.
-  \item \textbf{Simulation fidelity:} interval readings rather than cumulative meter
-        registers; synthetic curves and tariffs; 50 households, far below a real utility.
-        The weather file is produced but not used by billing or solar generation.
-  \item \textbf{Small files:} one simulated day produced 245 Parquet files averaging
-        10.2\,kB, far below Parquet's ideal size; production needs compaction or a table
-        format.
-  \item \textbf{Single points of failure:} one Kafka broker, one Spark node, one PostgreSQL
-        instance; no schema registry; secrets are local defaults in \texttt{.env}.
-  \item \textbf{Resources:} the stack needs about 9\,GB; on the demo laptop the divergence
-        drill stalled on memory, so that alert was shown with a lowered threshold.
-  \item \textbf{Monitoring gaps:} if \texttt{sql-exporter} stops, two alerts go quiet
-        instead of firing; the Pushgateway keeps the last divergence value indefinitely.
-        Tracing uses correlation IDs, not distributed spans.
+  \item \textbf{Time compression} speeds up simulated time but not the computer's processing
+        time, so the watermark settings are not realistic. This is why the trigger interval
+        ended up longer than the watermark, and why the live view misses about 1\% of the
+        energy. Setting the watermark longer than one trigger interval would fix this.
+  \item \textbf{Simulation:} meters send the energy used in each interval rather than a
+        running total; consumption, solar and tariffs are synthetic; and 50 households is far
+        fewer than a real utility serves. The weather file is produced but is not used for
+        billing or solar generation.
+  \item \textbf{Small files:} one simulated day produced 245 Parquet files averaging only
+        10.2\,kB, far smaller than Parquet works best with. A production system would need to
+        merge them regularly, or use a table format that does so.
+  \item \textbf{Single points of failure:} there is one Kafka broker, one Spark node and one
+        PostgreSQL server, no schema registry, and passwords are stored as local defaults in
+        \texttt{.env}.
+  \item \textbf{Resources:} the system needs about 9\,GB of memory. On the demonstration
+        laptop the divergence test ran out of memory, so that alert was demonstrated with a
+        lower threshold.
+  \item \textbf{Monitoring gaps:} if \texttt{sql-exporter} stops, two alerts stay silent
+        instead of firing, and the Pushgateway keeps showing the last divergence value
+        indefinitely. Tracing uses correlation IDs rather than full distributed tracing.
 \end{itemize}
 
-\paragraph{Production scale.} We would use Iceberg or Delta Lake over raw Parquet
-(transactions, compaction, time travel), a schema registry with Avro or Protobuf, change data
-capture instead of daily tariff files, replicated Kafka and Spark on Kubernetes, watermarks
-set from measured lateness, and alerts on exporter staleness. PostgreSQL would suit us up to
-roughly a few million aggregate rows per day, after which a columnar store such as ClickHouse
-fits better. Iceberg or Kafka tiered storage would also remove the retention constraint that
-decided Section~\ref{sec:arch}, making Kappa the better choice.
+\paragraph{Production scale.} In production we would use Iceberg or Delta Lake on top of the
+raw Parquet files (for transactions, automatic merging of small files and access to past
+versions), a schema registry with Avro or Protobuf, change data capture instead of daily
+tariff files, replicated Kafka, Spark on Kubernetes, watermarks based on measured delays, and
+alerts for when the exporters themselves stop. PostgreSQL would be enough for up to a few
+million summary rows per day; beyond that, a column-oriented database such as ClickHouse
+would fit better. Iceberg or Kafka tiered storage would also remove the retention limit that
+decided Section~\ref{sec:arch}, at which point Kappa would become the better choice.
 
 % =====================================================================
 \section{Conclusion}
 \label{sec:conclusion}
 % =====================================================================
 
-The same meter stream must give grid operators load and renewable share within seconds and
-give billing an exact, auditable bill that cannot exist until the daily tariff arrives. We
-chose Lambda because billing must be restatable after Kafka's retention has expired, and we
-contained Lambda's main risk by sharing all billing logic through one tested module.
-Voltstream implements this with Kafka, Spark, Parquet on object storage, PostgreSQL, Airflow
-and FastAPI, reproducible with one command. On the running system the speed path delivered
-zone metrics in about 6\,s, the batch layer finalised all 50 bills about 2.5 minutes after
-each day closed, the merge switched from provisional to final, a corrupted day was restated
-with its history kept, neither crash lost data, and all five alerts fired under their
-faults. The main limitation is time compression, which distorts streaming behaviour; the
-decision itself would change if the log became durable and queryable without limit.
+Voltstream uses one stream of meter readings to serve two very different needs. Grid
+operators need the load and renewable share of each zone within seconds, while billing needs
+an exact, auditable bill that cannot be produced until the daily tariff arrives. We chose
+Lambda because bills must be recalculable long after Kafka has deleted the original
+messages, and we limited Lambda's main risk by sharing all billing logic through one tested
+module. The system is built with Kafka, Spark, Parquet on object storage, PostgreSQL, Airflow
+and FastAPI, and starts with a single command. On the running system, the speed path
+delivered zone metrics in about 6 seconds; the batch layer finalised all 50 bills about 2.5
+minutes after each day closed; each bill switched from provisional to final as designed; a
+corrupted day was re-billed with its history kept; neither crash lost any data; and all five
+alerts fired when their faults were introduced. The main limitation is the compressed clock,
+which distorts the timing of the streaming path. The architecture decision itself would only
+change if Kafka's data could be kept and queried indefinitely.
 
 \phantomsection
 \addcontentsline{toc}{section}{References}
@@ -1117,12 +1171,12 @@ Prometheus Authors, \emph{Prometheus Documentation}. \url{https://prometheus.io/
 \begin{enumerate}
   \item Simulated time runs 288 times faster than real time: one simulated day is five real
         minutes, starting at 2026-01-01 00:00 UTC when the stack starts. All timestamps are UTC.
-  \item Meters report interval energy in kWh, not cumulative register readings.
+  \item Meters report the energy used in each interval (kWh), not a running total.
   \item Fifty households in five fixed grid zones. Kafka retention is the default seven days.
   \item Tariff values are synthetic (Table~\ref{tab:tariffvals}); only the block boundaries
         are configuration, and every rate comes from the daily tariff file.
-  \item Fault rates (Table~\ref{tab:faultvals}) exercise validation and alerting; they are
-        not realistic failure rates.
+  \item The fault rates (Table~\ref{tab:faultvals}) were chosen to test validation and
+        alerting, not to reflect real failure rates.
   \item The weather file satisfies the brief's second daily source but is not used in billing.
 \end{enumerate}
 
