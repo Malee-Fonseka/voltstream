@@ -18,7 +18,7 @@ Cross-references: `00-master-design.md` §3.3b, §3.4, §5.4, §5.7 and §10.2;
 |---|---|---|
 | Time compression | 1 simulated day = 5 real minutes (`TIME_SCALE = 288`) | `config/base.yaml` `simulation.time_scale` |
 | Emit interval | one reading per household per 2 real seconds | `simulation.emit_interval_seconds` |
-| Readings per meter per simulated day | 150 | derived: 300 real s ÷ 2 s |
+| Readings per meter per simulated day | 150 | derived: 300 real s ÷ 2 s; held exactly by the producer's fixed tick grid (R37) |
 | Raw events per simulated day | ~7,500 across 50 households | derived |
 
 **Limitation — time compression scales event time but not processing time** (§3.4).
@@ -126,11 +126,12 @@ nothing else" is wrong as written. Raising the watermark above one trigger (60 s
 minutes rather than 30) is the change D3's own analysis implies if the stated intent is
 to be met; that has not been done, because it revises a pinned decision.
 
-What is *not* affected: the daily totals, which stay complete in every run.
+What is *not* affected: the daily totals, which stay complete in every run. *(Superseded
+by R02 — see the update at the end of this section.)*
 
-**Two consequences worth stating plainly.** The real-time *operational* view is
-measurably incomplete — about 1 % of the day's energy on an idle host — which is the
-speed layer doing its job, trading completeness for latency. The *provisional bill* is
+**Two consequences worth stating plainly** *(the second superseded by R02, below)*. The
+real-time *operational* view is measurably incomplete — about 1 % of the day's energy on
+an idle host — which is the speed layer doing its job, trading completeness for latency. The *provisional bill* is
 not incomplete at all: nothing the fault model injects arrives late enough to miss the
 day it belongs to. So the speed-versus-batch divergence on bills comes from the **stale
 tariff**, not from lost readings, and the reconciliation metric should be read
@@ -138,12 +139,49 @@ accordingly.
 
 **Figures to quote.** The 15-minute gap is **1.16 %** with the default fault
 configuration, measured on an idle host over one complete simulated day; the daily gap is
-**0.00 %**. The loaded-host figures (0.37 % / 0.56 %) are recorded above only to document
+**0.00 %** *(pre-R02 and superseded: quote 0.52 %, from the update below)*. The loaded-host figures (0.37 % / 0.56 %) are recorded above only to document
 how the control was chased down, and should not be quoted as results — they were taken
 while four Spark drivers competed for one machine.
 
 D3's sizing model put the drop near 1.7 %, attributed entirely to dropout backfill. The
 measured total is 1.16 %, and the attribution is wrong: most of it is reordering.
+
+### Update (2026-09-27): the daily figures above predate R02
+
+Every daily figure in this section was measured on a speed layer that did not deduplicate,
+against an archive total that was not deduplicated either. The 2 % injected duplicates
+were on both sides and cancelled out. The batch layer removes them, so the "complete"
+provisional bill was about 2 % high against the bill it is reconciled with (backlog R02).
+
+The speed layer now deduplicates on the batch layer's key (`core.keys.DEDUP_COLUMNS`)
+before aggregating, and Spark's streaming dedup drops every record older than the
+watermark. So:
+
+- **The daily totals are no longer complete.** Backfill older than the watermark is
+  dropped before it reaches them. D3's model puts the gap near 1.7 %;
+  `test_watermark_behaviour.py` now asserts T094's 0.25–5 % band on it.
+- **The divergence on bills is both effects, not the stale tariff alone.** Reconciliation
+  separates them (D4): `tariff_effect` from yesterday's tariff, `data_effect` from the
+  dropped backfill.
+- **Reordering alone still leaves the daily totals complete.** A reordered record is sent
+  with its own tick, and the watermark trails that tick by at least the watermark; the
+  probe's control run asserts a daily gap under 0.05 %.
+- **The 15-minute figures still describe reordering.** With dropouts on, the 15-minute gap
+  can only grow: the dedup drops backfill by its own `event_ts`, before it can land in a
+  window that is still open.
+
+**Measured on the Gate 4 run (2026-09-27), from the live stack rather than the probe:**
+
+| Day | Dropouts | Backfilled readings | Daily kWh gap (speed vs batch) |
+|---|---|---|---|
+| 2026-01-01 (partial) | — | — | 0.861 % |
+| 2026-01-02 | 10 | 126 (1.9 % of the day) | **0.523 %** |
+
+Inside T094's 0.25–5 % band, and below D3's modelled 1.7 %. The speed layer lost about a
+quarter of each backlog where the model has 57.5 %; D4's "Measured attribution" gives the
+likely reason. **Figures to quote** for the daily grain: 0.52 %, from this run. The probe
+has not been re-run since R02, so the control (reordering alone) and the 15-minute
+figures are still the pre-R02 ones.
 
 ---
 
@@ -213,6 +251,9 @@ asserting the latter would be asserting something the file sink does not provide
   only by explicit schema declaration at the ingestion boundary and by T033's drift guard.
 - **Simplified dimension handling.** The tariff dimension uses an effective-dated join
   rather than a full slowly-changing-dimension implementation with validity intervals.
+- **No weather join in billing.** T113 lists one, but nothing in a bill depends on the
+  weather, and the producer does not use cloud cover either (R16, decided not to fix). The
+  daily weather file is dropped into the landing zone and read by nothing.
 - **Single points of failure throughout** — one Kafka broker, one Spark node, one
   PostgreSQL instance. No replication, no failover.
 - **Secrets live in `.env`**, not in a secret manager. Every credential in the repository
@@ -281,3 +322,26 @@ and are removed downstream by the batch dedup on `(meter_id, event_ts)` — see 
 
 The API endpoint named in the gate does not exist until Phase 8, so the zone view was
 verified directly against PostgreSQL, which that task permits.
+
+### Gate 4 — both Lambda paths live (T136)
+
+One uninterrupted run, the first with R01, R02, R04, R05 and R08 fixed: `voltstream.ps1 run`,
+clock anchor 2026-09-27 12:45:06 UTC. Times below are real UTC.
+
+| Criterion | Evidence |
+|---|---|
+| A complete, finalised day (T126) | 2026-01-02: 50 rows in `household_bill_daily`; `pipeline_runs` `success`, 7,029 rows in, 50 out, 12:55:56–12:56:15; tariff archived under `voltstream-archive/tariff/sim_date=2026-01-02/` |
+| Merge function flips, same household and date | HH-0001, 2026-01-02. At 12:54:13, day still open: `source=speed`, `provisional=true`, tariff 2026-01-01, total 200.53 (10.0665 kWh so far). At 12:57:33, after billing: `source=batch`, `provisional=false`, tariff 2026-01-02, total 234.21 (13.4363 kWh, 138 readings, 3 duplicates removed) |
+| `reconciliation_daily` populated | 50 rows for each of 2026-01-01 and 2026-01-02; the D4 identity holds on every row. The split is in `05-open-decisions.md` D4, "Measured attribution" |
+| Daily report generated | `voltstream-archive/reports/report_2026-01-01.md` and `report_2026-01-02.md`, both FINAL with every section filled. Their reject counts are doubled (backlog R23, fixed 2026-09-29): day one lists 212 where 105 readings were rejected |
+| Whole billing DAG | `billing__2026-01-02`: all 8 tasks `success`, 12:55:49–12:56:48 (59 s) |
+| No failed runs | 2 `daily_billing` runs, both `success`; no run for the seed day 2025-12-31 (R04) |
+| Speed path meanwhile | end-to-end latency 5.78 s average (NFR: under 60 s); consumer lag 0 |
+| `voltstream.ps1 check -Date 2026-01-02` | 37 passed, 0 waiting, 0 warnings, 0 failed |
+
+**Still to attach:** dashboard screenshots of the flip, which T136's *Done when* requires.
+**Waits for Phase 12:** §9's "divergence visible in Grafana" (T154).
+
+**Seen on this run, not gate criteria:** the late-data grace slept about 1 s, because R03
+is still open, and the producer emitted 138 ticks per simulated day rather than 150
+(R37). Both were fixed on 2026-09-29.

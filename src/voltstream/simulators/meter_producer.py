@@ -6,14 +6,22 @@ household in the roster, compute a reading from `simulators/profiles.py`, run it
 (§3.3d, so all of one household's readings land on one partition), headers `trace_id` and
 `produced_at` (T030, wall clock). One structured log line per tick with counts. SIGTERM/
 SIGINT trigger a graceful shutdown that flushes the producer before exiting.
+
+**Ticks run on a fixed grid (R37).** Tick k is due at `anchor + k × interval` real time
+and stamped `epoch + k × interval × time_scale` simulated time, so every simulated day has
+exactly `86400 / (interval × time_scale)` ticks (150 at the defaults) however the host
+behaves. A tick that runs late is made up at once rather than pushing every later tick
+back; before this, a day had about 138 ticks and each stall left a 14–23 simulated-minute
+gap in every meter's series.
 """
 
 from __future__ import annotations
 
+import math
 import random
 import signal
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import FrameType
 from uuid import uuid4
 
@@ -34,7 +42,20 @@ PRODUCER_ID = "sim-01"
 _NOMINAL_VOLTAGE = 230.0
 _VOLTAGE_NOISE = 3.0
 
+# Further behind than this (30 real seconds, a meter's store-and-forward buffer) and the
+# producer skips ahead instead of replaying: a host that slept for an hour should not
+# flood Kafka with an hour of readings. The skipped ticks are logged as lost.
+_MAX_CATCH_UP_TICKS = 15
+
+# Nothing delivered for this long while messages wait, and the producer exits so that
+# compose restarts it with a fresh Kafka client (R39). After a few seconds of Docker DNS
+# failure, librdkafka once lost the partition leader from its cache and never found it
+# again: nine minutes of "tick complete" while every message timed out, until a restart
+# fixed it at once. Short of the 5-minute message timeout, so less is lost.
+_DELIVERY_STALL_SECONDS = 60.0
+
 _shutdown_requested = False
+_last_delivered = time.monotonic()
 
 
 def _request_shutdown(signum: int, frame: FrameType | None) -> None:
@@ -62,10 +83,21 @@ def _build_reading(household: Household, event_ts: datetime, rng: random.Random)
 
 
 def _delivery_report(err: KafkaError | None, msg: Message) -> None:
+    global _last_delivered
     if err is not None:
         get_logger("meter-producer").error(
             "Kafka delivery failed", extra={"stage": "produce", "kafka_error": str(err)}
         )
+    else:
+        _last_delivered = time.monotonic()
+
+
+def delivery_stalled(queued: int, last_delivered: float, now: float) -> bool:
+    """Messages are waiting and none has been delivered for `_DELIVERY_STALL_SECONDS`.
+
+    An empty queue is never a stall: a producer with nothing to send has nothing to lose.
+    """
+    return queued > 0 and now - last_delivered > _DELIVERY_STALL_SECONDS
 
 
 def _produce_reading(producer: Producer, topic: str, reading: MeterReading) -> None:
@@ -83,15 +115,43 @@ def _produce_reading(producer: Producer, topic: str, reading: MeterReading) -> N
     metrics.events_produced_total.labels(producer_id=PRODUCER_ID).inc()
 
 
+def tick_due(anchor_real: datetime, interval_seconds: float, index: int) -> datetime:
+    """The real instant tick `index` is due."""
+    return anchor_real + timedelta(seconds=interval_seconds * index)
+
+
+def first_tick_index(anchor_real: datetime, now_real: datetime, interval_seconds: float) -> int:
+    """The first grid point at or after `now_real`."""
+    elapsed = (now_real - anchor_real).total_seconds()
+    return max(0, math.ceil(elapsed / interval_seconds))
+
+
+def catch_up(
+    index: int, anchor_real: datetime, now_real: datetime, interval_seconds: float
+) -> tuple[int, int]:
+    """The tick to run next and how many were skipped to reach it.
+
+    A tick or two behind is made up by running the late ones immediately, each stamped
+    with its own grid time. Further behind than `_MAX_CATCH_UP_TICKS` jumps to the
+    current grid point.
+    """
+    behind = (now_real - tick_due(anchor_real, interval_seconds, index)).total_seconds()
+    if behind / interval_seconds <= _MAX_CATCH_UP_TICKS:
+        return index, 0
+    current = first_tick_index(anchor_real, now_real, interval_seconds)
+    return current, current - index
+
+
 def _run_tick(
     config: VoltstreamConfig,
     roster: list[Household],
     injector: FaultInjector,
     producer: Producer,
     rng: random.Random,
+    event_ts: datetime,
+    index: int,
 ) -> None:
     logger = get_logger("meter-producer")
-    event_ts = simclock.sim_now()
 
     produced = 0
     for household in roster:
@@ -107,6 +167,7 @@ def _run_tick(
         "tick complete",
         extra={
             "stage": "produce",
+            "tick": index,
             "sim_date": simclock.sim_date_of(event_ts).isoformat(),
             "households": len(roster),
             "readings_produced": produced,
@@ -137,12 +198,35 @@ def main() -> None:
     )
 
     rng = random.Random()
+    interval = config.simulation.emit_interval_seconds
+    anchor = simclock.sim_to_real(config.simulation.epoch_sim)
+    index = first_tick_index(anchor, datetime.now(UTC), interval)
+    global _last_delivered
+    _last_delivered = time.monotonic()
     try:
         while not _shutdown_requested:
-            tick_started = time.monotonic()
-            _run_tick(config, roster, injector, producer, rng)
-            elapsed = time.monotonic() - tick_started
-            time.sleep(max(0.0, config.simulation.emit_interval_seconds - elapsed))
+            if delivery_stalled(len(producer), _last_delivered, time.monotonic()):
+                logger.error(
+                    "nothing delivered to Kafka, exiting so the container restarts",
+                    extra={
+                        "stage": "produce",
+                        "queued": len(producer),
+                        "stalled_seconds": round(time.monotonic() - _last_delivered, 1),
+                    },
+                )
+                raise SystemExit(1)
+            index, skipped = catch_up(index, anchor, datetime.now(UTC), interval)
+            if skipped:
+                logger.warning(
+                    "producer fell behind, skipping ticks",
+                    extra={"stage": "produce", "ticks_skipped": skipped, "resume_tick": index},
+                )
+            due = tick_due(anchor, interval, index)
+            wait = (due - datetime.now(UTC)).total_seconds()
+            if wait > 0:
+                time.sleep(wait)
+            _run_tick(config, roster, injector, producer, rng, simclock.real_to_sim(due), index)
+            index += 1
     finally:
         logger.info("meter-producer shutting down, flushing", extra={"stage": "shutdown"})
         producer.flush(timeout=10)

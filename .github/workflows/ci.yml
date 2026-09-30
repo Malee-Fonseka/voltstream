@@ -1,0 +1,101 @@
+# voltstream — continuous integration (T169, T170).
+#
+# Everything here runs without the Compose stack: unit, property and consistency tests,
+# linting and types, the core/ coverage gate, and the alerting configuration. The
+# integration tests (`pytest -m integration`) need Kafka, Postgres and MinIO and run
+# locally with `make test-all`.
+
+name: ci
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+# A newer push to the same branch makes an older run's result irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: lint, types and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      # D1: Python 3.11 (inside PySpark 3.5's supported range) and Java 17. PySpark needs a
+      # JVM, and the consistency test runs a real local Spark session: without setup-java
+      # this job fails on the first Spark test, which is the usual way this goes red.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install
+        run: python -m pip install -e ".[dev,api,sim,spark]"
+
+      - name: ruff check
+        run: ruff check src tests
+
+      - name: ruff format
+        run: ruff format --check src tests
+
+      - name: mypy
+        run: mypy src
+
+      # D7: no identifier may use the misspelling. Same rule as `make lint`: comment lines
+      # are excluded, because the places that mention it are explaining that decision.
+      - name: D7 spelling
+        run: |
+          if grep -rni "volstream" src/ docker/ config/ airflow/ scripts/ tests/ \
+               | grep -vE ':\s*(#|--|//)'; then
+            echo "found 'volstream' (missing a t) in an identifier; see D7"
+            exit 1
+          fi
+
+      # T170: coverage is gated on core/ only. That is where the billing arithmetic lives
+      # and where the correctness marks are; gating the whole package would mostly reward
+      # testing glue. core/ is fully covered, lines and branches, so anything added there
+      # must arrive with its tests.
+      - name: Unit, property and consistency tests, with the core/ coverage gate
+        run: >-
+          pytest -m "not integration"
+          --cov=voltstream.core --cov-branch --cov-fail-under=100 --cov-report=term-missing
+
+  alerting:
+    name: alert rules and routing
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      # The same pinned images docker-compose.yml runs, so the checker is the server's
+      # own version. `make check-alerts` runs these locally.
+      - name: Prometheus config and alert rules
+        run: >-
+          docker run --rm -v "$PWD/config/prometheus:/etc/prometheus:ro"
+          --entrypoint promtool prom/prometheus:v3.15.0
+          check config /etc/prometheus/prometheus.yml
+
+      - name: Alert rule unit tests
+        run: >-
+          docker run --rm -v "$PWD/config/prometheus:/etc/prometheus:ro"
+          --entrypoint promtool prom/prometheus:v3.15.0
+          test rules /etc/prometheus/alert_rules.test.yml
+
+      - name: Alertmanager routing and inhibition
+        run: >-
+          docker run --rm -v "$PWD/config/alertmanager:/etc/alertmanager:ro"
+          --entrypoint amtool prom/alertmanager:v0.34.1
+          check-config /etc/alertmanager/alertmanager.yml

@@ -8,7 +8,242 @@
 # tables present, 50 seeded households across exactly 5 zones.
 #
 # Usage: bash scripts/smoke_test.sh   (run from anywhere inside the repository)
+#
+# Second mode, T167: `bash scripts/smoke_test.sh kill-speed-layer` answers §10.3's viva
+# question "what happens if the speed layer dies mid-day?" on the running stack. It kills
+# the speed layer (SIGKILL, no clean shutdown), shows the live view going stale while the
+# raw archiver keeps consuming, restarts it, shows it resume from its checkpoint, and shows
+# that bills are unaffected: a finalised day's bill is served identically before, during
+# and after the kill, and the day of the kill is billed in full, because billing reads the
+# master dataset, not the speed view.
+#
+# Third mode, T177: `bash scripts/smoke_test.sh cold-starts [N]` (default 5) wipes the
+# stack N times, starts it from nothing each time, and asserts no container restarts more
+# than once and data reaches the live view: startup order that holds by construction, not
+# by luck. About 4 minutes per start. DESTROYS the stack's data.
+#
+# Fourth mode, T175: `bash scripts/smoke_test.sh cold-start [--prune]` is §9 Gate 5. It
+# clones the committed repository into a new directory, copies .env.example to .env,
+# rebuilds the project's images with no cache and runs the demo there, with zero manual
+# steps. --prune also runs `docker system prune -af --volumes` first, which deletes every
+# unused Docker image, container, network and volume ON THE MACHINE, not only this
+# project's; it asks first. About 15-25 minutes. DESTROYS the stack's data.
 set -uo pipefail
+
+if [ "${1:-}" = "cold-starts" ] || [ "${1:-}" = "cold-start" ]; then
+    # shellcheck source=lib/common.sh
+    source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+    MODE="$1"
+
+    # Every service that runs for the life of the stack; the init jobs exit by design.
+    LONG_RUNNING="kafka postgres minio meter-producer reference-dropper raw-archiver speed-layer
+        api docker-socket-proxy airflow pushgateway sql-exporter alertmanager prometheus grafana"
+
+    stamp_anchor() {
+        local file="$1" anchor
+        anchor="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        if grep -q '^VOLTSTREAM_ANCHOR_REAL=' "${file}"; then
+            sed -i "s|^VOLTSTREAM_ANCHOR_REAL=.*|VOLTSTREAM_ANCHOR_REAL=${anchor}|" "${file}"
+        else
+            echo "VOLTSTREAM_ANCHOR_REAL=${anchor}" >> "${file}"
+        fi
+    }
+
+    # After a start: every long-running service up, none restarted more than once, and
+    # readings reaching the live view.
+    assert_settled() {
+        local label="$1" service restarts problems="" rows
+        for service in ${LONG_RUNNING}; do
+            if ! container_running "voltstream-${service}"; then
+                problems="${problems} ${service}:not-running"
+                continue
+            fi
+            restarts="$(docker inspect --format '{{.RestartCount}}' "voltstream-${service}")"
+            [ "${restarts}" -le 1 ] || problems="${problems} ${service}:${restarts}-restarts"
+        done
+        rows="$(psql_value "SELECT count(*) FROM zone_metrics_rt")"
+        [ "${rows:-0}" -gt 0 ] || problems="${problems} no-zone-windows"
+        if [ -z "${problems}" ]; then
+            pass "${label}: all 15 services up, none restarted more than once, ${rows} zone windows"
+        else
+            fail "${label}:${problems}"
+        fi
+    }
+
+    if [ "${MODE}" = "cold-starts" ]; then
+        STARTS="${2:-5}"
+        section "T177 — ${STARTS} cold starts"
+        say "each one wipes the stack, including its data, and starts it from nothing"
+        for i in $(seq 1 "${STARTS}"); do
+            say "cold start ${i}/${STARTS}: wiping"
+            compose down -v --remove-orphans >/dev/null 2>&1
+            stamp_anchor "${ENV_FILE}"
+            T0="$(date +%s)"
+            if ! compose up -d --wait --wait-timeout 600 >/dev/null 2>&1; then
+                fail "cold start ${i}: not every service became healthy within 600 s"
+                compose ps -a
+                continue
+            fi
+            say "  healthy after $(($(date +%s) - T0)) s; letting the streaming jobs settle for 120 s"
+            sleep 120
+            assert_settled "cold start ${i}"
+        done
+        summary || exit 1
+        exit 0
+    fi
+
+    # ---- T175: a fresh clone, cold ----
+    section "T175 — cold start from a fresh clone"
+    if [ "${2:-}" = "--prune" ]; then
+        echo "--prune deletes EVERY unused Docker image, container, network and volume on this"
+        read -r -p "machine, not only voltstream's. Type 'prune' to continue: " answer
+        [ "${answer}" = "prune" ] || { echo "cancelled"; exit 2; }
+    fi
+    CLONE="$(mktemp -d "${TMPDIR:-/tmp}/voltstream-cold.XXXXXX")/voltstream"
+    say "cloning the committed repository (HEAD $(git -C "${REPO_ROOT}" rev-parse --short HEAD)) into ${CLONE}"
+    if [ -n "$(git -C "${REPO_ROOT}" status --porcelain)" ]; then
+        say "  note: uncommitted changes in ${REPO_ROOT} are not in the clone; this tests HEAD"
+    fi
+    git clone --quiet "${REPO_ROOT}" "${CLONE}" || { fail "git clone failed"; summary; exit 1; }
+    cp "${CLONE}/.env.example" "${CLONE}/.env"
+    pass "fresh clone, .env copied from .env.example"
+
+    say "removing the running stack, its volumes and the project's images"
+    compose down -v --remove-orphans >/dev/null 2>&1
+    docker image rm -f voltstream-app:local voltstream-spark:local voltstream-airflow:local >/dev/null 2>&1
+    if [ "${2:-}" = "--prune" ]; then
+        docker system prune -af --volumes >/dev/null 2>&1 && say "  docker system prune done"
+    fi
+
+    CLONE_COMPOSE=(docker compose --env-file "${CLONE}/.env" -f "${CLONE}/docker/docker-compose.yml")
+    T0="$(date +%s)"
+    say "building the images from the clone with no cache (the slow part)"
+    if "${CLONE_COMPOSE[@]}" build --no-cache >"${CLONE}/build.log" 2>&1; then
+        pass "images built from scratch in $(($(date +%s) - T0)) s"
+    else
+        fail "image build failed; see ${CLONE}/build.log"
+        tail -n 20 "${CLONE}/build.log"
+        say "  the stack is down and its images removed: .\\scripts\\voltstream.ps1 start (or make up)"
+        say "  rebuilds them and restarts it; delete $(dirname "${CLONE}") once the log is read"
+        summary
+        exit 1
+    fi
+
+    say "running the demo from the clone, exactly as a new user would"
+    T0="$(date +%s)"
+    if bash "${CLONE}/scripts/demo.sh"; then
+        pass "demo passed from a fresh clone in $(($(date +%s) - T0)) s, with no manual steps"
+    else
+        fail "the demo failed from a fresh clone"
+    fi
+
+    # Hand the stack back to this checkout: same data, same clock, this directory's config.
+    say "handing the running stack back to ${REPO_ROOT}"
+    sed -i "s|^VOLTSTREAM_ANCHOR_REAL=.*|$(grep '^VOLTSTREAM_ANCHOR_REAL=' "${CLONE}/.env")|" "${ENV_FILE}"
+    compose up -d --force-recreate --wait --wait-timeout 600 >/dev/null 2>&1 \
+        && say "  the stack now runs from this checkout, on the clone's clock" \
+        || say "  could not recreate the stack here: run .\\scripts\\voltstream.ps1 start"
+    rm -rf "$(dirname "${CLONE}")"
+    summary || exit 1
+    exit 0
+fi
+
+if [ "${1:-}" = "kill-speed-layer" ]; then
+    # shellcheck source=lib/common.sh
+    source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+    HOUSEHOLD="${2:-HH-0001}"
+    OUTAGE_SECONDS=60
+    require_stack
+
+    bill_total() {
+        curl -s --max-time 10 "${API}/api/v1/households/${HOUSEHOLD}/bill?date=$1" \
+            | sed -n 's/.*"total":"\{0,1\}\([^",}]*\).*/\1/p'
+    }
+    readings_of() {
+        psql_value "SELECT readings_count FROM household_bill_daily WHERE household_id = '${HOUSEHOLD}' AND sim_date = '$1'"
+    }
+
+    section "T167 — kill the speed layer mid-day"
+    KILL_DAY="$(sim_today)"
+    FINAL_DAY="$(psql_value "SELECT max(sim_date) FROM pipeline_runs WHERE layer = 'batch_billing' AND status = 'success'")"
+    [ -n "${FINAL_DAY}" ] || { echo "no billed day yet; run this once the first day is billed" >&2; exit 2; }
+    BEFORE="$(bill_total "${FINAL_DAY}")"
+    ARCHIVED_BEFORE="$(prom_value 'sum(voltstream_events_consumed_total{layer="archiver"})' | cut -d. -f1)"
+    say "simulated $(sim_now_text); killing the speed layer during ${KILL_DAY}"
+    say "${HOUSEHOLD}'s final bill for ${FINAL_DAY} before the kill: ${BEFORE}"
+
+    docker kill voltstream-speed-layer >/dev/null
+    on_exit_undo "docker start voltstream-speed-layer >/dev/null"
+    say "speed layer killed (SIGKILL); down for ${OUTAGE_SECONDS} s"
+    sleep "${OUTAGE_SECONDS}"
+
+    DURING="$(bill_total "${FINAL_DAY}")"
+    AGE="$(prom_value 'max(voltstream_pg_zone_data_age_seconds)' | cut -d. -f1)"
+    ARCHIVED_DURING="$(prom_value 'sum(voltstream_events_consumed_total{layer="archiver"})' | cut -d. -f1)"
+    say "during the outage: the live zone view is ${AGE} s old (the dashboard gap), while the"
+    say "raw archiver consumed $((ARCHIVED_DURING - ARCHIVED_BEFORE)) more readings into the master dataset"
+    if [ "${ARCHIVED_DURING}" -gt "${ARCHIVED_BEFORE}" ]; then
+        pass "the batch layer's input kept flowing while the speed layer was down"
+    else
+        fail "the raw archiver stopped consuming too"
+    fi
+    if [ -n "${DURING}" ] && [ "${DURING}" = "${BEFORE}" ]; then
+        pass "the final bill for ${FINAL_DAY} is still served, unchanged (${DURING}), with the speed layer down"
+    else
+        fail "the final bill for ${FINAL_DAY} changed or vanished during the outage ('${DURING}')"
+    fi
+
+    docker start voltstream-speed-layer >/dev/null
+    forget_undo "docker start voltstream-speed-layer >/dev/null"
+    T0="$(date +%s)"
+    say "speed layer started; it resumes from its checkpoint, not from the head of the topic"
+    caught_up() {
+        local age lag
+        age="$(prom_value 'max(voltstream_pg_zone_data_age_seconds)' | cut -d. -f1)"
+        lag="$(prom_value 'max(voltstream_consumer_lag{layer="speed"})' | cut -d. -f1)"
+        [ -n "${age}" ] && [ "${age}" -lt 30 ] && [ "${lag:-1}" = "0" ]
+    }
+    if wait_until 300 "the speed layer to catch up" caught_up; then
+        pass "caught up $(($(date +%s) - T0)) s after the restart: live view fresh, consumer lag 0"
+    else
+        fail "the speed layer had not caught up 300 s after the restart"
+    fi
+    # Its consumed counter restarted at 0 with the process, so it now counts everything read
+    # since the restart: the backlog from the checkpoint, then the live stream. (The lag
+    # gauge cannot show the backlog: it is set after each micro-batch, and the first one
+    # after a restart reads the whole backlog.)
+    READ_SINCE="$(prom_int 'sum(voltstream_events_consumed_total{layer="speed"})')"
+    say "  it has read ${READ_SINCE:-?} records since the restart, starting from its checkpoint: the"
+    say "  ${OUTAGE_SECONDS} s it missed (about $((OUTAGE_SECONDS * 25)) readings at 25/s), then the live stream"
+
+    AFTER="$(bill_total "${FINAL_DAY}")"
+    if [ "${AFTER}" = "${BEFORE}" ]; then
+        pass "the final bill for ${FINAL_DAY} is identical before, during and after the kill (${AFTER})"
+    else
+        fail "the final bill for ${FINAL_DAY} changed: ${BEFORE} before, ${AFTER} after"
+    fi
+
+    section "The day of the kill, once billed"
+    billed() { [ "$(psql_value "SELECT count(*) FROM pipeline_runs WHERE sim_date = '${KILL_DAY}' AND layer = 'batch_billing' AND status = 'success'")" = "1" ]; }
+    say "${KILL_DAY} closes in about $(real_seconds_to_sim_midnight) s; billing follows within two minutes"
+    if wait_until $(($(real_seconds_to_sim_midnight) + 420)) "${KILL_DAY} to be billed" billed; then
+        BILLS="$(psql_value "SELECT count(*) FROM household_bill_daily WHERE sim_date = '${KILL_DAY}'")"
+        R_KILL="$(readings_of "${KILL_DAY}")"
+        R_PREV="$(readings_of "$(date -u -d "${KILL_DAY} - 1 day" +%Y-%m-%d)")"
+        say "${HOUSEHOLD}: ${R_KILL} readings billed for ${KILL_DAY}, ${R_PREV} for the day before"
+        if [ "${BILLS}" = "50" ] && [ -n "${R_KILL}" ] && [ -n "${R_PREV}" ] \
+            && [ $((R_KILL * 100)) -ge $((R_PREV * 95)) ]; then
+            pass "${KILL_DAY} billed in full: 50 bills, and no readings lost to the outage"
+        else
+            fail "${KILL_DAY}: ${BILLS} bills, ${R_KILL} readings against ${R_PREV} the day before"
+        fi
+        say "${HOUSEHOLD}'s final bill for ${KILL_DAY}: $(bill_total "${KILL_DAY}")"
+    else
+        fail "${KILL_DAY} was not billed"
+    fi
+    summary || exit 1
+    exit 0
+fi
 
 # Git Bash on Windows (this project's primary dev shell, §T009) rewrites bare
 # absolute-looking arguments like `/opt/kafka/bin/...` or `/bin/sh` into Windows paths

@@ -13,7 +13,7 @@ from voltstream.config import get_config
 from voltstream.logging_setup import get_logger
 
 # One registry, shared by every metric below and by whichever server exposes them —
-# either start_metrics_server() (non-HTTP services) or the FastAPI instrumentator (API).
+# either start_metrics_server() (non-HTTP services) or the API's own /metrics route.
 REGISTRY = CollectorRegistry()
 
 # Seconds. Covers "well under a second" up to a few minutes, log-ish spacing, so both the

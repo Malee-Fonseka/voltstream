@@ -13,6 +13,10 @@ from voltstream.contracts.events import MeterReading
 
 DedupKey = tuple[str, datetime]
 
+# The same key as column names, for the Spark jobs: the batch layer's window dedup and the
+# speed layer's streaming dedup both use this, so they cannot disagree about a duplicate.
+DEDUP_COLUMNS: tuple[str, str] = ("meter_id", "event_ts")
+
 
 def dedup_key(reading: MeterReading) -> DedupKey:
     """Two readings are the same event iff they share `(meter_id, event_ts)` — not

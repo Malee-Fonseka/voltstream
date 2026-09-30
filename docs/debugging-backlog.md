@@ -3,7 +3,7 @@
 **Reviewed:** 2026-09-26, commit `0e58e3a` on `dev`, against Phases 0–10 of
 [`Implementation_Tasks.md`](Implementation_Tasks.md).
 **Purpose:** the work list for a debugging session once the remaining phases are
-implemented. Nothing here has been fixed yet.
+implemented. Fixed items are ticked, with the date and what changed.
 
 Line numbers are as of `0e58e3a` and will drift. Every item also names the function or
 section, so search for that if a line reference no longer lands.
@@ -47,8 +47,12 @@ outputs look wrong in predictable ways. Don't debug the symptom in the new code:
 | `LowRenewableContribution` cannot be forced via cloud cover (T160) | R16 |
 
 R06 (lag), R07 (batch duration) and R21 (latency) were fixed on 2026-09-26, before Phase 12,
-because Phase 12's dashboards and alerts read those metrics directly. Batch pushes only take
-effect once Phase 12 sets `observability.pushgateway_url`.
+because Phase 12's dashboards and alerts read those metrics directly. Batch pushes took
+effect in Phase 12 (2026-09-27): the DAG now points the three batch jobs at the Pushgateway.
+
+R01, R02, R04, R05 and R08 were fixed on 2026-09-27, so the rows above for them no longer
+apply. After R02 the expected picture is D4's revised one: `tariff_effect` non-zero on every
+row with a sign that alternates by day, and `data_effect` carrying the dropped backfill.
 
 ---
 
@@ -91,13 +95,28 @@ effect once Phase 12 sets `observability.pushgateway_url`.
 | R33 | Low | storage | Some repository functions return raw tuples | T101 |
 | R34 | Low | tests | Small inconsistencies in property test / T062 grep | T060, T062 |
 | R35 | Low | batch | A household with no valid readings gets no bill → row-count check fails | T113, T122 |
+| R36 | Medium | DAG / compose | DAG tasks always get the default Postgres and MinIO passwords | T121, D6 |
+| R37 | Low | simulators | A stalled producer tick is never made up: 138 readings per meter-day, not 150 | T072 |
+| R38 | High | batch / DAG | A transient DNS or connection failure fails a batch job outright; the rollup never retries, and a killed job leaves a `running` row forever | T113, T124, T122 |
+| R39 | High | simulators | After a brief Docker DNS outage the producer keeps ticking, but every message times out and it never recovers until restarted | T072 |
+| R40 | High | Airflow / compose | A Postgres blip kills Airflow's scheduler; `airflow standalone` does not restart it, and the container stays up, so nothing is billed | T120, D6 |
 
 ---
 
 ## Blockers
 
 ### R01 — Stale-tariff divergence is always zero
-- [ ] Fixed
+- [x] Fixed 2026-09-27 (minimum fix): the dropper now steps `block_1_rate` by +0.50 on even
+  date ordinals, and `block_2_rate` is constant. `tests/unit/test_reference_dropper.py` runs
+  one simulated day through the real profiles and checks that yesterday's and today's
+  tariffs price all 50 households differently; it fails on the old rule. D2 records the change.
+  - **Still open, a design decision:** the block boundaries are unchanged, so no bill
+    reaches block 2 and the tier breakdown is still never exercised (the "Better" fix below).
+  - **Caveat for T162:** the backfill demo's example corruption (`block_2_rate`
+    `16.50 → 61.50`, in D2 and `Implementation_Tasks.md`) changes no bill. Corrupt
+    `block_1_rate` or `fixed_charge`. D2 now says so; the task text does not.
+  - **Verified live** (Gate 4 run, 2026-09-27): `tariff_effect` non-zero for all 50
+    households on both days, positive on 2026-01-01 and negative on 2026-01-02.
 
 **Where:** [`simulators/reference_dropper.py:75-77`](../src/voltstream/simulators/reference_dropper.py#L75-L77) `_block_2_rate_for`
 
@@ -155,7 +174,25 @@ boundaries are rescaled, at least some bills should have non-zero kWh in block 2
 ---
 
 ### R02 — Speed layer counts duplicates; batch removes them
-- [ ] Fixed
+- [x] Fixed 2026-09-27 (option 1): `speed_layer.deduplicated()` sets the watermark and
+  drops duplicates on `core.keys.DEDUP_COLUMNS`, the key the batch layer's window dedup now
+  uses too. Both aggregations read its output.
+  - `dropDuplicates` rather than `dropDuplicatesWithinWatermark`: the key contains the
+    watermarked `event_ts`, which is the documented pattern for plain `dropDuplicates`, and
+    each key's state is evicted once the watermark passes it. Both variants drop records
+    older than the watermark.
+  - Consequence, recorded in D3, D4 and `assumptions.md` §2: backfill older than the
+    watermark is now missing from the **daily** totals too, so `data_effect` carries D3's
+    ~1.7 % as originally designed. Reordering is still not dropped at the daily grain.
+  - T094's probe dedups the archive side. Its daily test asserts the 0.25–5 % band; the
+    control (dropouts off) asserts under 0.05 %.
+  - **Measured live** (Gate 4 run, 2026-09-27): daily gap 0.523 % on 2026-01-02, inside the
+    band and below the modelled 1.7 % (D4 "Measured attribution" explains why). Duplicates:
+    the batch layer removed 127 and the speed layer counted none.
+  - **The probe has not been re-run.** Run `pytest -m integration tests/integration/test_watermark_behaviour.py`
+    for the control (reordering alone) and record the figures.
+  - **Run `clean` before the next start.** The zone query gained a dedup operator, so its
+    old checkpoint cannot be restored.
 
 **Where:**
 
@@ -202,7 +239,15 @@ total for a closed day, or the docs state the duplicate effect with a measured n
 ---
 
 ### R03 — Tariff written at the start of the day; D3 grace never waits
-- [ ] Fixed
+- [x] Fixed 2026-09-29, as recommended below. The dropper writes `tariff_D` at the D→D+1
+  rollover and `weather_D` as D starts, polling every real second (4.8 simulated minutes).
+  On start it writes the tariff of every closed day since the newest one in the bucket
+  (`closed_days_owed`, capped at a week): yesterday alone on a fresh stack (the T075
+  seed), and the missed days after a restart. The watcher's `days[:-1]` exclusion is gone,
+  so a day is billed when its tariff arrives. Unit tests in `test_reference_dropper.py`.
+  **Verified live:** `tariff_2026-01-01` landed at 04:37:55.568, the simulated midnight.
+  The grace task logged `sleeping 37.8s`, the rest of its 90 s after the watcher's
+  one-minute poll. All eight tasks succeeded.
 
 **Where:**
 
@@ -243,7 +288,12 @@ Consequences:
 ---
 
 ### R04 — Every cold start leaves a permanently failed billing run
-- [ ] Fixed
+- [x] Fixed 2026-09-27 (recommended fix): `list_pending_days()` only offers a day with at
+  least one object under `voltstream-raw/meter_readings/sim_date=<day>/`
+  (`S3Hook.list_keys(max_items=1)`), and logs the days it skips. Checked in the Airflow
+  image against the object store: the seed day was skipped and only the first real day
+  triggered. `voltstream.ps1 check` now reports a failed seed-day run as a regression.
+  **Verified live** (Gate 4 run): no run for 2025-12-31; both billing runs `success`.
 
 **Where:**
 
@@ -273,7 +323,11 @@ The alternative is to make an empty day a successful zero-row run and relax
 ---
 
 ### R05 — Trace-id dependency: null trace ids and a `ValueError` per request
-- [ ] Fixed
+- [x] Fixed 2026-09-27: `trace_id_provider` is `async`, with the same body.
+  `tests/unit/test_api_dependencies.py` checks the logged `trace_id` against the response
+  header for a sync and an async endpoint, with `TestClient` defaults. It fails on the old
+  code with the `ValueError`. `/health` and `/metrics` still don't declare the dependency
+  (the middleware option), which T104 doesn't require.
 
 **Where:** [`api/dependencies.py:32-46`](../src/voltstream/api/dependencies.py#L32-L46) `trace_id_provider`
 
@@ -340,6 +394,7 @@ stays flat, and the lag falls back after restart.
 
 ### R07 — Batch duration never reaches a backend (T116)
 - [x] Fixed 2026-09-26 — Pushgateway chosen. `daily_billing` and `daily_zone_rollup` call `metrics.push_metrics()` after committing; a push failure is a logged warning, never a failed run. Pushes are no-ops until `observability.pushgateway_url` is set in Phase 12.
+  **Live since Phase 12 (2026-09-27):** the DAG sets `VOLTSTREAM__OBSERVABILITY__PUSHGATEWAY_URL` for billing, the rollup and reconciliation. Verified: the first run pushed 16.5 s (billing) and 12.8 s (rollup), shown on the pipeline health dashboard.
 
 **Where:**
 
@@ -364,7 +419,13 @@ Record the choice for the report.
 ---
 
 ### R08 — Daily report file is deleted with its container (T131)
-- [ ] Fixed
+- [x] Fixed 2026-09-27 (object-store option): `generate_report.py` publishes to
+  `voltstream-archive/reports/report_<date>.md` (`objectstore.report_key`) and still writes
+  a local file with `--out DIR`. The DAG task runs on the **app** image with object-store
+  credentials; the Spark image no longer copies `scripts/`. `voltstream.ps1 check` lists the
+  report in stage 9. Tests: `tests/unit/test_generate_report.py`. Needs `build` for both
+  images. **Verified live** (Gate 4 run): `report_2026-01-01.md` and `report_2026-01-02.md`
+  listed in the archive bucket, both FINAL.
 
 **Where:**
 
@@ -388,7 +449,13 @@ reconciliation) to the app image.
 ---
 
 ### R09 — `/bill/delta` contradicts D4/D5 (T129)
-- [ ] Fixed
+- [x] Fixed 2026-09-28, for T163's demo, which shows the delta. `delta = speed_estimate −
+  batch_final` (D4), so `delta == tariff_effect + data_effect` once reconciled.
+  `delta_pct` goes through `pct_divergence`, moved from `batch/reconciliation.py` to
+  `core/money.py` so the API and the reconciliation job share one definition (D5's gross
+  charges base). `BillDelta`'s field descriptions are updated.
+  `tests/unit/test_api_bill_delta.py` covers the sign, the identity, the net exporter and the
+  open day; two of its tests fail on the old code.
 
 **Where:** [`api/routers/households.py:165-176`](../src/voltstream/api/routers/households.py#L165-L176) `get_bill_delta`
 
@@ -462,10 +529,128 @@ lines, to match `make lint`.
 
 ---
 
+### R38 — Transient infrastructure failures are fatal to a day's batch run
+- [x] Fixed 2026-09-28:
+  - `storage.postgres.connect()` is now the one way to open a short-lived connection. It
+    retries *establishing* one on `psycopg.OperationalError`, five attempts over about
+    15 s, and never retries a query. The speed layer's sinks, the billing and rollup jobs
+    and the repositories' no-pool fallback all use it. A unit test fails if any module
+    calls `psycopg.connect` directly again.
+  - `daily_billing._start_run` marks the day's leftover `running` rows `failed` in the
+    same transaction that opens its own (safe with `max_active_runs=1`).
+  - The rollup keeps `retries=0`: its cross-check verdict is still never retried, and its
+    connection is.
+  - Tests: `tests/unit/test_postgres_connect.py`, and the abandoned-run test in
+    `test_daily_billing.py`.
+  - The sinks are the speed layer's path to Postgres, and the one that killed a streaming
+    query on a single failed lookup and restarted the container 15 times. Spark's own S3A
+    and Kafka clients already retry on their own, so they were left as they are.
+
+*Found 2026-09-28, by the Phase 13 fault drills, on a saturated laptop (the SLA-pause backlog
+catching up, the divergence fault running, and an image build at the same time).*
+
+**What happened, from the Airflow logs:**
+
+- `billing__2026-02-22`: `run_zone_rollup` failed with
+  `failed to resolve host 'postgres': [Errno -3] Temporary failure in name resolution`, a
+  transient Docker DNS timeout. It has `retries=0`, so `run_reconciliation` and
+  `generate_report` never ran for that day: no reconciliation row, no report.
+- `billing__2026-02-24`: `run_daily_billing` failed the same way; its retry succeeded. The
+  failed attempt left its `pipeline_runs` row at `running` for good, since it could not
+  reach Postgres to mark itself `failed`.
+- `billing__2026-02-23`: a first billing attempt died in Spark (`An error occurred while
+  calling o65.count`, a block write failing under memory pressure); the retry succeeded.
+
+**What's wrong:**
+
+- The batch jobs open connections with bare `psycopg.connect` (`daily_billing.py`,
+  `daily_zone_rollup.py`, `storage/postgres.py`), so one failed DNS lookup ends the job.
+- The rollup's `retries=0` is deliberate: a failed cross-check is a data verdict, and
+  retrying it only fails again more slowly. But it makes every transient failure before
+  the cross-check fatal too, and everything downstream of the rollup is lost for the day.
+- An attempt killed before it can write `failed` leaves an orphan `running` row. Nothing
+  reads `running` rows for decisions, so bills are unaffected, but the ledger shows a run
+  that never ended.
+
+**Fix:**
+
+- Retry connection *establishment* only, a few times with backoff, on
+  `psycopg.OperationalError`, in one shared helper used by the batch jobs. A cross-check
+  verdict is still never retried.
+- Or give the rollup `retries=1` and accept one slow repeat of a genuine cross-check
+  failure.
+- On start, mark the day's stale `running` rows from earlier attempts `failed`.
+- Meanwhile, recover a lost day by clearing the failed task in Airflow (Graph →
+  `run_zone_rollup` → Clear), which reruns it and everything downstream.
+
+---
+
+### R39 — The producer never recovers from a brief broker outage
+- [x] Fixed 2026-09-29, as below: with messages queued and nothing delivered for 60 s,
+  the producer logs an error and exits 1, and `restart: unless-stopped` gives it a fresh
+  client. `delivery_stalled` is unit-tested.
+
+*Found 2026-09-29, while verifying R03–R37 on the live stack.*
+
+**Where:** [`simulators/meter_producer.py`](../src/voltstream/simulators/meter_producer.py) `main()` and `_delivery_report()`.
+
+**What happened:** at 04:50, during a billing run's Spark container, Docker's DNS stopped
+resolving `kafka` for a few seconds (the T176 memory pressure; the VM was still at
+7.46 GiB). The broker's heartbeat to its own KRaft controller failed with
+`UnknownHostException: kafka`, and the partitions briefly lost their leader. The
+broker recovered within a minute. The producer did not: librdkafka logged "new leader-1
+not found in cache", and for the next nine minutes every message sat in its local
+queue and was dropped after `message.timeout.ms` (6,175 "Kafka delivery failed"
+errors). Meanwhile the producer kept logging "tick complete". Restarting the container
+fixed it at once, with 412 messages in the next 15 s.
+
+**Effect:** every reading from about 2026-01-04 20:00 to 2026-01-06 00:40 simulated was
+lost. The day-4 bills were computed, correctly, from the partial day. MeterDataStale
+fired for all five zones, so the outage was visible; nothing acted on it.
+
+**Fix:** have the producer exit when deliveries keep failing, for example when nothing has
+been delivered for 60 real seconds while messages were queued. Compose's
+`restart: unless-stopped` then restarts it with a fresh client, which is what fixed it by
+hand. Giving Docker 10 GB (runbook §0) removes the DNS stall that triggered it.
+
+---
+
+### R40 — Airflow's scheduler dies with a Postgres blip and nothing restarts it
+- [ ] Fixed
+
+*Found 2026-09-29, verifying R31 by stopping Postgres for about 10 s.*
+
+**Where:** [`docker/docker-compose.yml`](../docker/docker-compose.yml), the `airflow` service
+(`command: ["standalone"]`, D6's one-container choice).
+
+**What happened:** the scheduler lost its metadata database and exited ("Shutting down:
+Master", 06:40:47). `airflow standalone` supervises nothing, so the scheduler stayed dead
+while the DAG processor and API server kept the container running. `restart:
+unless-stopped` therefore never fired. For 13 minutes no DAG ran: no watcher, no billing,
+with two days' tariffs waiting. A `docker restart voltstream-airflow` recovered it, and
+the waiting days were billed.
+
+**Effect:** orchestration stops silently. BatchSLAMiss fires after 15 minutes, which is
+what would catch it.
+
+**Fix (pick):**
+
+- Run the scheduler as its own compose service with `restart: unless-stopped`, leaving
+  `standalone` for the rest. This costs one more container (about 300 MB), which D6 tried
+  to avoid.
+- Or replace `standalone` with a small entrypoint that exits when any of its processes
+  exits, so the container's restart policy applies.
+- Either way, add a healthcheck on the scheduler's heartbeat
+  (`airflow jobs check --job-type SchedulerJob --local`), so `voltstream.ps1 check` and
+  `compose ps` show it.
+
+---
+
 ## Medium
 
 ### R14 — D2's config validation is missing
-- [ ] Fixed
+- [x] Fixed 2026-09-29: a `TariffConfig` validator enforces three blocks, positive and
+  strictly increasing bounds, and one unbounded block, last. Tests in `test_config.py`.
 
 [`config.py:55-57`](../src/voltstream/config.py#L55-L57) `TariffConfig` has no
 validators. D2 requires failing at load when:
@@ -501,7 +686,11 @@ built "reading everything from config". Violations:
 ---
 
 ### R16 — Weather has no effect on solar (T066)
-- [ ] Fixed
+- [x] Decided 2026-09-28: **not fixed.** Data-generation accuracy is out of scope; the focus
+  is the pipeline and its orchestration. T160 demonstrates LowRenewableContribution through
+  the simulated night instead (`inject_faults.sh renewable`), which needs no data change.
+  Even fixed, 100 % cloud leaves 20 % of solar (`_SOLAR_CLOUD_ATTENUATION`), not reliably
+  under 15 % at midday.
 
 [`simulators/meter_producer.py:47`](../src/voltstream/simulators/meter_producer.py#L47)
 calls `solar_kwh(...)` without `cloud_cover_pct`, so it is always 0. T066 requires
@@ -598,7 +787,16 @@ partition. Re-record the evidence.
 ---
 
 ### R22 — Tariff reading gaps (T113)
-- [ ] Fixed
+- [x] Fixed 2026-09-29. Both Spark layers read the file through one function,
+  `streaming/reference.py` `read_tariff`: every column as text, the header checked by name
+  (`enforceSchema=false`, so swapped columns fail), and every row validated by
+  `contracts.reference.applicable_tariffs`. That is the effective-dated `TariffRecord`
+  parser reconciliation already used, moved next to the contract. `subsidy_flag` now
+  accepts what the contract accepts (`true`, `1`, `True`, …). The weather join is recorded
+  as a cut in `assumptions.md` §5: nothing in a bill depends on the weather. Tests in
+  `test_daily_billing.py`.
+  The DataFrame is coalesced to one partition: built from fifty rows it had one per core,
+  and archiving it opened 16 Parquet writers at once (heap warnings on a swapping VM).
 
 **Where:**
 
@@ -627,7 +825,14 @@ partition. Re-record the evidence.
 ---
 
 ### R23 — Batch rejects: DLQ duplicates and non-idempotent inserts
-- [ ] Fixed
+- [x] Fixed 2026-09-29, as recommended below. The batch job collects its rejects
+  (`sinks.collect_rejected`, still counted in `records_rejected_total{layer="batch"}`) and
+  `finalise` deletes the day's `stage='batch'` rows and inserts the new ones in the bill
+  transaction. Nothing from the batch layer goes to the DLQ. `get_rejected_for_day` takes
+  a stage: the report and `/reports/daily` count the batch layer's rejects once a day is
+  final and the speed layer's before that (`reject_stage_for`). **Verified live:** 117
+  batch rows for 117 distinct readings on 2026-01-01, and the report shows 117, where
+  the old query would have counted both layers (237).
 
 **Where:**
 
@@ -642,7 +847,10 @@ partition. Re-record the evidence.
 - It inserts into `rejected_records` **before** the bill transaction, with no idempotency
   key. Each DAG retry (`retries=2`) and each restatement adds another full set.
 - `get_rejected_for_day` counts speed and batch rows together, so report reject counts
-  are at least 2× reality.
+  are at least 2× reality. **Confirmed on the Gate 4 run:** `report_2026-01-01.md` lists
+  212 rejects. `rejected_records` holds 105 distinct rejected readings with
+  `stage='batch'` and the same 105 again with `stage='speed'`, plus 2 more speed rows for
+  injected duplicates of bad readings: the speed layer validates before it dedups.
 
 **Fix:**
 
@@ -654,7 +862,14 @@ partition. Re-record the evidence.
 ---
 
 ### R24 — Zone rollup lineage and netting (T124)
-- [ ] Fixed
+- [x] Fixed 2026-09-29. The rollup writes `batch_rollup` ledger rows (running, then
+  success in the same transaction as its rows, superseding the day's previous one, or
+  failed) through a new `batch/ledger.py` that billing now uses too. It nets each
+  household's daily totals, as the bill does, before summing by zone, so zone
+  `self_consumed_kwh` and `export_kwh` are the sums of the households' bill figures.
+  `cross_check` has unit tests (`test_zone_rollup.py`). **Verified live:** for 2026-01-01,
+  the zone and bill sums of `self_consumed_kwh` match (176.3673), and so do those of
+  `export_kwh`.
 
 **Where:** [`batch/daily_zone_rollup.py`](../src/voltstream/batch/daily_zone_rollup.py)
 
@@ -679,7 +894,15 @@ partition. Re-record the evidence.
 ---
 
 ### R25 — Restatement overwrites history
-- [ ] Decided / fixed
+- [x] Fixed 2026-09-29, all three options below. There is a new append-only
+  `household_bill_history` table (`LIKE household_bill_daily`, keyed by `pipeline_run_id`),
+  written in the bill transaction. The tariff is archived per run under
+  `tariff/sim_date=…/run_id=…/`. `finalise` deletes the day's bills and inserts them, rather
+  than upserting. D6 has a dated update stating the rule, and `backfill.sh` prints every
+  run's bills. T172 checks all three runs' bills and archives.
+  **Verified live:** restating 2026-01-03 left both runs in the history (the Airflow run
+  `superseded`, the restatement `success`, 50 bills each, both totalling 18,482.76) and two
+  `run_id=` archive directories.
 
 **Where:**
 
@@ -708,7 +931,10 @@ Otherwise soften the D6 and report wording.
 ---
 
 ### R26 — Speed and batch are forking outside `core/`
-- [ ] Fixed
+- [x] Fixed 2026-09-29. Both layers use `get_config().tariff.boundaries()`,
+  `sources.known_household_ids()` and `sources.event_ts_bounds()`, and the rollup no longer
+  imports billing's private helpers. The tariff reader (R22) and the run ledger
+  (`batch/ledger.py`, R24) are shared too.
 
 These are duplicated, some with different mechanisms:
 
@@ -734,7 +960,10 @@ wants for the Spark readers too.
 ---
 
 ### R27 — Tests that copy the code under test
-- [ ] Fixed
+- [x] Fixed 2026-09-29. T118: the effective-dated test calls `read_tariff` on a CSV file
+  (with R22). T128: the merge tests call the router's `get_bill` itself, and the
+  "neither" case asserts the 404. Host-side integration tests also connect now, because
+  config falls back to `.env`'s `POSTGRES_PASSWORD`.
 
 - **T128:** [`tests/integration/test_merge_function.py:104-111`](../tests/integration/test_merge_function.py#L104-L111)
   `_merge_source()` re-implements the merge. If `households.get_bill` dropped the
@@ -744,6 +973,37 @@ wants for the Spark readers too.
 - **T118:** [`tests/unit/test_daily_billing.py:148-178`](../tests/unit/test_daily_billing.py#L148-L178)
   rebuilds the effective-dated window inside the test instead of calling `read_tariff`.
   Split `read_tariff` into I/O plus a pure `select_effective(df, sim_date)` and test that.
+
+---
+
+### R36 — DAG tasks always get the default Postgres and MinIO passwords
+- [x] Fixed 2026-09-29, as recommended below; `test_compose_files.py` guards it. Not run
+  end to end with a non-default password. `POSTGRES_USER` has the same gap in every
+  service, not only Airflow: they all take the user from `config/base.yaml`.
+
+*Found 2026-09-27, while fixing R08.*
+
+**Where:**
+
+- [`airflow/dags/daily_billing_dag.py`](../airflow/dags/daily_billing_dag.py): every
+  `DockerOperator`'s `private_environment`
+- [`docker/docker-compose.yml`](../docker/docker-compose.yml): the `airflow` service's
+  `environment`
+
+**What's wrong:** each task passes `os.environ.get("POSTGRES_PASSWORD", "voltstream")`,
+`os.environ.get("MINIO_ROOT_USER", "voltstream")` and
+`os.environ.get("MINIO_ROOT_PASSWORD", "voltstream-dev")`. The airflow container has none of
+these variables: compose uses them only inside the two `AIRFLOW_CONN_*` URLs and the
+metadata-database URL. So the tasks always get the defaults. With the default `.env`
+nothing breaks. Change either password in `.env` and every billing, rollup,
+reconciliation and report task fails to authenticate, while the watcher's S3 hook, which
+reads the connection, keeps working.
+
+**Fix:** pass `POSTGRES_PASSWORD`, `MINIO_ROOT_USER` and `MINIO_ROOT_PASSWORD` to the
+`airflow` service's `environment` in compose, with the same defaults.
+
+**Done when:** with a non-default `POSTGRES_PASSWORD` in `.env`, a `daily_billing` run
+succeeds.
 
 ---
 
@@ -769,7 +1029,17 @@ gave `get_client` the path-style addressing the dropper sets.
 - **T071:** the rate test omits `out_of_order_rate` and `dropout_probability_per_meter_tick`.
 
 ### R30 — Documentation drift
-- [ ] Fixed
+- [x] Fixed 2026-09-29, item by item:
+  - Master Design §6.4 gained `households`, `zone_metrics_daily` and
+    `household_bill_history`.
+  - D6's update states T040's rule.
+  - T126's evidence was already in `assumptions.md` §7, Gate 4.
+  - `base.yaml`, `metrics.py` and `api/main.py` comments corrected.
+  - `.env.example` lost its unused variables; its name-agreement claim is now a test
+    (`test_config.py`).
+  - README: images, section number, decision range, and a complete services table.
+  - The `generate_report.py` wording was already accurate; the index R32 added makes the
+    `get_latest_zone_metrics` docstring true.
 
 - **T037 / T038:** their *Done when* requires Master Design §6.4 to gain
   `zone_metrics_daily` and `households`. It hasn't.
@@ -794,7 +1064,11 @@ gave `get_client` the path-style addressing the dropper sets.
   it reads no speed-layer data.
 
 ### R31 — `DatabaseUnavailable` too broad; readiness can hang
-- [ ] Fixed
+- [x] Fixed 2026-09-29, as recommended below. Only `psycopg.OperationalError` (which
+  includes `PoolTimeout`) becomes `DatabaseUnavailable`. `healthcheck()` waits at most
+  2 s for a connection and no longer goes through `transaction()`. Nothing in the API
+  mapped the error to 503 anyway, so the visible effect was the misleading error type, and
+  the readiness hang. Tests in `test_postgres_connect.py`.
 
 - [`storage/postgres.py:85-112`](../src/voltstream/storage/postgres.py#L85-L112)
   `transaction()` turns *any* exception inside the `with` block (a SQL typo, a mapping
@@ -806,7 +1080,9 @@ gave `get_client` the path-style addressing the dropper sets.
   `pool.connection()` in `healthcheck()`.
 
 ### R32 — `/zones/load` query and table growth (T041/T100)
-- [ ] Fixed
+- [x] Fixed 2026-09-29. Added the `(grid_zone, window_start DESC)` index. The zone rollup
+  deletes speed-view windows more than 14 simulated days older than the day it rolled up;
+  that is 70 real minutes, and the longest dashboard looks back one hour.
 
 - `DISTINCT ON (grid_zone) … ORDER BY grid_zone, window_start DESC` has no matching
   index (the PK is ascending; `idx_zone_metrics_rt_window` is `window_start DESC` only).
@@ -832,7 +1108,10 @@ these, so make them NamedTuples first.
   line 162 (a string, not a float). Use `Decimal(0)` so the check passes literally.
 
 ### R35 — A household with no valid readings gets no bill
-- [ ] Decided / fixed
+- [x] Decided and fixed 2026-09-29: such a household gets a fixed-charge-only bill with
+  `readings_count = 0`. The tariff file is the day's customer list
+  (`daily_billing.with_idle_households`). The DAG's sanity check now allows zero-reading
+  bills, but fails a day where half or more of the bills have no readings.
 
 `aggregate_to_daily(valid)` only produces rows for households with valid readings, and
 `join_tariff` left-joins totals → tariff. A meter that is offline or rejected all day
@@ -842,23 +1121,70 @@ the check should expect it.
 
 ---
 
+### R37 — A stalled producer tick is never made up
+- [x] Fixed 2026-09-29, as recommended below, including `event_ts` from the tick index.
+  A tick more than 15 behind (30 real s) skips ahead instead and logs the ticks it
+  skipped. The tick log line carries `tick`. Tests in `test_meter_producer.py`.
+  **Verified live:** 150 ticks logged for 2026-01-03, and all 150 grid timestamps in the
+  master dataset. The second *Done when* below cannot hold as written: the out-of-order
+  fault moves a reading back up to 30 simulated minutes, across midnight in either
+  direction, so a household's `readings_count` was 142–151 that day.
+
+*Found 2026-09-27, on the Gate 4 run.*
+
+**Where:** [`simulators/meter_producer.py`](../src/voltstream/simulators/meter_producer.py) `main()`: `time.sleep(max(0.0, emit_interval_seconds - elapsed))`, and `_run_tick()`: `event_ts = simclock.sim_now()`.
+
+**What's wrong:** each tick sleeps for whatever is left of 2 s after its own work, and
+stamps its readings with the simulated time at which it happens to run. A tick that
+stalls (9 of 137 on 2026-01-02 took 3–4.8 s, the rest 2.0 s) pushes every later tick back
+and is never made up. The day then has 138 ticks rather than 150, readings are on average
+about 10.4 simulated minutes apart rather than 9.6, and each stall stretches one gap in
+every meter's series to 14–23 simulated minutes.
+
+It doesn't affect correctness: both layers see the same readings, and the reconciliation
+and the kWh gap are ratios. It does make figures quoted as "150 readings per meter per
+day" wrong, and daily energy about 8 % lower than the profiles imply.
+
+**Fix:** schedule ticks on a fixed grid (`next_tick += interval`; sleep until `next_tick`,
+and run at once when behind). Optionally derive `event_ts` from the tick index
+(`anchor + k × 9.6 sim min`) so every meter-day has exactly 150 readings however the host
+behaves.
+
+**Done when:** a complete simulated day has 150 ticks in the producer log, and
+`household_bill_daily.readings_count` is 150 minus that household's rejects.
+
+---
+
 ## Verify with the stack up
 
 These could not be checked without Docker:
 
 - [ ] `pytest -m integration` (19 tests) passes against a fresh `make clean && make up`.
-- [ ] **Kafka persistence:** compose mounts `kafka_data` at `/var/lib/kafka/data` but
+- [ ] R02: `test_watermark_behaviour.py` passes, and its figures are recorded in D3 and
+  `assumptions.md` §2.
+- [x] R08: after a billing run, `voltstream.ps1 check` shows `Daily report` PASS
+  (2026-09-27, Gate 4 run).
+- [x] **Kafka persistence:** compose mounts `kafka_data` at `/var/lib/kafka/data` but
   doesn't set `KAFKA_LOG_DIRS`. Confirm the broker writes there:
   `docker exec voltstream-kafka grep log.dirs /opt/kafka/config/server.properties`.
   If it writes elsewhere, topics are lost on `make down && make up` while the Spark
   checkpoints survive, and `failOnDataLoss=true` will stop both streaming jobs.
+  **Confirmed and fixed 2026-09-29:** `apache/kafka:3.8.0` defaults to
+  `/tmp/kraft-combined-logs`. Compose now sets `KAFKA_LOG_DIRS`; `test_compose_files.py`
+  guards it. Verified with `compose down` and `up` (volumes kept): all 12,417 messages
+  survived, and both streaming jobs resumed from their checkpoints with no restarts.
 - [ ] T111: `df.explain()` in `daily_billing.read_day` shows `voltage` absent from
   `ReadSchema` and the date under `PartitionFilters`.
-- [ ] T041: `EXPLAIN` on the merge-function lookup and on `/zones/load` (see R32).
+- [x] T041: `EXPLAIN` on the merge-function lookup and on `/zones/load` (see R32).
+  2026-09-29: the merge lookup is an index-only scan on `idx_runs_date_layer_success`.
+  `/zones/load` at 138 rows is a sequential scan plus a sort, correctly the cheaper plan;
+  with sequential scans disabled it becomes a sort-free index scan on
+  `idx_zone_metrics_rt_zone_window`, the plan it takes once the table is large.
 - [ ] T121: after the R03 fix, a grace of ~90 s appears in the task log.
 - [ ] T123: a `billing__D__r2` run produces a `superseded` + `success` pair with distinct
   `orchestrator_run_id`s.
-- [ ] T105: `/health/ready` returns 503 promptly with Postgres stopped (see R31).
+- [x] T105: `/health/ready` returns 503 promptly with Postgres stopped (see R31).
+  2026-09-29: 503 in 0.03 s and 1.9 s, naming postgres; 200 again after the restart.
 
 ---
 

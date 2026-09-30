@@ -19,6 +19,10 @@ minutes is 6.25 real seconds at TIME_SCALE 288; the 10-**real**-second trigger i
 simulated minutes, which is the larger of the two. At this time compression the trigger,
 not the watermark, dominates what gets dropped — see D3 and `docs/assumptions.md`.
 
+Both queries read the stream through `deduplicated()`: one watermark, and the batch
+layer's dedup key, applied before any aggregation (R02). The provisional figures therefore
+count each reading once, and drop the stragglers the watermark rules out.
+
 The provisional bill is deliberately stale and deliberately labelled. It applies
 yesterday's tariff because today's does not exist until the day closes (§3.1), and every
 row records `tariff_source_date` so the staleness is visible rather than implied. The
@@ -40,15 +44,18 @@ from pyspark.sql.streaming import StreamingQuery
 from pyspark.sql.types import DecimalType
 
 from voltstream.config import get_config
+from voltstream.core.keys import DEDUP_COLUMNS
 from voltstream.core.spark_expr import compute_bill_expr
-from voltstream.core.tariff import BlockBoundary
 from voltstream.logging_setup import get_logger
 from voltstream.metrics import events_consumed_total, start_metrics_server, zone_renewable_ratio
 from voltstream.storage.objectstore import landing_tariff_path
+from voltstream.streaming.reference import read_tariff
 from voltstream.streaming.session import build_session, checkpoint_path
 from voltstream.streaming.sinks import observe_e2e_latency, upsert_batch, write_rejected
 from voltstream.streaming.sources import (
     KafkaLagListener,
+    event_ts_bounds,
+    known_household_ids,
     read_meter_stream,
     split_valid_invalid,
 )
@@ -71,23 +78,6 @@ _RATIO = DecimalType(5, 4)
 _tariff_cache: dict[date, DataFrame] = {}
 
 
-def _boundaries() -> list[BlockBoundary]:
-    """Block boundaries from config — structure only, never rates (D2).
-
-    Config holds the boundaries as ints (60, 120); tariff arithmetic is Decimal
-    throughout, so they are converted here rather than left to mix with Decimal kWh
-    values further in. `Decimal(int)` is exact, so nothing is lost.
-
-    ponytail: the batch job (Phase 9) needs the same conversion. Lift this into a shared
-    helper at that point rather than copying it — two copies is how the two layers start
-    disagreeing about where a block ends.
-    """
-    return [
-        BlockBoundary(b.name, None if b.up_to_kwh is None else Decimal(b.up_to_kwh))
-        for b in get_config().tariff.blocks
-    ]
-
-
 def _watermark_sim_minutes() -> str:
     return f"{get_config().speed_layer.watermark_sim_minutes} minutes"
 
@@ -101,15 +91,45 @@ def _window_sim_minutes() -> str:
 # --------------------------------------------------------------------------------------
 
 
+def deduplicated(valid_df: DataFrame) -> DataFrame:
+    """Watermark on `event_ts`, then drop repeated readings (R02). Both aggregations read
+    this, never the raw valid stream.
+
+    The watermark string is SIMULATED minutes: it is applied to `event_ts`, which advances
+    at TIME_SCALE relative to the wall clock.
+
+    The key is `core.keys.DEDUP_COLUMNS`, the batch layer's key, so the two layers agree on
+    what a duplicate is. Without this the speed layer summed the 2 % injected duplicates
+    that the batch layer removes, and every provisional figure ran about 2 % high.
+
+    Streaming dedup also drops records older than the watermark ("to avoid any possibility
+    of duplicates", in Spark's words). That is the speed layer's documented trade (§5.3,
+    "drop stragglers") applied before aggregation:
+
+    - Network reordering (under 30 simulated minutes, D3) is not dropped. The producer
+      sends a reordered record with its own tick, and a micro-batch's watermark is the
+      newest tick of the batch before it minus 30 simulated minutes, so it trails the
+      record's tick by at least the watermark (by 39.6 unless the tick straddles two
+      batches). That holds while delivery keeps up with the 2-real-second tick; a
+      producer stalled for longer can still lose some.
+    - Store-and-forward backfill is dropped once it is older than the watermark, so the
+      daily provisional totals now miss part of each meter's backlog. The batch layer
+      rescans a closed day and sees all of it. That gap is the `data_effect` D4 attributes
+      and T094 measures.
+    """
+    return valid_df.withWatermark("event_ts", _watermark_sim_minutes()).dropDuplicates(
+        list(DEDUP_COLUMNS)
+    )
+
+
 def zone_aggregation(valid_df: DataFrame) -> DataFrame:
     """Windowed per-zone load and renewable contribution.
 
-    The watermark and window strings are SIMULATED minutes: they are applied to
-    `event_ts`, which advances at TIME_SCALE relative to the wall clock.
+    Expects `deduplicated()` output: that is where the watermark is set. The window string
+    is SIMULATED minutes, like the watermark.
     """
     return (
-        valid_df.withWatermark("event_ts", _watermark_sim_minutes())
-        .groupBy(F.window(F.col("event_ts"), _window_sim_minutes()), F.col("grid_zone"))
+        valid_df.groupBy(F.window(F.col("event_ts"), _window_sim_minutes()), F.col("grid_zone"))
         .agg(
             F.sum("consumption_kwh").cast(_KWH).alias("total_consumption_kwh"),
             F.sum("solar_generation_kwh").cast(_KWH).alias("total_solar_kwh"),
@@ -209,10 +229,11 @@ def household_aggregation(valid_df: DataFrame) -> DataFrame:
     window carries an end, so the watermark can evict the previous day's keys shortly
     after simulated midnight. A derived date column has no end and its state would grow
     without bound for the life of the query.
+
+    Expects `deduplicated()` output: that is where the watermark is set.
     """
     return (
-        valid_df.withWatermark("event_ts", _watermark_sim_minutes())
-        .groupBy(F.window(F.col("event_ts"), "1 day"), F.col("household_id"))
+        valid_df.groupBy(F.window(F.col("event_ts"), "1 day"), F.col("household_id"))
         .agg(
             F.sum("consumption_kwh").cast(_KWH).alias("consumption_kwh"),
             F.sum("solar_generation_kwh").cast(_KWH).alias("solar_kwh"),
@@ -227,31 +248,20 @@ def household_aggregation(valid_df: DataFrame) -> DataFrame:
 
 
 def _tariff_for(spark: SparkSession, effective: date) -> DataFrame | None:
-    """Yesterday's tariff file, cached. Returns None when it is not there yet."""
+    """Yesterday's tariff file, cached. Returns None when it is not there yet.
+
+    Read by `streaming.reference.read_tariff`, the billing job's reader too (R22), so both
+    layers price a household with the same validated rates and the same subsidy flag.
+    """
     if effective in _tariff_cache:
         return _tariff_cache[effective]
 
     path = landing_tariff_path(effective)
     try:
-        frame = (
-            spark.read.option("header", "true")
-            .option("inferSchema", "false")
-            .csv(path)
-            .select(
-                F.col("household_id"),
-                F.col("billing_tier"),
-                (F.col("subsidy_flag") == F.lit("true")).alias("subsidy_flag"),
-                F.col("subsidy_pct").cast(DecimalType(5, 2)).alias("subsidy_pct"),
-                F.col("fixed_charge").cast(DecimalType(12, 2)).alias("fixed_charge"),
-                F.col("block_1_rate").cast(DecimalType(12, 2)).alias("block_1_rate"),
-                F.col("block_2_rate").cast(DecimalType(12, 2)).alias("block_2_rate"),
-                F.col("block_3_rate").cast(DecimalType(12, 2)).alias("block_3_rate"),
-                F.col("export_rate").cast(DecimalType(12, 2)).alias("export_rate"),
-            )
-        )
+        frame = read_tariff(spark, effective, path)
         frame.cache()
-        frame.count()  # force the read now, inside the try, so a missing file is caught here
-    except Exception as exc:  # noqa: BLE001 - any read failure means "not available yet"
+        frame.count()
+    except Exception as exc:  # noqa: BLE001 - missing (not dropped yet) or invalid: no bill
         log.warning(
             "tariff file not available",
             extra={"stage": "speed-household", "path": path, "detail": str(exc)[:200]},
@@ -287,7 +297,8 @@ def with_provisional_bill(totals_df: DataFrame, tariff_df: DataFrame, effective:
         subsidy_flag_col=F.col("subsidy_flag"),
         subsidy_pct_col=F.col("subsidy_pct"),
         export_rate_col=F.col("export_rate"),
-        boundaries=_boundaries(),
+        # Structure only, never rates (D2); the billing job reads the same (R26).
+        boundaries=get_config().tariff.boundaries(),
     )
 
     return joined.select(
@@ -352,12 +363,6 @@ def _write_household_batch(batch_df: DataFrame, batch_id: int, *, spark: SparkSe
 # --------------------------------------------------------------------------------------
 
 
-def _known_household_ids(spark: SparkSession) -> frozenset[str]:
-    """The seeded household dimension, read once at startup."""
-    config = get_config()
-    return frozenset(f"HH-{i:04d}" for i in range(1, config.simulation.households + 1))
-
-
 def _write_validation_batch(
     batch_df: DataFrame,
     batch_id: int,
@@ -412,14 +417,8 @@ def start(await_termination: bool = True) -> list[StreamingQuery]:
         KafkaLagListener({q: _LAYER for q in (_ZONE_JOB, _HOUSEHOLD_JOB, _VALIDATION_JOB)})
     )
 
-    known_households = _known_household_ids(spark)
-    # event_ts is simulated time; the plausible range is generous because the simulated
-    # clock can be anchored anywhere. Its job is to catch a garbage timestamp, not to
-    # second-guess the clock.
-    bounds = (
-        config.simulation.epoch_sim - timedelta(days=365),
-        config.simulation.epoch_sim + timedelta(days=365 * 50),
-    )
+    known_households = known_household_ids()
+    bounds = event_ts_bounds()
 
     # One source per query. Each gets its own Spark-generated consumer group and, more to
     # the point, its own checkpoint — which is where offsets actually live and what makes
@@ -434,7 +433,9 @@ def start(await_termination: bool = True) -> list[StreamingQuery]:
             known_household_ids=known_households,
             event_ts_bounds=bounds,
         )
-        return valid
+        # Watermarked and deduplicated once here, so both aggregations see the same
+        # records the batch layer would bill (R02).
+        return deduplicated(valid)
 
     trigger = f"{config.speed_layer.trigger_interval_real_seconds} seconds"
     output_mode = config.speed_layer.output_mode

@@ -1,0 +1,20 @@
+# voltstream — Grafana dashboard provider (T151). Loads every JSON file in
+# config/grafana/dashboards/, mounted at /etc/grafana/dashboards by docker-compose.yml.
+#
+# The files in git are the dashboards. UI edits cannot be saved over them
+# (allowUiUpdates: false), so a change is made by exporting the JSON and committing it,
+# the same review path as any other code.
+
+apiVersion: 1
+
+providers:
+  - name: voltstream
+    orgId: 1
+    folder: voltstream
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: false

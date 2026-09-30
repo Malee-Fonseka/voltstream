@@ -21,8 +21,11 @@ from datetime import date
 from decimal import Decimal
 
 import pytest
+from fastapi import HTTPException
 
-from voltstream.storage import postgres, repositories
+from voltstream.api.models import BillResponse
+from voltstream.api.routers import households
+from voltstream.storage import postgres
 
 pytestmark = pytest.mark.integration
 
@@ -101,20 +104,21 @@ def _insert_run(status: str) -> None:
         )
 
 
-def _merge_source() -> str | None:
-    """The merge decision, exercised through the same calls the router makes."""
-    if repositories.is_day_finalised(_SIM_DATE):
-        if repositories.get_finalised_bill_row(_HOUSEHOLD, _SIM_DATE) is not None:
-            return "batch"
-    if repositories.get_running_estimate(_HOUSEHOLD, _SIM_DATE) is not None:
-        return "speed"
-    return None
+def _bill() -> BillResponse:
+    """The merge function itself: the router's handler, called as the plain function it is.
+
+    Not a copy of its decision (R27): a copy would keep passing if `get_bill` dropped the
+    `is_day_finalised` check, which is the one mistake these tests exist to catch.
+    """
+    return households.get_bill(_HOUSEHOLD, trace_id="merge-test", bill_date=_SIM_DATE)
 
 
 def test_speed_row_only_serves_the_estimate() -> None:
     """The ordinary case during a simulated day: no batch run yet."""
     _insert_speed_row()
-    assert _merge_source() == "speed"
+    bill = _bill()
+    assert (bill.source, bill.provisional) == ("speed", True)
+    assert bill.tariff_date == _TARIFF_DATE, "yesterday's tariff, as the speed layer costs"
 
 
 def test_a_finalised_day_serves_the_batch_row() -> None:
@@ -122,7 +126,8 @@ def test_a_finalised_day_serves_the_batch_row() -> None:
     _insert_speed_row()
     _insert_batch_row()
     _insert_run("success")
-    assert _merge_source() == "batch"
+    bill = _bill()
+    assert (bill.source, bill.provisional) == ("batch", False)
 
 
 def test_a_failed_run_does_not_flip_to_batch() -> None:
@@ -136,7 +141,7 @@ def test_a_failed_run_does_not_flip_to_batch() -> None:
     _insert_speed_row()
     _insert_batch_row()
     _insert_run("failed")
-    assert _merge_source() == "speed", "a failed run must not finalise the day"
+    assert _bill().source == "speed", "a failed run must not finalise the day"
 
 
 def test_superseded_plus_success_still_flips_to_batch() -> None:
@@ -152,9 +157,11 @@ def test_superseded_plus_success_still_flips_to_batch() -> None:
     _insert_run("superseded")
     _insert_run("superseded")
     _insert_run("success")
-    assert _merge_source() == "batch"
+    assert _bill().source == "batch"
 
 
 def test_neither_view_has_the_day() -> None:
     """Nothing to serve, so the router raises 404 rather than inventing zeros."""
-    assert _merge_source() is None
+    with pytest.raises(HTTPException) as raised:
+        _bill()
+    assert raised.value.status_code == 404

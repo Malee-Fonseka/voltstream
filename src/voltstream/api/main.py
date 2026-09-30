@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import mimetypes
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -10,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from voltstream import __version__
-from voltstream.api.routers import alerts, health, households, reports, zones
+from voltstream.api.routers import alerts, clock, health, households, reports, zones
 from voltstream.config import get_config
 from voltstream.logging_setup import get_logger
 from voltstream.metrics import REGISTRY
@@ -74,11 +75,13 @@ def create_app() -> FastAPI:
             },
             {"name": "reports", "description": "Consolidated daily reports."},
             {"name": "alerts", "description": "Firing alerts, proxied from Alertmanager."},
+            {"name": "clock", "description": "The simulated clock, as this process reads it."},
             {"name": "health", "description": "Liveness and dependency readiness."},
         ],
     )
 
     app.include_router(health.router)
+    app.include_router(clock.router)
     app.include_router(zones.router)
     app.include_router(households.router)
     app.include_router(reports.router)
@@ -107,6 +110,12 @@ def create_app() -> FastAPI:
     # it before the routers would shadow /api, /docs and /metrics.
     dashboard = _dashboard_dir()
     if dashboard is not None:
+        # The dashboard's scripts are ES modules, which a browser refuses to run unless
+        # they arrive as JavaScript. StaticFiles takes the type from `mimetypes`, and on
+        # Windows that reads the registry, where `.js` is often `text/plain` — so a local
+        # `voltstream-api` would serve a blank page. Registering it here makes the type
+        # the same on every platform.
+        mimetypes.add_type("text/javascript", ".js")
         app.mount("/", StaticFiles(directory=str(dashboard), html=True), name="dashboard")
     else:
         # Not fatal. The API is useful without the dashboard, and the image that serves

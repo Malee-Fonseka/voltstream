@@ -25,7 +25,10 @@ FROM python:3.11-slim-bookworm AS builder
 
 WORKDIR /build
 RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:${PATH}"
+# pip gives up on a download that stalls for 15 s, and does not retry it: a cold build once
+# died eleven minutes into pyspark's 318 MB download on a slow link (T175).
+ENV PATH="/opt/venv/bin:${PATH}" \
+    PIP_DEFAULT_TIMEOUT=120
 
 # Dependencies first, source second. pyspark is a ~317 MB wheel and installing it takes
 # the better part of an hour on a slow link; copying src/ before this step put every
@@ -61,15 +64,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /extra-jars
+# Retry every failure, not just HTTP 5xx: a cold build once died on one dropped TLS handshake
+# (curl exit 35) on a slow link, after the jar before it had taken two minutes (T175).
 RUN set -eux; \
     base=https://repo1.maven.org/maven2; \
-    curl -fsSL -O "$base/org/apache/spark/spark-sql-kafka-0-10_2.12/${SPARK_KAFKA_CONNECTOR_VERSION}/spark-sql-kafka-0-10_2.12-${SPARK_KAFKA_CONNECTOR_VERSION}.jar"; \
-    curl -fsSL -O "$base/org/apache/spark/spark-token-provider-kafka-0-10_2.12/${SPARK_KAFKA_CONNECTOR_VERSION}/spark-token-provider-kafka-0-10_2.12-${SPARK_KAFKA_CONNECTOR_VERSION}.jar"; \
-    curl -fsSL -O "$base/org/apache/kafka/kafka-clients/${KAFKA_CLIENTS_VERSION}/kafka-clients-${KAFKA_CLIENTS_VERSION}.jar"; \
-    curl -fsSL -O "$base/org/apache/commons/commons-pool2/${COMMONS_POOL2_VERSION}/commons-pool2-${COMMONS_POOL2_VERSION}.jar"; \
-    curl -fsSL -O "$base/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar"; \
-    curl -fsSL -O "$base/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_BUNDLE_VERSION}/aws-java-sdk-bundle-${AWS_SDK_BUNDLE_VERSION}.jar"; \
-    curl -fsSL -O "$base/org/postgresql/postgresql/${POSTGRESQL_JDBC_VERSION}/postgresql-${POSTGRESQL_JDBC_VERSION}.jar"
+    fetch() { curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 -O "$base/$1"; }; \
+    fetch "org/apache/spark/spark-sql-kafka-0-10_2.12/${SPARK_KAFKA_CONNECTOR_VERSION}/spark-sql-kafka-0-10_2.12-${SPARK_KAFKA_CONNECTOR_VERSION}.jar"; \
+    fetch "org/apache/spark/spark-token-provider-kafka-0-10_2.12/${SPARK_KAFKA_CONNECTOR_VERSION}/spark-token-provider-kafka-0-10_2.12-${SPARK_KAFKA_CONNECTOR_VERSION}.jar"; \
+    fetch "org/apache/kafka/kafka-clients/${KAFKA_CLIENTS_VERSION}/kafka-clients-${KAFKA_CLIENTS_VERSION}.jar"; \
+    fetch "org/apache/commons/commons-pool2/${COMMONS_POOL2_VERSION}/commons-pool2-${COMMONS_POOL2_VERSION}.jar"; \
+    fetch "org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar"; \
+    fetch "com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_BUNDLE_VERSION}/aws-java-sdk-bundle-${AWS_SDK_BUNDLE_VERSION}.jar"; \
+    fetch "org/postgresql/postgresql/${POSTGRESQL_JDBC_VERSION}/postgresql-${POSTGRESQL_JDBC_VERSION}.jar"
 
 # ---------------------------------------------------------------------------
 # Final stage
@@ -106,11 +112,6 @@ RUN mkdir -p /var/lib/voltstream/checkpoints \
 # from the environment (T018), and the package itself is already baked from the same
 # commit, so the two cannot drift apart.
 COPY config/ /app/config/
-
-# Operational scripts that are not part of the importable package but do run inside this
-# image — the report generator is launched as a DAG task. Kept out of src/voltstream on
-# purpose: they are entry points for the orchestrator, not library code anything imports.
-COPY scripts/ /app/scripts/
 
 WORKDIR /app
 USER voltstream

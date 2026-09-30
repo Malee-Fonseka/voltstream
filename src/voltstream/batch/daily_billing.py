@@ -23,31 +23,42 @@ A partially written billing day is worse than no billing day.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import time
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date
 from decimal import Decimal
 
-import psycopg
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import DecimalType, StringType, StructField, StructType
+from pyspark.sql.types import DecimalType
 from pyspark.sql.window import Window
 
+from voltstream.batch import ledger
 from voltstream.config import get_config
+from voltstream.core.keys import DEDUP_COLUMNS
 from voltstream.core.spark_expr import compute_bill_expr
-from voltstream.core.tariff import BlockBoundary
 from voltstream.logging_setup import get_logger
 from voltstream.metrics import batch_duration_seconds, push_metrics
-from voltstream.storage.objectstore import archive_tariff_path, landing_tariff_path, raw_root
+from voltstream.storage.objectstore import archive_tariff_path, raw_root
+from voltstream.storage.postgres import connect
+from voltstream.streaming.reference import read_tariff
 from voltstream.streaming.session import build_session
-from voltstream.streaming.sinks import pg_connection_string, write_rejected
-from voltstream.streaming.sources import split_valid_invalid
+from voltstream.streaming.sinks import (
+    INSERT_REJECTED,
+    RejectedRow,
+    collect_rejected,
+    pg_connection_string,
+)
+from voltstream.streaming.sources import (
+    event_ts_bounds,
+    known_household_ids,
+    split_valid_invalid,
+)
 
 _JOB = "daily_billing"
 _LAYER = "batch"
+_LEDGER_LAYER = "batch_billing"
 
 log = get_logger("daily-billing")
 
@@ -71,24 +82,6 @@ _BILLING_COLUMNS = (
     "trace_id",
 )
 
-# The tariff contract (T031), declared rather than inferred. inferSchema would read the
-# money columns as DoubleType and silently defeat D5's Decimal-everywhere rule — a bill
-# would then be computed in binary floating point and be wrong in the last cent.
-_TARIFF_SCHEMA = StructType(
-    [
-        StructField("household_id", StringType()),
-        StructField("effective_date", StringType()),
-        StructField("billing_tier", StringType()),
-        StructField("subsidy_flag", StringType()),
-        StructField("subsidy_pct", DecimalType(5, 2)),
-        StructField("fixed_charge", DecimalType(12, 2)),
-        StructField("block_1_rate", DecimalType(12, 2)),
-        StructField("block_2_rate", DecimalType(12, 2)),
-        StructField("block_3_rate", DecimalType(12, 2)),
-        StructField("export_rate", DecimalType(12, 2)),
-    ]
-)
-
 
 class MissingTariffError(RuntimeError):
     """Raised when a household has no tariff row for the day.
@@ -97,18 +90,6 @@ class MissingTariffError(RuntimeError):
     that owes nothing — a silently wrong money figure is the one failure mode this job
     must never have.
     """
-
-
-def _boundaries() -> list[BlockBoundary]:
-    """Block boundaries from config — structure only, never rates (D2).
-
-    Same conversion as the speed layer's. Both layers must read the same boundaries from
-    the same place or the consistency test proves nothing about production behaviour.
-    """
-    return [
-        BlockBoundary(b.name, None if b.up_to_kwh is None else Decimal(b.up_to_kwh))
-        for b in get_config().tariff.blocks
-    ]
 
 
 # --------------------------------------------------------------------------------------
@@ -144,7 +125,7 @@ def deduplicate(df: DataFrame) -> DataFrame:
     earliest `ingest_ts` wins, so the surviving row is the one that arrived first rather
     than an arbitrary one, which keeps the choice deterministic across reruns.
     """
-    ordering = Window.partitionBy("meter_id", "event_ts").orderBy(F.col("ingest_ts").asc())
+    ordering = Window.partitionBy(*DEDUP_COLUMNS).orderBy(F.col("ingest_ts").asc())
     return (
         df.withColumn("_rank", F.row_number().over(ordering))
         .filter(F.col("_rank") == 1)
@@ -152,42 +133,37 @@ def deduplicate(df: DataFrame) -> DataFrame:
     )
 
 
-def _known_household_ids() -> frozenset[str]:
-    config = get_config()
-    return frozenset(f"HH-{i:04d}" for i in range(1, config.simulation.households + 1))
-
-
-def _event_ts_bounds() -> tuple[datetime, datetime]:
-    epoch = get_config().simulation.epoch_sim
-    return (epoch - timedelta(days=365), epoch + timedelta(days=365 * 50))
-
-
 # --------------------------------------------------------------------------------------
 # T113 — reference joins
 # --------------------------------------------------------------------------------------
+#
+# The tariff is read by `streaming.reference.read_tariff`, shared with the speed layer:
+# validated against the contract, effective-dated (§10.2: the latest row per household
+# with `effective_date <= sim_date`, not full SCD Type 2).
+#
+# There is no weather join. T113 lists one, but nothing in a bill depends on the weather,
+# and the producer does not use cloud cover either (R16), so joining it would only carry
+# columns no one reads. Recorded as a cut in docs/assumptions.md §5.
 
 
-def read_tariff(spark: SparkSession, sim_date: date) -> DataFrame:
-    """The day's tariff file, declared schema, effective-dated.
+def with_idle_households(totals: DataFrame, tariff: DataFrame) -> DataFrame:
+    """Add a zero-usage row for every tariffed household with no valid reading (R35).
 
-    §10.2 is explicit that this is a simple effective-dated join and not full SCD Type 2:
-    take the latest row per household with `effective_date <= sim_date`. That is enough
-    for a tariff that changes daily and is stated as a limitation rather than hidden.
+    A meter that was offline, or rejected, all day still has a customer behind it, and
+    that customer owes the fixed charge. Without this the household got no bill at all
+    and the day's row-count check failed the whole run. The tariff file is the day's
+    customer list; a household it omits fails `join_tariff` if it has readings.
     """
-    raw = (
-        spark.read.option("header", "true")
-        .schema(_TARIFF_SCHEMA)
-        .csv(landing_tariff_path(sim_date))
-        .withColumn("effective_date", F.to_date(F.col("effective_date")))
-        .withColumn("subsidy_flag", F.col("subsidy_flag") == F.lit("true"))
+    idle = tariff.select("household_id").join(
+        totals.select("household_id"), on="household_id", how="left_anti"
     )
-
-    applicable = raw.filter(F.col("effective_date") <= F.lit(sim_date))
-    latest = Window.partitionBy("household_id").orderBy(F.col("effective_date").desc())
-    return (
-        applicable.withColumn("_rank", F.row_number().over(latest))
-        .filter(F.col("_rank") == 1)
-        .drop("_rank")
+    return totals.unionByName(
+        idle.select(
+            F.col("household_id"),
+            F.lit(Decimal(0)).cast(_KWH).alias("consumption_kwh"),
+            F.lit(Decimal(0)).cast(_KWH).alias("solar_kwh"),
+            F.lit(0).cast("int").alias("readings_count"),
+        )
     )
 
 
@@ -237,7 +213,8 @@ def compute_bills(joined: DataFrame, sim_date: date, run_id: uuid.UUID) -> DataF
         subsidy_flag_col=F.col("subsidy_flag"),
         subsidy_pct_col=F.col("subsidy_pct"),
         export_rate_col=F.col("export_rate"),
-        boundaries=_boundaries(),
+        # Structure only, never rates (D2); the speed layer reads the same (R26).
+        boundaries=get_config().tariff.boundaries(),
     )
 
     return joined.select(
@@ -268,8 +245,8 @@ def compute_bills(joined: DataFrame, sim_date: date, run_id: uuid.UUID) -> DataF
 # --------------------------------------------------------------------------------------
 
 
-def archive_tariff(tariff: DataFrame, sim_date: date) -> str:
-    """Write the day's tariff to the archive bucket as Parquet.
+def archive_tariff(tariff: DataFrame, sim_date: date, run_id: uuid.UUID) -> str:
+    """Write the tariff this run billed with to the archive bucket as Parquet, per run.
 
     This is what makes a restatement possible after the landing zone has been cleaned up.
     Recomputing a bill from the master dataset is only reproducible if the *rates* that
@@ -280,7 +257,7 @@ def archive_tariff(tariff: DataFrame, sim_date: date) -> str:
     re-inferred CSV gives DoubleType and the restated bill differs from the original in
     the last cent, which is precisely the kind of discrepancy a restatement must not have.
     """
-    path = archive_tariff_path(sim_date)
+    path = archive_tariff_path(sim_date, str(run_id))
     tariff.write.mode("overwrite").parquet(path)
     return path
 
@@ -290,41 +267,15 @@ def archive_tariff(tariff: DataFrame, sim_date: date) -> str:
 # --------------------------------------------------------------------------------------
 
 
-def _orchestrator_run_id() -> str | None:
-    """Airflow's dag_run_id, when this job was launched by a DAG.
-
-    None when it was not — a bare `spark-submit` or `make backfill` is a legitimate way to
-    run this, not a degraded one. Recording it is what makes a restatement legible later:
-    two ledger rows for one simulated day, each naming the execution that produced it.
-    """
-    return os.environ.get("VOLTSTREAM_ORCHESTRATOR_RUN_ID") or None
-
-
-def _start_run(run_id: uuid.UUID, sim_date: date) -> None:
-    with psycopg.connect(pg_connection_string()) as conn, conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO pipeline_runs "
-            "(run_id, sim_date, layer, status, started_at, orchestrator_run_id) "
-            "VALUES (%s, %s, 'batch_billing', 'running', now(), %s)",
-            (run_id, sim_date, _orchestrator_run_id()),
-        )
-        conn.commit()
-
-
-def _fail_run(run_id: uuid.UUID, rows_in: int) -> None:
-    with psycopg.connect(pg_connection_string()) as conn, conn.cursor() as cur:
-        cur.execute(
-            "UPDATE pipeline_runs SET status = 'failed', finished_at = now(), rows_in = %s "
-            "WHERE run_id = %s",
-            (rows_in, run_id),
-        )
-        conn.commit()
-
-
 def finalise(
-    bills: list[tuple], columns: list[str], run_id: uuid.UUID, sim_date: date, rows_in: int
+    bills: list[tuple],
+    columns: list[str],
+    run_id: uuid.UUID,
+    sim_date: date,
+    rows_in: int,
+    rejected: list[RejectedRow],
 ) -> int:
-    """Write the day's bills and close the run, in **one** transaction.
+    """Write the day's bills and rejects and close the run, in **one** transaction.
 
     Either the whole day lands or none of it does (§5.5). A half-written billing day is
     not a smaller problem than an unwritten one — it is a worse one, because it looks
@@ -334,28 +285,35 @@ def finalise(
     the partial unique index permits only one at a time: inserting the new one before
     demoting the old would violate it, and demoting first in a separate transaction would
     leave a window where the day looks unfinalised and the API serves a provisional bill.
-    """
-    placeholders = ", ".join(["%s"] * len(columns))
-    updates = ", ".join(
-        f"{c} = EXCLUDED.{c}" for c in columns if c not in ("household_id", "sim_date")
-    )
 
-    with psycopg.connect(pg_connection_string()) as conn, conn.cursor() as cur:
+    The day's batch rejects are replaced, not appended (R23): every retry and every
+    restatement used to insert another full set, so the report's reject count grew with
+    each run. A reject's day is its reading's `event_ts`, as
+    `repositories.get_rejected_for_day` reads it.
+    """
+    column_list = ", ".join(columns)
+    placeholders = ", ".join(["%s"] * len(columns))
+
+    with connect(pg_connection_string()) as conn, conn.cursor() as cur:
+        ledger.supersede_success(cur, sim_date, _LEDGER_LAYER)
         cur.execute(
-            "UPDATE pipeline_runs SET status = 'superseded' "
-            "WHERE sim_date = %s AND layer = 'batch_billing' AND status = 'success'",
+            "DELETE FROM rejected_records WHERE stage = 'batch' "
+            "AND (raw_payload ->> 'event_ts')::timestamptz::date = %s",
             (sim_date,),
         )
+        if rejected:
+            cur.executemany(INSERT_REJECTED, rejected)
+        # Replaced, not upserted (R25): a restatement that bills fewer households must not
+        # leave the previous run's rows behind, attributed to a run that was superseded.
+        cur.execute("DELETE FROM household_bill_daily WHERE sim_date = %s", (sim_date,))
         cur.executemany(
-            f"INSERT INTO household_bill_daily ({', '.join(columns)}) VALUES ({placeholders}) "
-            f"ON CONFLICT (household_id, sim_date) DO UPDATE SET {updates}, computed_at = now()",
-            bills,
+            f"INSERT INTO household_bill_daily ({column_list}) VALUES ({placeholders})", bills
         )
-        cur.execute(
-            "UPDATE pipeline_runs SET status = 'success', finished_at = now(), "
-            "rows_in = %s, rows_out = %s WHERE run_id = %s",
-            (rows_in, len(bills), run_id),
+        # Every run's bills, kept (D6, R25): what the current table no longer shows.
+        cur.executemany(
+            f"INSERT INTO household_bill_history ({column_list}) VALUES ({placeholders})", bills
         )
+        ledger.complete_run(cur, run_id, rows_in, len(bills))
         conn.commit()
     return len(bills)
 
@@ -373,7 +331,7 @@ def run(sim_date: date) -> int:
     spark.sparkContext.setLogLevel("WARN")
 
     rows_in = 0
-    _start_run(run_id, sim_date)
+    ledger.start_run(run_id, sim_date, _LEDGER_LAYER)
     try:
         raw = read_day(spark, sim_date).persist()
         rows_in = raw.count()
@@ -383,32 +341,30 @@ def run(sim_date: date) -> int:
         deduped = deduplicate(raw).persist()
         valid, invalid = split_valid_invalid(
             deduped,
-            known_household_ids=_known_household_ids(),
-            event_ts_bounds=_event_ts_bounds(),
+            known_household_ids=known_household_ids(),
+            event_ts_bounds=event_ts_bounds(),
         )
-        rejected = write_rejected(invalid, _LAYER)
+        rejected = collect_rejected(invalid, _LAYER)
 
-        totals = aggregate_to_daily(valid)
+        tariff = read_tariff(spark, sim_date)
+        totals = with_idle_households(aggregate_to_daily(valid), tariff)
         # Duplicates are counted per household from the pre-dedup frame, so the column
         # reports what this day actually contained rather than a global figure.
         dupes = raw.groupBy("household_id").agg(
-            (F.count("*") - F.countDistinct("meter_id", "event_ts"))
-            .cast("int")
-            .alias("duplicates_removed")
+            (F.count("*") - F.countDistinct(*DEDUP_COLUMNS)).cast("int").alias("duplicates_removed")
         )
         totals = totals.join(dupes, on="household_id", how="left").fillna({"duplicates_removed": 0})
 
-        tariff = read_tariff(spark, sim_date)
         joined = join_tariff(totals, tariff)
         bills_df = compute_bills(joined, sim_date, run_id)
 
         # After the join, so a day that fails on a missing tariff does not leave an
         # archive implying it was processed.
-        archive_tariff(tariff, sim_date)
+        archive_tariff(tariff, sim_date, run_id)
 
         columns = bills_df.columns
         bills = [tuple(r) for r in bills_df.collect()]
-        written = finalise(bills, columns, run_id, sim_date, rows_in)
+        written = finalise(bills, columns, run_id, sim_date, rows_in, rejected)
 
         duration = time.monotonic() - started
         batch_duration_seconds.labels(job=_JOB).observe(duration)
@@ -424,14 +380,14 @@ def run(sim_date: date) -> int:
                 "run_id": str(run_id),
                 "rows_in": rows_in,
                 "rows_out": written,
-                "rows_rejected": rejected,
+                "rows_rejected": len(rejected),
                 "duration_seconds": round(duration, 2),
                 "metrics_pushed": pushed,
             },
         )
         return written
     except Exception:
-        _fail_run(run_id, rows_in)
+        ledger.fail_run(run_id, rows_in)
         log.exception(
             "billing run failed",
             extra={"stage": "batch", "sim_date": sim_date.isoformat(), "run_id": str(run_id)},

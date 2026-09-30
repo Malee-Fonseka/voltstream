@@ -19,13 +19,13 @@ be a third implementation of the billing rules and would eventually disagree wit
 from __future__ import annotations
 
 from datetime import date
-from decimal import Decimal
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, status
 
 from voltstream.api.dependencies import TraceIdDep
-from voltstream.api.models import BillDelta, BillResponse
+from voltstream.api.models import BillDelta, BillResponse, HouseholdInfo
+from voltstream.core.money import pct_divergence
 from voltstream.logging_setup import get_logger
 from voltstream.storage import repositories
 
@@ -91,6 +91,18 @@ def _from_speed(row) -> BillResponse:  # type: ignore[no-untyped-def]
         pipeline_run_id=None,
         computed_at=None,
     )
+
+
+@router.get("", response_model=list[HouseholdInfo], summary="Every known household")
+def list_households(trace_id: TraceIdDep) -> list[HouseholdInfo]:
+    """The seeded household dimension: zone, billing tier, subsidy and solar.
+
+    Read from the `households` table rather than generated from the seed rule, so a
+    client never holds a second copy of that rule that could disagree with the database.
+    """
+    rows = repositories.list_households()
+    log.info("households listed", extra={"stage": "api", "households": len(rows)})
+    return [HouseholdInfo(**row._asdict()) for row in rows]
 
 
 @router.get(
@@ -164,16 +176,15 @@ def get_bill_delta(
 
     delta = None
     delta_pct = None
-    if estimate is not None and final is not None:
-        delta = final - estimate
-        # Percentage against the final figure, which is the correct one — expressing the
-        # error as a fraction of the estimate would flatter a bad estimate.
-        #
-        # Quantised to three places to match reconciliation_daily.pct_divergence. Decimal
-        # division otherwise returns 28 significant digits, which is noise in a figure
-        # this endpoint exists to put in a screenshot.
-        if final != 0:
-            delta_pct = ((delta / final) * 100).quantize(Decimal("0.001"))
+    if speed is not None and batch is not None:
+        # D4's direction, speed minus batch, so that once the day is reconciled
+        # delta == tariff_effect + data_effect exactly, as reconciliation_daily states (R09).
+        delta = speed.estimated_bill - batch["final_bill"]
+        # D5's base, the batch bill's gross charges, through the same function the
+        # reconciliation job uses: this is reconciliation_daily.pct_divergence for the
+        # household and day. Never a percentage of final_bill, which is negative or near
+        # zero for a net exporter and would make the figure explode.
+        delta_pct = pct_divergence(abs(delta), batch["energy_charge"], batch["fixed_charge"])
 
     effects = repositories.get_reconciliation_effects(household_id, bill_date)
 

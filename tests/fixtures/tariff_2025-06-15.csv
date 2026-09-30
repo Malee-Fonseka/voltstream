@@ -1,0 +1,5 @@
+household_id,effective_date,billing_tier,subsidy_flag,subsidy_pct,fixed_charge,block_1_rate,block_2_rate,block_3_rate,export_rate
+HH-0001,2025-06-15,TIER_2,false,0.00,240.00,8.00,16.50,24.50,18.00
+HH-0002,2025-06-15,TIER_2,true,25.00,240.00,8.00,16.50,24.50,18.00
+HH-0003,2025-06-15,TIER_1,false,0.00,120.00,8.00,16.50,24.50,18.00
+HH-0004,2025-06-15,TIER_3,false,0.00,480.00,8.00,16.50,24.50,18.00

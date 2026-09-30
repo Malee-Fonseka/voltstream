@@ -136,6 +136,48 @@ def get_zone_metrics_range(
         return [_zone_metric(r) for r in cur.fetchall()]
 
 
+def get_all_zone_metrics_range(window_from: datetime, window_to: datetime) -> list[ZoneMetric]:
+    """Every zone's windows over an interval, by zone then oldest first.
+
+    One query for the dashboard's trend charts, which show all zones at once; a call per
+    zone would be five round trips on every poll.
+    """
+    with transaction() as cur:
+        cur.execute(
+            f"SELECT {_ZONE_COLUMNS} FROM zone_metrics_rt "
+            "WHERE window_start >= %s AND window_start < %s "
+            "ORDER BY grid_zone, window_start",
+            (window_from, window_to),
+        )
+        return [_zone_metric(r) for r in cur.fetchall()]
+
+
+# --------------------------------------------------------------------------------------
+# Household dimension
+# --------------------------------------------------------------------------------------
+
+
+class Household(NamedTuple):
+    """A row of `households` — the seeded dimension, not pipeline output."""
+
+    household_id: str
+    meter_id: str
+    grid_zone: str
+    billing_tier: str
+    subsidy_flag: bool
+    has_solar: bool
+
+
+def list_households() -> list[Household]:
+    """Every known household, by id — what the dashboard's household picker offers."""
+    with transaction() as cur:
+        cur.execute(
+            "SELECT household_id, meter_id, grid_zone, billing_tier, subsidy_flag, has_solar "
+            "FROM households ORDER BY household_id"
+        )
+        return [Household(*r) for r in cur.fetchall()]
+
+
 # --------------------------------------------------------------------------------------
 # Bill and run queries (T101)
 # --------------------------------------------------------------------------------------
@@ -373,20 +415,31 @@ def get_run_summary(sim_date: date) -> list[RunSummary]:
         return [RunSummary(*r) for r in cur.fetchall()]
 
 
-def get_rejected_for_day(sim_date: date) -> list[RejectedSummary]:
-    """Rejections attributable to a simulated day.
+def reject_stage_for(finalised: bool) -> str:
+    """Whose rejects describe a day: the batch layer's once it is billed, else the speed's."""
+    return "batch" if finalised else "speed"
+
+
+def get_rejected_for_day(sim_date: date, stage: str) -> list[RejectedSummary]:
+    """One layer's rejections attributable to a simulated day.
+
+    One layer, not both (R23): the two validate the same readings, so counting both
+    reported every bad reading twice. Use `reject_stage_for(finalised)`. The batch layer's
+    figures are the day's authoritative ones — deduplicated, and replaced on every run.
+    The speed layer validates before it deduplicates, so its count also includes the
+    injected duplicates of bad readings.
 
     Matched on the payload's `event_ts` rather than `rejected_at`: a record rejected by
     the batch layer is rejected when the job runs, which can be a different real day from
     the simulated one it belongs to. Counting by wall clock would attribute a restatement
-    of last week's data to today.
+    of last week's data to today. `daily_billing.finalise` deletes by the same expression.
     """
     with transaction() as cur:
         cur.execute(
             "SELECT reason, count(*) FROM rejected_records "
-            "WHERE (raw_payload ->> 'event_ts')::timestamptz::date = %s "
+            "WHERE stage = %s AND (raw_payload ->> 'event_ts')::timestamptz::date = %s "
             "GROUP BY reason ORDER BY count(*) DESC",
-            (sim_date,),
+            (stage, sim_date),
         )
         return [RejectedSummary(reason, total) for reason, total in cur.fetchall()]
 

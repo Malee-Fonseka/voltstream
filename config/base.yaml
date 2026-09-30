@@ -46,14 +46,16 @@ simulation:
 # faults — deliberate fault injection rates (simulators/faults.py, T069-T070)
 # ==============================================================================
 # D3: lateness has two distinct, deliberately separated mechanisms — network reordering
-# (always absorbed by the watermark) and comms-outage store-and-forward (mostly dropped).
+# (bounded by the watermark) and comms-outage store-and-forward (mostly dropped). D3 expected
+# reordering to be always absorbed; measured, it is not quite (docs/assumptions.md §2).
 # Every rate here is a per-reading (or per-meter-tick) PROBABILITY, unitless, and safe to
 # set to 0 for a clean run (faults.py's contract: all rates 0 => output == input exactly).
 faults:
   # Probability a reading is re-sent with the same event_id (tests dedup in core/keys.py).
   duplicate_rate: 0.02
   # Probability a reading's event_ts is shifted backwards — SIMULATED lateness, spread
-  # below. Always <= watermark_sim_minutes, so these are always absorbed, never dropped.
+  # below. Always <= watermark_sim_minutes, yet a few still miss the 15-minute windows,
+  # because the 10 s trigger is 48 simulated minutes (D3's correction). Daily totals keep them.
   out_of_order_rate: 0.03
   # Uniform range, in SIMULATED minutes, for the out-of-order shift above. Upper bound is
   # deliberately equal to speed_layer.watermark_sim_minutes (D3).
@@ -99,7 +101,8 @@ speed_layer:
   # Tumbling window width, SIMULATED minutes, on event_ts.
   window_sim_minutes: 15
   # Watermark on event_ts, SIMULATED minutes. = 6.25 real s at time_scale 288; sized to be
-  # >= the out-of-order spread above, so network reordering is always absorbed.
+  # >= the out-of-order spread above. That was meant to absorb all reordering; at this
+  # time scale the trigger interval below dominates instead (D3's correction).
   watermark_sim_minutes: 30
   # Structured Streaming micro-batch trigger interval, REAL seconds. = 48 SIMULATED
   # minutes - this, not the watermark, is the dominant term in what gets dropped (D3).
@@ -150,9 +153,9 @@ alerts:
   # Renewable ratio (0-1) below which LowRenewableContribution fires. Crossed both ways
   # daily per profiles.py's solar curve (T068).
   low_renewable_threshold: 0.15
-  # Fraction (0-1) of rejected records above which RejectRateHigh fires.
+  # Fraction (0-1) of rejected records above which HighRejectRate fires.
   reject_rate_threshold: 0.05
-  # REAL minutes after simulated day-close before BatchSlaMissed fires.
+  # REAL minutes after simulated day-close before BatchSLAMiss fires.
   batch_sla_minutes: 10
   # Percent divergence (see core/money.py pct_divergence base, D5) above which
   # LambdaDivergenceHigh fires. Sized so D3's modelled ~1.7% steady-state gap sits under it.
@@ -188,8 +191,8 @@ api:
   port: 8000
 
 # ==============================================================================
-# observability — non-HTTP metrics endpoints (§10.1). The API exposes /metrics itself via
-# prometheus-fastapi-instrumentator; this port is for processes with no HTTP server of
+# observability — non-HTTP metrics endpoints (§10.1). The API serves /metrics itself, from
+# the shared registry in metrics.py; this port is for processes with no HTTP server of
 # their own (meter_producer.py, reference_dropper.py, Spark driver processes).
 # ==============================================================================
 observability:
@@ -197,6 +200,8 @@ observability:
   # Default root log level for logging_setup.py; overridden by VOLTSTREAM_LOG_LEVEL (.env).
   log_level: "INFO"
   # Pushgateway for one-shot batch containers, which exit before Prometheus could scrape
-  # them (T116, T138). null = do not push. The Pushgateway arrives with Prometheus in
-  # Phase 12 (T142/T143); point this at it then, e.g. "http://pushgateway:9091".
+  # them (T116, T138). null = do not push. Left null here on purpose: the Pushgateway only
+  # exists on the Compose network, so the billing DAG sets it for the batch containers it
+  # launches (VOLTSTREAM__OBSERVABILITY__PUSHGATEWAY_URL, daily_billing_dag.py), and a
+  # local run or a test never tries to reach it.
   pushgateway_url: null

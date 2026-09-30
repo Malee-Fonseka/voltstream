@@ -1,4 +1,4 @@
-"""Response schemas for the API (T106, §5.8).
+"""Request and response schemas for the API (T106, §5.8).
 
 The important one is `BillResponse`. **One model serves both branches of the merge** (D4),
 and that is a design decision rather than convenience: the §3.2 contract is that a client
@@ -21,7 +21,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ZoneLoad(BaseModel):
@@ -44,6 +44,36 @@ class ZoneLoad(BaseModel):
 class ZoneHistory(BaseModel):
     grid_zone: str
     windows: list[ZoneLoad]
+
+
+class HouseholdInfo(BaseModel):
+    """One seeded household: who it is, not what it used."""
+
+    household_id: str
+    meter_id: str
+    grid_zone: str
+    billing_tier: str
+    subsidy_flag: bool
+    has_solar: bool
+
+
+class ClockResponse(BaseModel):
+    """The simulated clock as the API process reads it (§3.4).
+
+    A dashboard shows this rather than the newest window's end, which trails the
+    simulated present by up to a trigger interval. `time_scale` is included so a client
+    can advance the clock smoothly between polls and re-sync on the next one.
+    """
+
+    sim_now: datetime = Field(description="The current simulated instant, UTC.")
+    sim_date: date = Field(description="The simulated day that instant falls on.")
+    time_scale: int = Field(description="Simulated seconds per real second.")
+    day_progress: float = Field(
+        description="Fraction of the simulated day elapsed, 0 at midnight, towards 1."
+    )
+    real_seconds_to_day_close: float = Field(
+        description="REAL seconds until simulated midnight, when the day becomes billable."
+    )
 
 
 class BillResponse(BaseModel):
@@ -117,23 +147,32 @@ class BillDelta(BaseModel):
     )
     delta: Decimal | None = Field(
         default=None,
-        description="batch_final - speed_estimate. Positive means the estimate was low.",
+        description=(
+            "speed_estimate - batch_final (D4). Positive means the estimate was high. Once "
+            "the day is reconciled, delta == tariff_effect + data_effect."
+        ),
     )
     delta_pct: Decimal | None = Field(
         default=None,
         description=(
-            "Divergence as a percentage of the final figure, not of the estimate — "
-            "measuring the error against the wrong number would flatter a bad estimate."
+            "|delta| as a percentage of the final bill's gross charges (energy + fixed), "
+            "0 when those are 0 (D5): the figure reconciliation_daily.pct_divergence "
+            "holds. Not a percentage of batch_final, which is negative or near zero for "
+            "a net exporter."
         ),
     )
 
     tariff_effect: Decimal | None = Field(
         default=None,
-        description="Share of the delta explained by the speed layer using yesterday's tariff.",
+        description=(
+            "Part of delta caused by the speed layer using yesterday's tariff (S - C, D4)."
+        ),
     )
     data_effect: Decimal | None = Field(
         default=None,
-        description="Share explained by readings the speed layer never saw.",
+        description=(
+            "Part of delta caused by readings the two layers saw differently (C - B, D4)."
+        ),
     )
     reconciled: bool = Field(
         description="False until the reconciliation job has decomposed this day's divergence."
@@ -223,6 +262,38 @@ class AlertsResponse(BaseModel):
     alerts: list[AlertStatus]
     available: bool
     warning: str | None = None
+
+
+class AlertmanagerAlert(BaseModel):
+    """One alert in an Alertmanager webhook notification.
+
+    Only the fields the receiver logs. Unknown fields are ignored rather than rejected:
+    the payload belongs to Alertmanager, and a new field in a later version must not turn
+    every notification into a 422.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    status: str
+    labels: dict[str, str] = Field(default_factory=dict)
+    annotations: dict[str, str] = Field(default_factory=dict)
+    startsAt: datetime | None = None  # noqa: N815 - Alertmanager's field name
+    endsAt: datetime | None = None  # noqa: N815 - Alertmanager's field name
+    fingerprint: str | None = None
+
+
+class AlertmanagerNotification(BaseModel):
+    """The body Alertmanager POSTs to a webhook receiver (payload version 4)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    receiver: str
+    status: str
+    alerts: list[AlertmanagerAlert]
+
+
+class WebhookAck(BaseModel):
+    received: int
 
 
 class DependencyHealth(BaseModel):

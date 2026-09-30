@@ -1,0 +1,47 @@
+# voltstream — Alertmanager (T149). Routing by severity, grouping, and one inhibition.
+#
+# No real paging: both receivers post to the API's webhook (POST /api/v1/alerts/webhook),
+# which writes each notification as a structured log line, `stage: alert`, into the same
+# JSON log stream as the rest of the pipeline. `docker compose logs api | grep '"stage":
+# "alert"'` is the pager. The receiver name travels in the payload, so the log line says
+# which route an alert took.
+
+route:
+  receiver: warning-log
+  # One notification per alert name, not per zone: a dead producer silences all five
+  # zones at once, and five near-identical notifications read as noise.
+  group_by: [alertname]
+  group_wait: 30s
+  group_interval: 2m
+  repeat_interval: 1h
+  routes:
+    # Data missing or late: a bill will be wrong or late. Sent quickly, repeated often.
+    - matchers: ['severity="critical"']
+      receiver: critical-log
+      group_wait: 10s
+      group_interval: 1m
+      repeat_interval: 30m
+    # Data flowing but worth a look. LowRenewableContribution fires every simulated
+    # night, so this route batches and repeats slowly.
+    - matchers: ['severity="warning"']
+      receiver: warning-log
+
+inhibit_rules:
+  # Killing the producer stops a zone's renewable-ratio gauge at its last value. If that
+  # was a night-time value, LowRenewableContribution keeps firing for a zone with no data
+  # at all, and the demo shows two alerts for one fault. The stale-data alert explains the
+  # other, so it suppresses it: same zone only, so other zones' real low-renewable alerts
+  # still get through.
+  - source_matchers: ['alertname="MeterDataStale"']
+    target_matchers: ['alertname="LowRenewableContribution"']
+    equal: [grid_zone]
+
+receivers:
+  - name: critical-log
+    webhook_configs:
+      - url: http://api:8000/api/v1/alerts/webhook
+        send_resolved: true
+  - name: warning-log
+    webhook_configs:
+      - url: http://api:8000/api/v1/alerts/webhook
+        send_resolved: true
